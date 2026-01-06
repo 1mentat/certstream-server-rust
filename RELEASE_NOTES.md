@@ -1,8 +1,76 @@
-# Release Notes - v1.0.5
+# Release Notes - v1.0.6
 
-**Release Date**: December 28, 2025
+**Release Date**: January 6, 2026
 
-## Changes
+## New Features
+
+### REST API Endpoints
+
+New REST API for querying server state and certificates:
+
+- `GET /api/stats` - Server statistics (uptime, connections, throughput, cache metrics)
+- `GET /api/logs` - CT log health status with per-log details
+- `GET /api/cert/{hash}` - Certificate lookup by SHA256, SHA1, or fingerprint
+
+Enable with `CERTSTREAM_API_ENABLED=true`.
+
+### Rate Limiting
+
+Advanced rate limiting with token bucket + sliding window hybrid algorithm:
+
+- **Token Bucket**: Smooth rate limiting with configurable refill
+- **Sliding Window**: Request counting over time windows
+- **Tier-based Limits**: Free, Standard, and Premium tiers
+- **Burst Allowance**: Temporary burst capacity for each tier
+
+Enable with `CERTSTREAM_RATE_LIMIT_ENABLED=true`.
+
+### Backpressure & Flow Control
+
+Slow consumer detection and message handling:
+
+- **ClientBuffer**: Bounded message queue per client
+- **Slow Consumer Threshold**: Detect clients falling behind
+- **Drop Policies**: `drop_oldest`, `drop_newest`, or `disconnect`
+
+Enable with `CERTSTREAM_BACKPRESSURE_ENABLED=true`.
+
+### CLI Enhancements
+
+New command-line options:
+
+```bash
+--validate-config    Validate configuration and exit
+--dry-run            Start server without connecting to CT logs
+--export-metrics     Export current metrics and exit
+-V, --version        Print version information
+-h, --help           Print help information
+```
+
+## Example Usage
+
+```bash
+# Validate config before starting
+certstream-server-rust --validate-config
+
+# Start in dry-run mode for testing
+certstream-server-rust --dry-run
+
+# Enable all new features
+docker run -d -p 8080:8080 \
+  -e CERTSTREAM_API_ENABLED=true \
+  -e CERTSTREAM_RATE_LIMIT_ENABLED=true \
+  -e CERTSTREAM_BACKPRESSURE_ENABLED=true \
+  reloading01/certstream-server-rust:1.0.6
+```
+
+---
+
+# Previous Releases
+
+## v1.0.5 (December 28, 2025)
+
+### Changes
 
 ### Complete Certificate Field Compatibility with certstream-server-go
 

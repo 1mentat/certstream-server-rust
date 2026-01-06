@@ -4,6 +4,8 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 
+use crate::backpressure::DropPolicy;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CustomCtLog {
     pub name: String,
@@ -26,6 +28,8 @@ pub struct ProtocolConfig {
     pub health: bool,
     #[serde(default = "default_true")]
     pub example_json: bool,
+    #[serde(default)]
+    pub api: bool,
 }
 
 impl Default for ProtocolConfig {
@@ -38,6 +42,7 @@ impl Default for ProtocolConfig {
             metrics: true,
             health: true,
             example_json: true,
+            api: false,
         }
     }
 }
@@ -136,6 +141,158 @@ fn default_max_connections() -> u32 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_free_max_tokens")]
+    pub free_max_tokens: f64,
+    #[serde(default = "default_free_refill_rate")]
+    pub free_refill_rate: f64,
+    #[serde(default = "default_free_burst")]
+    pub free_burst: f64,
+    #[serde(default = "default_standard_max_tokens")]
+    pub standard_max_tokens: f64,
+    #[serde(default = "default_standard_refill_rate")]
+    pub standard_refill_rate: f64,
+    #[serde(default = "default_standard_burst")]
+    pub standard_burst: f64,
+    #[serde(default = "default_premium_max_tokens")]
+    pub premium_max_tokens: f64,
+    #[serde(default = "default_premium_refill_rate")]
+    pub premium_refill_rate: f64,
+    #[serde(default = "default_premium_burst")]
+    pub premium_burst: f64,
+    #[serde(default = "default_window_seconds")]
+    pub window_seconds: u64,
+    #[serde(default = "default_window_max_requests")]
+    pub window_max_requests: u32,
+    #[serde(default = "default_burst_window_seconds")]
+    pub burst_window_seconds: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            free_max_tokens: default_free_max_tokens(),
+            free_refill_rate: default_free_refill_rate(),
+            free_burst: default_free_burst(),
+            standard_max_tokens: default_standard_max_tokens(),
+            standard_refill_rate: default_standard_refill_rate(),
+            standard_burst: default_standard_burst(),
+            premium_max_tokens: default_premium_max_tokens(),
+            premium_refill_rate: default_premium_refill_rate(),
+            premium_burst: default_premium_burst(),
+            window_seconds: default_window_seconds(),
+            window_max_requests: default_window_max_requests(),
+            burst_window_seconds: default_burst_window_seconds(),
+        }
+    }
+}
+
+fn default_free_max_tokens() -> f64 {
+    100.0
+}
+fn default_free_refill_rate() -> f64 {
+    10.0
+}
+fn default_free_burst() -> f64 {
+    20.0
+}
+fn default_standard_max_tokens() -> f64 {
+    500.0
+}
+fn default_standard_refill_rate() -> f64 {
+    50.0
+}
+fn default_standard_burst() -> f64 {
+    100.0
+}
+fn default_premium_max_tokens() -> f64 {
+    2000.0
+}
+fn default_premium_refill_rate() -> f64 {
+    200.0
+}
+fn default_premium_burst() -> f64 {
+    500.0
+}
+fn default_window_seconds() -> u64 {
+    60
+}
+fn default_window_max_requests() -> u32 {
+    1000
+}
+fn default_burst_window_seconds() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackpressureConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_buffer_size")]
+    pub buffer_size: usize,
+    #[serde(default = "default_slow_consumer_threshold")]
+    pub slow_consumer_threshold: usize,
+    #[serde(default = "default_drop_policy")]
+    pub drop_policy: String,
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            buffer_size: default_buffer_size(),
+            slow_consumer_threshold: default_slow_consumer_threshold(),
+            drop_policy: default_drop_policy(),
+        }
+    }
+}
+
+impl BackpressureConfig {
+    pub fn to_backpressure_config(&self) -> crate::backpressure::BackpressureConfig {
+        crate::backpressure::BackpressureConfig {
+            buffer_size: self.buffer_size,
+            slow_consumer_threshold: self.slow_consumer_threshold,
+            drop_policy: match self.drop_policy.as_str() {
+                "drop_newest" => DropPolicy::DropNewest,
+                "disconnect" => DropPolicy::Disconnect,
+                _ => DropPolicy::DropOldest,
+            },
+        }
+    }
+}
+
+fn default_buffer_size() -> usize {
+    1024
+}
+fn default_slow_consumer_threshold() -> usize {
+    512
+}
+fn default_drop_policy() -> String {
+    "drop_oldest".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default = "default_cache_capacity")]
+    pub cache_capacity: usize,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            cache_capacity: default_cache_capacity(),
+        }
+    }
+}
+
+fn default_cache_capacity() -> usize {
+    10000
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -143,6 +300,10 @@ pub struct AuthConfig {
     pub tokens: Vec<String>,
     #[serde(default = "default_header_name")]
     pub header_name: String,
+    #[serde(default)]
+    pub standard_tokens: Vec<String>,
+    #[serde(default)]
+    pub premium_tokens: Vec<String>,
 }
 
 impl Default for AuthConfig {
@@ -151,6 +312,8 @@ impl Default for AuthConfig {
             enabled: false,
             tokens: Vec::new(),
             header_name: default_header_name(),
+            standard_tokens: Vec::new(),
+            premium_tokens: Vec::new(),
         }
     }
 }
@@ -193,6 +356,9 @@ pub struct Config {
     pub protocols: ProtocolConfig,
     pub ct_log: CtLogConfig,
     pub connection_limit: ConnectionLimitConfig,
+    pub rate_limit: RateLimitConfig,
+    pub backpressure: BackpressureConfig,
+    pub api: ApiConfig,
     pub auth: AuthConfig,
     pub hot_reload: HotReloadConfig,
     pub config_path: Option<String>,
@@ -216,6 +382,12 @@ struct YamlConfig {
     #[serde(default)]
     connection_limit: Option<ConnectionLimitConfig>,
     #[serde(default)]
+    rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    backpressure: Option<BackpressureConfig>,
+    #[serde(default)]
+    api: Option<ApiConfig>,
+    #[serde(default)]
     auth: Option<AuthConfig>,
     #[serde(default)]
     hot_reload: Option<HotReloadConfig>,
@@ -224,6 +396,12 @@ struct YamlConfig {
 struct YamlConfigWithPath {
     config: YamlConfig,
     path: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ConfigValidationError {
+    pub field: String,
+    pub message: String,
 }
 
 impl Config {
@@ -287,6 +465,9 @@ impl Config {
             let example_json = env::var("CERTSTREAM_EXAMPLE_JSON_ENABLED")
                 .map(|v| v.parse().unwrap_or(true))
                 .unwrap_or(true);
+            let api = env::var("CERTSTREAM_API_ENABLED")
+                .map(|v| v.parse().unwrap_or(false))
+                .unwrap_or(false);
 
             ProtocolConfig {
                 websocket: ws,
@@ -296,6 +477,7 @@ impl Config {
                 metrics,
                 health,
                 example_json,
+                api,
             }
         });
 
@@ -348,6 +530,24 @@ impl Config {
             cfg
         });
 
+        let rate_limit = yaml_config.rate_limit.unwrap_or_else(|| {
+            let mut cfg = RateLimitConfig::default();
+            if let Ok(v) = env::var("CERTSTREAM_RATE_LIMIT_ENABLED") {
+                cfg.enabled = v.parse().unwrap_or(false);
+            }
+            cfg
+        });
+
+        let backpressure = yaml_config.backpressure.unwrap_or_else(|| {
+            let mut cfg = BackpressureConfig::default();
+            if let Ok(v) = env::var("CERTSTREAM_BACKPRESSURE_ENABLED") {
+                cfg.enabled = v.parse().unwrap_or(false);
+            }
+            cfg
+        });
+
+        let api = yaml_config.api.unwrap_or_default();
+
         let auth = yaml_config.auth.unwrap_or_else(|| {
             let mut cfg = AuthConfig::default();
             if let Ok(v) = env::var("CERTSTREAM_AUTH_ENABLED") {
@@ -382,9 +582,93 @@ impl Config {
             protocols,
             ct_log,
             connection_limit,
+            rate_limit,
+            backpressure,
+            api,
             auth,
             hot_reload,
             config_path,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), Vec<ConfigValidationError>> {
+        let mut errors = Vec::new();
+
+        if self.port == 0 {
+            errors.push(ConfigValidationError {
+                field: "port".to_string(),
+                message: "Port must be greater than 0".to_string(),
+            });
+        }
+
+        if self.buffer_size == 0 {
+            errors.push(ConfigValidationError {
+                field: "buffer_size".to_string(),
+                message: "Buffer size must be greater than 0".to_string(),
+            });
+        }
+
+        if self.ct_logs_url.is_empty() {
+            errors.push(ConfigValidationError {
+                field: "ct_logs_url".to_string(),
+                message: "CT logs URL cannot be empty".to_string(),
+            });
+        }
+
+        if self.has_tls() {
+            if let Some(ref cert) = self.tls_cert {
+                if !Path::new(cert).exists() {
+                    errors.push(ConfigValidationError {
+                        field: "tls_cert".to_string(),
+                        message: format!("TLS certificate file not found: {}", cert),
+                    });
+                }
+            }
+            if let Some(ref key) = self.tls_key {
+                if !Path::new(key).exists() {
+                    errors.push(ConfigValidationError {
+                        field: "tls_key".to_string(),
+                        message: format!("TLS key file not found: {}", key),
+                    });
+                }
+            }
+        }
+
+        if self.connection_limit.enabled && self.connection_limit.max_connections == 0 {
+            errors.push(ConfigValidationError {
+                field: "connection_limit.max_connections".to_string(),
+                message: "Max connections must be greater than 0 when enabled".to_string(),
+            });
+        }
+
+        if self.rate_limit.enabled {
+            if self.rate_limit.free_refill_rate <= 0.0 {
+                errors.push(ConfigValidationError {
+                    field: "rate_limit.free_refill_rate".to_string(),
+                    message: "Refill rate must be positive".to_string(),
+                });
+            }
+        }
+
+        if self.backpressure.enabled {
+            if self.backpressure.buffer_size == 0 {
+                errors.push(ConfigValidationError {
+                    field: "backpressure.buffer_size".to_string(),
+                    message: "Buffer size must be greater than 0".to_string(),
+                });
+            }
+            if self.backpressure.slow_consumer_threshold > self.backpressure.buffer_size {
+                errors.push(ConfigValidationError {
+                    field: "backpressure.slow_consumer_threshold".to_string(),
+                    message: "Slow consumer threshold cannot exceed buffer size".to_string(),
+                });
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 
