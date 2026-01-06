@@ -25,7 +25,7 @@ pub struct LogHealth {
     consecutive_failures: AtomicU32,
     consecutive_successes: AtomicU32,
     total_errors: AtomicU64,
-    status: parking_lot::RwLock<HealthStatus>,
+    pub status: parking_lot::RwLock<HealthStatus>,
 }
 
 impl LogHealth {

@@ -33,6 +33,10 @@ Certstream aggregates certificates from Certificate Transparency logs and stream
 - Token authentication (Bearer token based)
 - Hot reload (config changes without restart)
 - CT log health management (automatic retry, circuit breaker)
+- REST API for stats, logs health, and certificate lookup
+- Rate limiting (token bucket + sliding window, tier-based)
+- Backpressure & flow control for slow consumers
+- CLI with validation, dry-run, and metrics export
 
 ## Documentation
 
@@ -93,6 +97,7 @@ docker run -d \
 | `CERTSTREAM_METRICS_ENABLED` | true | Enable /metrics endpoint |
 | `CERTSTREAM_HEALTH_ENABLED` | true | Enable /health endpoint |
 | `CERTSTREAM_EXAMPLE_JSON_ENABLED` | true | Enable /example.json endpoint |
+| `CERTSTREAM_API_ENABLED` | false | Enable REST API endpoints |
 
 **Connection Limiting**
 
@@ -110,6 +115,22 @@ docker run -d \
 | `CERTSTREAM_AUTH_TOKENS` | - | Comma-separated tokens |
 | `CERTSTREAM_AUTH_HEADER_NAME` | Authorization | Auth header |
 
+**Rate Limiting**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CERTSTREAM_RATE_LIMIT_ENABLED` | false | Enable rate limiting |
+
+Rate limiting uses a hybrid token bucket + sliding window algorithm with tier-based limits (Free, Standard, Premium).
+
+**Backpressure**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CERTSTREAM_BACKPRESSURE_ENABLED` | false | Enable backpressure |
+
+Backpressure handles slow consumers with configurable drop policies (drop_oldest, drop_newest, disconnect).
+
 **CT Log Settings**
 
 | Variable | Default | Description |
@@ -125,6 +146,19 @@ docker run -d \
 |----------|---------|-------------|
 | `CERTSTREAM_HOT_RELOAD_ENABLED` | false | Enable hot reload |
 | `CERTSTREAM_HOT_RELOAD_WATCH_PATH` | - | Config file to watch |
+
+### CLI Options
+
+```bash
+certstream-server-rust [OPTIONS]
+
+OPTIONS:
+    --validate-config    Validate configuration and exit
+    --dry-run            Start server without connecting to CT logs
+    --export-metrics     Export current metrics and exit
+    -V, --version        Print version information
+    -h, --help           Print help information
+```
 
 ### Build from Source
 
@@ -170,6 +204,28 @@ Connect to port `8081`. Send `f` for full, `d` for domains, or nothing for lite.
 | `/health` | Health check |
 | `/metrics` | Prometheus metrics |
 | `/example.json` | Example message |
+
+### REST API
+
+Enable with `CERTSTREAM_API_ENABLED=true`.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/stats` | Server statistics (uptime, connections, throughput, cache) |
+| `GET /api/logs` | CT log health status (healthy, degraded, unhealthy counts) |
+| `GET /api/cert/{hash}` | Lookup certificate by SHA256, SHA1, or fingerprint |
+
+Example:
+```bash
+# Get server stats
+curl http://localhost:8080/api/stats
+
+# Get CT log health
+curl http://localhost:8080/api/logs
+
+# Lookup certificate by SHA256 hash
+curl http://localhost:8080/api/cert/F0E2023BCAACBF9D40A4E2C767E77B46BA96AE81240EBC525FA43C0A50BFACDE
+```
 
 ## Performance
 

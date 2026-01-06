@@ -1,17 +1,18 @@
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::config::{AuthConfig, ConnectionLimitConfig};
+use crate::rate_limit::{RateLimitResult, RateLimiter};
 
 pub struct ConnectionLimiter {
     config: ConnectionLimitConfig,
@@ -148,4 +149,30 @@ pub async fn auth_middleware(
     }
 }
 
+pub async fn rate_limit_middleware(
+    State(limiter): State<Arc<RateLimiter>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
 
+    match limiter.check(addr.ip(), token) {
+        RateLimitResult::Allowed => next.run(request).await,
+        RateLimitResult::Rejected { retry_after_ms } => {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Rate limit exceeded. Retry after {}ms", retry_after_ms),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                "Retry-After",
+                ((retry_after_ms / 1000).max(1)).to_string().parse().unwrap(),
+            );
+            response
+        }
+    }
+}

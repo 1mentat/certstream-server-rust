@@ -1,6 +1,6 @@
 [package]
 name = "certstream-server-rust"
-version = "1.0.5"
+version = "1.0.6"
 edition = "2024"
 repository = "https://github.com/burakozcn01/certstream-server-rust"
 license = "MIT"
