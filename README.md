@@ -35,7 +35,6 @@ Certstream aggregates certificates from Certificate Transparency logs and stream
 - CT log health management (automatic retry, circuit breaker)
 - REST API for stats, logs health, and certificate lookup
 - Rate limiting (token bucket + sliding window, tier-based)
-- Backpressure & flow control for slow consumers
 - CLI with validation, dry-run, and metrics export
 
 ## Documentation
@@ -122,14 +121,6 @@ docker run -d \
 | `CERTSTREAM_RATE_LIMIT_ENABLED` | false | Enable rate limiting |
 
 Rate limiting uses a hybrid token bucket + sliding window algorithm with tier-based limits (Free, Standard, Premium).
-
-**Backpressure**
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CERTSTREAM_BACKPRESSURE_ENABLED` | false | Enable backpressure |
-
-Backpressure handles slow consumers with configurable drop policies (drop_oldest, drop_newest, disconnect).
 
 **CT Log Settings**
 

@@ -36,15 +36,12 @@ struct LogState {
     usable: Option<StateInfo>,
     #[serde(default)]
     retired: Option<StateInfo>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    readonly: Option<StateInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct StateInfo {
-    #[allow(dead_code)]
-    timestamp: String,
+    #[serde(rename = "timestamp")]
+    _timestamp: String,
 }
 
 #[derive(Debug, Clone)]

@@ -1,5 +1,4 @@
 mod api;
-mod backpressure;
 mod cli;
 mod config;
 mod ct;
@@ -9,7 +8,6 @@ mod models;
 mod rate_limit;
 mod sse;
 mod state;
-mod tcp;
 mod websocket;
 
 use axum::{middleware as axum_middleware, routing::get, Json, Router};
@@ -30,7 +28,7 @@ use api::{handle_cert, handle_logs, handle_stats, ApiState, CachedCert, Certific
 use cli::{CliArgs, VERSION};
 use config::Config;
 use ct::fetch_log_list;
-use hot_reload::{ConfigWatcher, HotReloadableConfig};
+use hot_reload::{HotReloadManager, HotReloadableConfig};
 use middleware::{auth_middleware, rate_limit_middleware, AuthMiddleware, ConnectionLimiter};
 use models::{CertificateData, CertificateMessage, ChainCert, Extensions, LeafCert, PreSerializedMessage, Source, Subject};
 use rate_limit::{RateLimiter, TierTokens};
@@ -122,7 +120,6 @@ async fn example_json() -> Json<CertificateMessage> {
             source: Arc::new(Source {
                 name: Arc::from("Google 'Argon2024' log"),
                 url: Arc::from("https://ct.googleapis.com/logs/argon2024"),
-                operator: Arc::from("Google"),
             }),
         },
     };
@@ -165,7 +162,6 @@ async fn main() {
                 println!("Metrics: {}", config.protocols.metrics);
                 println!("Connection limit enabled: {}", config.connection_limit.enabled);
                 println!("Rate limit enabled: {}", config.rate_limit.enabled);
-                println!("Backpressure enabled: {}", config.backpressure.enabled);
                 println!("Auth enabled: {}", config.auth.enabled);
                 println!("Hot reload enabled: {}", config.hot_reload.enabled);
             }
@@ -217,16 +213,20 @@ async fn main() {
         info!("state persistence enabled");
     }
 
-    if config.hot_reload.enabled {
+    let hot_reload_manager = if config.hot_reload.enabled {
         let initial_hot_config = HotReloadableConfig {
             connection_limit: config.connection_limit.clone(),
+            rate_limit: config.rate_limit.clone(),
             auth: config.auth.clone(),
         };
-        let config_watcher = ConfigWatcher::new(initial_hot_config);
+        let manager = HotReloadManager::new(initial_hot_config);
         let watch_path = config.hot_reload.watch_path.clone().or(config.config_path.clone());
-        config_watcher.start_watching(watch_path);
+        manager.clone().start_watching(watch_path);
         info!("hot reload enabled");
-    }
+        Some(manager)
+    } else {
+        None
+    };
 
     let ct_log_config = Arc::new(config.ct_log.clone());
     let log_tracker = Arc::new(LogTracker::new());
@@ -237,7 +237,7 @@ async fn main() {
         standard: config.auth.standard_tokens.clone(),
         premium: config.auth.premium_tokens.clone(),
     };
-    let rate_limiter = RateLimiter::new(config.rate_limit.clone(), tier_tokens);
+    let rate_limiter = RateLimiter::new(config.rate_limit.clone(), tier_tokens, hot_reload_manager.clone());
 
     info!(url = %config.ct_logs_url, "fetching CT log list");
 
@@ -296,7 +296,7 @@ async fn main() {
         info!("dry-run mode: skipping CT log connections");
     }
 
-    let connection_limiter = ConnectionLimiter::new(config.connection_limit.clone());
+    let connection_limiter = ConnectionLimiter::new(config.connection_limit.clone(), hot_reload_manager.clone());
 
     if protocols.tcp {
         let tcp_port = protocols.tcp_port.unwrap_or(port + 1);
@@ -315,7 +315,7 @@ async fn main() {
         connections: ConnectionCounter::new(),
         limiter: connection_limiter.clone(),
     });
-    let auth_middleware_state = Arc::new(AuthMiddleware::new(&config.auth));
+    let auth_middleware_state = Arc::new(AuthMiddleware::new(&config.auth, hot_reload_manager.clone()));
 
     let api_state = Arc::new(ApiState {
         stats: server_stats.clone(),
@@ -403,15 +403,6 @@ async fn main() {
         );
     }
 
-    if config.backpressure.enabled {
-        info!(
-            buffer_size = config.backpressure.buffer_size,
-            threshold = config.backpressure.slow_consumer_threshold,
-            policy = %config.backpressure.drop_policy,
-            "backpressure enabled"
-        );
-    }
-
     let addr = SocketAddr::from((host, port));
     info!(address = %addr, "starting server");
 
@@ -474,7 +465,6 @@ async fn run_watcher_with_cache(
     let source = Arc::new(Source {
         name: Arc::from(log.description.as_str()),
         url: Arc::from(base_url.as_str()),
-        operator: Arc::from(log.operator.as_str()),
     });
 
     let health = Arc::new(LogHealth::new());

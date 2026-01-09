@@ -4,8 +4,6 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 
-use crate::backpressure::DropPolicy;
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct CustomCtLog {
     pub name: String,
@@ -228,53 +226,6 @@ fn default_burst_window_seconds() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct BackpressureConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_buffer_size")]
-    pub buffer_size: usize,
-    #[serde(default = "default_slow_consumer_threshold")]
-    pub slow_consumer_threshold: usize,
-    #[serde(default = "default_drop_policy")]
-    pub drop_policy: String,
-}
-
-impl Default for BackpressureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            buffer_size: default_buffer_size(),
-            slow_consumer_threshold: default_slow_consumer_threshold(),
-            drop_policy: default_drop_policy(),
-        }
-    }
-}
-
-impl BackpressureConfig {
-    pub fn to_backpressure_config(&self) -> crate::backpressure::BackpressureConfig {
-        crate::backpressure::BackpressureConfig {
-            buffer_size: self.buffer_size,
-            slow_consumer_threshold: self.slow_consumer_threshold,
-            drop_policy: match self.drop_policy.as_str() {
-                "drop_newest" => DropPolicy::DropNewest,
-                "disconnect" => DropPolicy::Disconnect,
-                _ => DropPolicy::DropOldest,
-            },
-        }
-    }
-}
-
-fn default_buffer_size() -> usize {
-    1024
-}
-fn default_slow_consumer_threshold() -> usize {
-    512
-}
-fn default_drop_policy() -> String {
-    "drop_oldest".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ApiConfig {
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: usize,
@@ -357,7 +308,6 @@ pub struct Config {
     pub ct_log: CtLogConfig,
     pub connection_limit: ConnectionLimitConfig,
     pub rate_limit: RateLimitConfig,
-    pub backpressure: BackpressureConfig,
     pub api: ApiConfig,
     pub auth: AuthConfig,
     pub hot_reload: HotReloadConfig,
@@ -383,8 +333,6 @@ struct YamlConfig {
     connection_limit: Option<ConnectionLimitConfig>,
     #[serde(default)]
     rate_limit: Option<RateLimitConfig>,
-    #[serde(default)]
-    backpressure: Option<BackpressureConfig>,
     #[serde(default)]
     api: Option<ApiConfig>,
     #[serde(default)]
@@ -538,14 +486,6 @@ impl Config {
             cfg
         });
 
-        let backpressure = yaml_config.backpressure.unwrap_or_else(|| {
-            let mut cfg = BackpressureConfig::default();
-            if let Ok(v) = env::var("CERTSTREAM_BACKPRESSURE_ENABLED") {
-                cfg.enabled = v.parse().unwrap_or(false);
-            }
-            cfg
-        });
-
         let api = yaml_config.api.unwrap_or_default();
 
         let auth = yaml_config.auth.unwrap_or_else(|| {
@@ -583,7 +523,6 @@ impl Config {
             ct_log,
             connection_limit,
             rate_limit,
-            backpressure,
             api,
             auth,
             hot_reload,
@@ -646,21 +585,6 @@ impl Config {
                 errors.push(ConfigValidationError {
                     field: "rate_limit.free_refill_rate".to_string(),
                     message: "Refill rate must be positive".to_string(),
-                });
-            }
-        }
-
-        if self.backpressure.enabled {
-            if self.backpressure.buffer_size == 0 {
-                errors.push(ConfigValidationError {
-                    field: "backpressure.buffer_size".to_string(),
-                    message: "Buffer size must be greater than 0".to_string(),
-                });
-            }
-            if self.backpressure.slow_consumer_threshold > self.backpressure.buffer_size {
-                errors.push(ConfigValidationError {
-                    field: "backpressure.slow_consumer_threshold".to_string(),
-                    message: "Slow consumer threshold cannot exceed buffer size".to_string(),
                 });
             }
         }

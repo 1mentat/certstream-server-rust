@@ -12,31 +12,43 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::config::{AuthConfig, ConnectionLimitConfig};
+use crate::hot_reload::HotReloadManager;
 use crate::rate_limit::{RateLimitResult, RateLimiter};
 
 pub struct ConnectionLimiter {
-    config: ConnectionLimitConfig,
+    hot_reload: Option<Arc<HotReloadManager>>,
+    fallback_config: ConnectionLimitConfig,
     total_connections: AtomicU32,
     per_ip_connections: DashMap<IpAddr, u32>,
 }
 
 impl ConnectionLimiter {
-    pub fn new(config: ConnectionLimitConfig) -> Arc<Self> {
+    pub fn new(config: ConnectionLimitConfig, hot_reload: Option<Arc<HotReloadManager>>) -> Arc<Self> {
         Arc::new(Self {
-            config,
+            hot_reload,
+            fallback_config: config,
             total_connections: AtomicU32::new(0),
             per_ip_connections: DashMap::new(),
         })
     }
 
+    fn get_config(&self) -> ConnectionLimitConfig {
+        self.hot_reload
+            .as_ref()
+            .map(|hr| hr.get().connection_limit.clone())
+            .unwrap_or_else(|| self.fallback_config.clone())
+    }
+
     pub fn try_acquire(&self, ip: IpAddr) -> bool {
-        if !self.config.enabled {
+        let config = self.get_config();
+
+        if !config.enabled {
             return true;
         }
 
         loop {
             let current_total = self.total_connections.load(Ordering::SeqCst);
-            if current_total >= self.config.max_connections {
+            if current_total >= config.max_connections {
                 metrics::counter!("certstream_connection_limit_rejected").increment(1);
                 return false;
             }
@@ -50,7 +62,7 @@ impl ConnectionLimiter {
             }
         }
 
-        if let Some(per_ip_limit) = self.config.per_ip_limit {
+        if let Some(per_ip_limit) = config.per_ip_limit {
             let mut should_release = false;
             {
                 let mut entry = self.per_ip_connections.entry(ip).or_insert(0);
@@ -76,7 +88,9 @@ impl ConnectionLimiter {
     }
 
     pub fn release(&self, ip: IpAddr) {
-        if !self.config.enabled {
+        let config = self.get_config();
+
+        if !config.enabled {
             return;
         }
 
@@ -94,22 +108,29 @@ impl ConnectionLimiter {
 
 #[derive(Clone)]
 pub struct AuthMiddleware {
-    enabled: bool,
-    tokens: Vec<Vec<u8>>,
-    header_name: String,
+    hot_reload: Option<Arc<HotReloadManager>>,
+    fallback_config: AuthConfig,
 }
 
 impl AuthMiddleware {
-    pub fn new(config: &AuthConfig) -> Self {
+    pub fn new(config: &AuthConfig, hot_reload: Option<Arc<HotReloadManager>>) -> Self {
         Self {
-            enabled: config.enabled,
-            tokens: config.tokens.iter().map(|t| t.as_bytes().to_vec()).collect(),
-            header_name: config.header_name.clone(),
+            hot_reload,
+            fallback_config: config.clone(),
         }
     }
 
+    fn get_config(&self) -> AuthConfig {
+        self.hot_reload
+            .as_ref()
+            .map(|hr| hr.get().auth.clone())
+            .unwrap_or_else(|| self.fallback_config.clone())
+    }
+
     pub fn validate(&self, token: Option<&str>) -> bool {
-        if !self.enabled {
+        let config = self.get_config();
+
+        if !config.enabled {
             return true;
         }
 
@@ -117,13 +138,22 @@ impl AuthMiddleware {
             Some(t) => {
                 let token_value = t.strip_prefix("Bearer ").unwrap_or(t);
                 let token_bytes = token_value.as_bytes();
-                self.tokens.iter().any(|stored| {
-                    stored.len() == token_bytes.len()
-                        && stored.ct_eq(token_bytes).into()
+                config.tokens.iter().any(|stored| {
+                    let stored_bytes = stored.as_bytes();
+                    stored_bytes.len() == token_bytes.len()
+                        && stored_bytes.ct_eq(token_bytes).into()
                 })
             }
             None => false,
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.get_config().enabled
+    }
+
+    pub fn header_name(&self) -> String {
+        self.get_config().header_name
     }
 }
 
@@ -132,13 +162,14 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !auth.enabled {
+    if !auth.is_enabled() {
         return next.run(request).await;
     }
 
+    let header_name = auth.header_name();
     let token = request
         .headers()
-        .get(&auth.header_name)
+        .get(&header_name)
         .and_then(|v| v.to_str().ok());
 
     if auth.validate(token) {

@@ -1,6 +1,28 @@
-# Release Notes - v1.0.6
+# Release Notes - v1.0.7
 
-**Release Date**: January 6, 2026
+**Release Date**: January 9, 2026
+
+## Bug Fixes
+
+### Hot Reload Fixed
+
+Fixed hot reload feature that was not applying configuration changes at runtime:
+
+- Config changes now properly propagate to connection limiter, rate limiter, and auth middleware
+- Uses ArcSwap for lock-free reads during hot reload
+
+### Code Cleanup
+
+- Removed dead code and unused dependencies
+- Removed `backpressure` feature (was never integrated)
+- Removed `tcp` module (was never integrated)
+- Cleaned up unused struct fields
+
+---
+
+# Previous Releases
+
+## v1.0.6 (January 6, 2026)
 
 ## New Features
 
@@ -24,16 +46,6 @@ Advanced rate limiting with token bucket + sliding window hybrid algorithm:
 - **Burst Allowance**: Temporary burst capacity for each tier
 
 Enable with `CERTSTREAM_RATE_LIMIT_ENABLED=true`.
-
-### Backpressure & Flow Control
-
-Slow consumer detection and message handling:
-
-- **ClientBuffer**: Bounded message queue per client
-- **Slow Consumer Threshold**: Detect clients falling behind
-- **Drop Policies**: `drop_oldest`, `drop_newest`, or `disconnect`
-
-Enable with `CERTSTREAM_BACKPRESSURE_ENABLED=true`.
 
 ### CLI Enhancements
 
@@ -60,7 +72,6 @@ certstream-server-rust --dry-run
 docker run -d -p 8080:8080 \
   -e CERTSTREAM_API_ENABLED=true \
   -e CERTSTREAM_RATE_LIMIT_ENABLED=true \
-  -e CERTSTREAM_BACKPRESSURE_ENABLED=true \
   reloading01/certstream-server-rust:1.0.6
 ```
 

@@ -200,7 +200,6 @@ async fn handle_socket(
         }
     }
 
-    // Release connection limit when socket closes
     state.limiter.release(client_ip);
     state.connections.decrement(stream_type);
     info!(

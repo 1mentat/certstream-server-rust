@@ -141,9 +141,6 @@ pub struct ChainCert {
 pub struct Source {
     pub name: Arc<str>,
     pub url: Arc<str>,
-    #[serde(skip_serializing)]
-    #[allow(dead_code)]
-    pub operator: Arc<str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

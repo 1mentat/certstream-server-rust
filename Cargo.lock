@@ -255,8 +255,9 @@ dependencies = [
 
 [[package]]
 name = "certstream-server-rust"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
+ "arc-swap",
  "axum",
  "axum-server",
  "backon",
