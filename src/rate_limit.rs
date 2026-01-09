@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::RateLimitConfig;
+use crate::hot_reload::HotReloadManager;
 
 pub struct TokenBucket {
     tokens: f64,
@@ -39,6 +40,12 @@ impl TokenBucket {
         self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
         self.last_refill = now;
     }
+
+    fn update_limits(&mut self, max_tokens: f64, refill_rate: f64) {
+        self.max_tokens = max_tokens;
+        self.refill_rate = refill_rate;
+        self.tokens = self.tokens.min(max_tokens);
+    }
 }
 
 pub struct SlidingWindow {
@@ -66,6 +73,11 @@ impl SlidingWindow {
         } else {
             false
         }
+    }
+
+    fn update_limits(&mut self, window_size: Duration, max_requests: u32) {
+        self.window_size = window_size;
+        self.max_requests = max_requests;
     }
 }
 
@@ -134,45 +146,62 @@ struct ClientRateLimit {
 }
 
 pub struct RateLimiter {
-    config: RateLimitConfig,
+    hot_reload: Option<Arc<HotReloadManager>>,
+    fallback_config: RateLimitConfig,
     clients: DashMap<IpAddr, Mutex<ClientRateLimit>>,
     tier_tokens: TierTokens,
 }
 
 impl RateLimiter {
-    pub fn new(config: RateLimitConfig, tier_tokens: TierTokens) -> Arc<Self> {
+    pub fn new(config: RateLimitConfig, tier_tokens: TierTokens, hot_reload: Option<Arc<HotReloadManager>>) -> Arc<Self> {
         Arc::new(Self {
-            config,
+            hot_reload,
+            fallback_config: config,
             clients: DashMap::new(),
             tier_tokens,
         })
     }
 
+    fn get_config(&self) -> RateLimitConfig {
+        self.hot_reload
+            .as_ref()
+            .map(|hr| hr.get().rate_limit.clone())
+            .unwrap_or_else(|| self.fallback_config.clone())
+    }
+
     pub fn check(&self, ip: IpAddr, token: Option<&str>) -> RateLimitResult {
-        if !self.config.enabled {
+        let config = self.get_config();
+
+        if !config.enabled {
             return RateLimitResult::Allowed;
         }
 
         let tier = RateLimitTier::from_token(token, &self.tier_tokens);
-        let limits = tier.limits(&self.config);
+        let limits = tier.limits(&config);
 
         let entry = self.clients.entry(ip).or_insert_with(|| {
             Mutex::new(ClientRateLimit {
                 token_bucket: TokenBucket::new(limits.max_tokens, limits.refill_rate),
                 sliding_window: SlidingWindow::new(
-                    Duration::from_secs(self.config.window_seconds),
-                    self.config.window_max_requests,
+                    Duration::from_secs(config.window_seconds),
+                    config.window_max_requests,
                 ),
                 tier,
                 burst_used: 0.0,
-                burst_reset: Instant::now() + Duration::from_secs(self.config.burst_window_seconds),
+                burst_reset: Instant::now() + Duration::from_secs(config.burst_window_seconds),
             })
         });
 
         let mut client = entry.lock();
+        let current_limits = client.tier.limits(&config);
+        client.token_bucket.update_limits(current_limits.max_tokens, current_limits.refill_rate);
+        client.sliding_window.update_limits(
+            Duration::from_secs(config.window_seconds),
+            config.window_max_requests,
+        );
 
         if client.tier != tier {
-            let new_limits = tier.limits(&self.config);
+            let new_limits = tier.limits(&config);
             client.token_bucket = TokenBucket::new(new_limits.max_tokens, new_limits.refill_rate);
             client.tier = tier;
         }
@@ -180,7 +209,7 @@ impl RateLimiter {
         if !client.sliding_window.try_acquire() {
             metrics::counter!("certstream_rate_limit_rejected", "reason" => "sliding_window").increment(1);
             return RateLimitResult::Rejected {
-                retry_after_ms: self.config.window_seconds * 1000 / 2,
+                retry_after_ms: config.window_seconds * 1000 / 2,
             };
         }
 
@@ -191,7 +220,7 @@ impl RateLimiter {
         let now = Instant::now();
         if now >= client.burst_reset {
             client.burst_used = 0.0;
-            client.burst_reset = now + Duration::from_secs(self.config.burst_window_seconds);
+            client.burst_reset = now + Duration::from_secs(config.burst_window_seconds);
         }
 
         if client.burst_used < limits.burst_allowance {
@@ -219,10 +248,4 @@ impl RateLimiter {
 pub enum RateLimitResult {
     Allowed,
     Rejected { retry_after_ms: u64 },
-}
-
-impl RateLimitResult {
-    pub fn is_allowed(&self) -> bool {
-        matches!(self, RateLimitResult::Allowed)
-    }
 }

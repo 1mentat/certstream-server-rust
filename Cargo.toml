@@ -1,6 +1,6 @@
 [package]
 name = "certstream-server-rust"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 repository = "https://github.com/burakozcn01/certstream-server-rust"
 license = "MIT"
@@ -37,6 +37,7 @@ backon = "1"
 dashmap = "6"
 notify = { version = "7", features = ["macos_kqueue"] }
 subtle = "2.6"
+arc-swap = "1.7"
 
 [profile.release]
 lto = true
