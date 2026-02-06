@@ -81,7 +81,7 @@ impl SlidingWindow {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitTier {
     Free,
     Standard,
@@ -248,4 +248,241 @@ impl RateLimiter {
 pub enum RateLimitResult {
     Allowed,
     Rejected { retry_after_ms: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RateLimitConfig;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    fn test_config(enabled: bool) -> RateLimitConfig {
+        RateLimitConfig {
+            enabled,
+            window_seconds: 60,
+            window_max_requests: 100,
+            burst_window_seconds: 10,
+            free_max_tokens: 5.0,
+            free_refill_rate: 1.0,
+            free_burst: 2.0,
+            standard_max_tokens: 50.0,
+            standard_refill_rate: 10.0,
+            standard_burst: 20.0,
+            premium_max_tokens: 200.0,
+            premium_refill_rate: 50.0,
+            premium_burst: 100.0,
+        }
+    }
+
+    fn test_tier_tokens() -> TierTokens {
+        TierTokens {
+            standard: vec!["std-token".to_string()],
+            premium: vec!["premium-token".to_string()],
+        }
+    }
+
+    fn ip(last_octet: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet))
+    }
+
+    #[test]
+    fn test_tier_from_none_token_is_free() {
+        let tokens = test_tier_tokens();
+        let tier = RateLimitTier::from_token(None, &tokens);
+        assert_eq!(tier, RateLimitTier::Free);
+    }
+
+    #[test]
+    fn test_tier_from_unknown_token_is_free() {
+        let tokens = test_tier_tokens();
+        let tier = RateLimitTier::from_token(Some("unknown-garbage"), &tokens);
+        assert_eq!(tier, RateLimitTier::Free);
+    }
+
+    #[test]
+    fn test_tier_from_standard_token() {
+        let tokens = test_tier_tokens();
+        let tier = RateLimitTier::from_token(Some("std-token"), &tokens);
+        assert_eq!(tier, RateLimitTier::Standard);
+    }
+
+    #[test]
+    fn test_tier_from_premium_token() {
+        let tokens = test_tier_tokens();
+        let tier = RateLimitTier::from_token(Some("premium-token"), &tokens);
+        assert_eq!(tier, RateLimitTier::Premium);
+    }
+
+    #[test]
+    fn test_tier_strips_bearer_prefix() {
+        let tokens = test_tier_tokens();
+
+        let tier_std = RateLimitTier::from_token(Some("Bearer std-token"), &tokens);
+        assert_eq!(tier_std, RateLimitTier::Standard);
+
+        let tier_prem = RateLimitTier::from_token(Some("Bearer premium-token"), &tokens);
+        assert_eq!(tier_prem, RateLimitTier::Premium);
+
+        // Bearer prefix with unknown token still resolves to Free
+        let tier_unknown = RateLimitTier::from_token(Some("Bearer nope"), &tokens);
+        assert_eq!(tier_unknown, RateLimitTier::Free);
+    }
+
+    #[test]
+    fn test_check_disabled_always_allowed() {
+        let limiter = RateLimiter::new(test_config(false), test_tier_tokens(), None);
+        let addr = ip(1);
+
+        // Even many rapid requests should all be allowed when disabled.
+        for _ in 0..500 {
+            match limiter.check(addr, None) {
+                RateLimitResult::Allowed => {}
+                RateLimitResult::Rejected { .. } => {
+                    panic!("should never reject when rate limiting is disabled");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_first_request_allowed() {
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let addr = ip(2);
+
+        match limiter.check(addr, None) {
+            RateLimitResult::Allowed => {} // expected
+            RateLimitResult::Rejected { .. } => {
+                panic!("first request should always be allowed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_free_tier_eventually_rejected() {
+        // Free tier: 5 tokens + 2 burst = 7 requests before rejection.
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let addr = ip(3);
+
+        let mut rejected = false;
+        for _ in 0..50 {
+            if let RateLimitResult::Rejected { retry_after_ms } = limiter.check(addr, None) {
+                assert!(retry_after_ms > 0, "retry_after_ms should be positive");
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "free tier should eventually be rate limited");
+    }
+
+    #[test]
+    fn test_check_different_ips_independent() {
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let addr_a = ip(10);
+        let addr_b = ip(11);
+
+        // Exhaust addr_a's allowance (free tier: 5 tokens + 2 burst).
+        for _ in 0..50 {
+            limiter.check(addr_a, None);
+        }
+
+        // addr_b should still be allowed on its first request.
+        match limiter.check(addr_b, None) {
+            RateLimitResult::Allowed => {} // expected
+            RateLimitResult::Rejected { .. } => {
+                panic!("addr_b should not be affected by addr_a's exhaustion");
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_standard_tier_has_more_capacity() {
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let free_ip = ip(20);
+        let std_ip = ip(21);
+
+        // Consume 8 requests on each — free should be rejected, standard should not.
+        let mut free_rejected = false;
+        for _ in 0..8 {
+            if let RateLimitResult::Rejected { .. } = limiter.check(free_ip, None) {
+                free_rejected = true;
+            }
+        }
+
+        let mut std_rejected = false;
+        for _ in 0..8 {
+            if let RateLimitResult::Rejected { .. } =
+                limiter.check(std_ip, Some("std-token"))
+            {
+                std_rejected = true;
+            }
+        }
+
+        assert!(
+            free_rejected,
+            "free tier should be rejected within 8 requests"
+        );
+        assert!(
+            !std_rejected,
+            "standard tier should still be allowed after 8 requests"
+        );
+    }
+
+    #[test]
+    fn test_check_premium_tier_has_most_capacity() {
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let premium_ip = ip(30);
+
+        // Premium: 200 tokens + 100 burst. Even 100 requests should all pass.
+        let mut any_rejected = false;
+        for _ in 0..100 {
+            if let RateLimitResult::Rejected { .. } =
+                limiter.check(premium_ip, Some("premium-token"))
+            {
+                any_rejected = true;
+                break;
+            }
+        }
+        assert!(
+            !any_rejected,
+            "premium tier should handle 100 rapid requests without rejection"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_stale_removes_old_entries() {
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let addr = ip(40);
+
+        // Generate an entry by sending a request.
+        limiter.check(addr, None);
+        assert!(
+            limiter.clients.contains_key(&addr),
+            "client entry should exist after a request"
+        );
+
+        // Cleanup with max_age = 0 means everything is stale.
+        limiter.cleanup_stale(Duration::from_secs(0));
+        assert!(
+            !limiter.clients.contains_key(&addr),
+            "client entry should be removed after cleanup with zero max_age"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_stale_keeps_fresh_entries() {
+        let limiter = RateLimiter::new(test_config(true), test_tier_tokens(), None);
+        let addr = ip(41);
+
+        // Generate an entry by sending a request.
+        limiter.check(addr, None);
+
+        // Cleanup with a very large max_age; the entry was just created so it
+        // should survive.
+        limiter.cleanup_stale(Duration::from_secs(3600));
+        assert!(
+            limiter.clients.contains_key(&addr),
+            "fresh client entry should survive cleanup with large max_age"
+        );
+    }
 }

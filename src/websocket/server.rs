@@ -149,10 +149,46 @@ async fn handle_socket(
     );
 
     let mut heartbeat_interval = interval(Duration::from_secs(30));
+    let mut ping_interval = interval(Duration::from_secs(15));
+    let mut last_pong = std::time::Instant::now();
+    let pong_timeout = Duration::from_secs(45);
 
     loop {
         tokio::select! {
             biased;
+
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Ping(data))) => {
+                        if sender.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong = std::time::Instant::now();
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            _ = ping_interval.tick() => {
+                if last_pong.elapsed() > pong_timeout {
+                    debug!(ip = %client_ip, "client pong timeout, disconnecting");
+                    break;
+                }
+                if sender.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
+
+            _ = heartbeat_interval.tick() => {
+                if sender.send(Message::Text(HEARTBEAT_JSON.into())).await.is_err() {
+                    break;
+                }
+            }
 
             result = rx.recv() => {
                 match result {
@@ -174,27 +210,6 @@ async fn handle_socket(
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
                     }
-                }
-            }
-
-            _ = heartbeat_interval.tick() => {
-                if sender.send(Message::Text(HEARTBEAT_JSON.into())).await.is_err() {
-                    break;
-                }
-            }
-
-            msg = receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Ping(data))) => {
-                        if sender.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => {
-                        break;
-                    }
-                    _ => {}
                 }
             }
         }

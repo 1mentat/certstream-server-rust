@@ -7,8 +7,6 @@ ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
 protocols:
   websocket: true
   sse: true
-  tcp: false
-  tcp_port: 8081
   metrics: true
   health: true
   example_json: true
@@ -21,7 +19,7 @@ ct_log:
   healthy_threshold: 2
   unhealthy_threshold: 5
   health_check_interval_secs: 60
-  state_file: null
+  state_file: "certstream_state.json"
   batch_size: 256
   poll_interval_ms: 1000
 
@@ -40,3 +38,16 @@ hot_reload:
   watch_path: null
 
 custom_logs: []
+
+# Static CT logs (Sunlight / static-ct-api protocol)
+# These logs use checkpoint + tile-based fetching instead of get-sth/get-entries
+# Use monitoring prefix (mon.*) for read access to checkpoint and tile data
+static_logs:
+  - name: "Let's Encrypt 'Willow' 2026h1"
+    url: "https://mon.willow.ct.letsencrypt.org/2026h1/"
+  - name: "Let's Encrypt 'Sycamore' 2026h1"
+    url: "https://mon.sycamore.ct.letsencrypt.org/2026h1/"
+  - name: "Let's Encrypt 'Willow' 2025h2d"
+    url: "https://mon.willow.ct.letsencrypt.org/2025h2d/"
+  - name: "Let's Encrypt 'Sycamore' 2025h2d"
+    url: "https://mon.sycamore.ct.letsencrypt.org/2025h2d/"

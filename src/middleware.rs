@@ -104,6 +104,10 @@ impl ConnectionLimiter {
             }
         }
     }
+
+    pub fn current_connections(&self) -> u32 {
+        self.total_connections.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Clone)]
@@ -205,5 +209,208 @@ pub async fn rate_limit_middleware(
             );
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthConfig, ConnectionLimitConfig};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_ip(last_octet: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, last_octet))
+    }
+
+    fn limiter_config(enabled: bool, max: u32, per_ip: Option<u32>) -> ConnectionLimitConfig {
+        ConnectionLimitConfig {
+            enabled,
+            max_connections: max,
+            per_ip_limit: per_ip,
+        }
+    }
+
+    fn auth_config(enabled: bool, tokens: Vec<&str>) -> AuthConfig {
+        AuthConfig {
+            enabled,
+            tokens: tokens.into_iter().map(String::from).collect(),
+            header_name: "Authorization".to_string(),
+            standard_tokens: Vec::new(),
+            premium_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn limiter_disabled_always_allows() {
+        let limiter = ConnectionLimiter::new(limiter_config(false, 1, Some(1)), None);
+        let ip = test_ip(1);
+
+        // Should succeed even though max_connections and per_ip_limit are 1
+        assert!(limiter.try_acquire(ip));
+        assert!(limiter.try_acquire(ip));
+        assert!(limiter.try_acquire(ip));
+    }
+
+    #[test]
+    fn limiter_acquire_within_limits() {
+        let limiter = ConnectionLimiter::new(limiter_config(true, 3, None), None);
+
+        assert!(limiter.try_acquire(test_ip(1)));
+        assert!(limiter.try_acquire(test_ip(2)));
+        assert!(limiter.try_acquire(test_ip(3)));
+    }
+
+    #[test]
+    fn limiter_rejects_at_max_connections() {
+        let limiter = ConnectionLimiter::new(limiter_config(true, 3, None), None);
+
+        assert!(limiter.try_acquire(test_ip(1)));
+        assert!(limiter.try_acquire(test_ip(2)));
+        assert!(limiter.try_acquire(test_ip(3)));
+        // 4th connection should be rejected
+        assert!(!limiter.try_acquire(test_ip(4)));
+    }
+
+    #[test]
+    fn limiter_per_ip_limit_enforcement() {
+        let limiter = ConnectionLimiter::new(limiter_config(true, 10, Some(2)), None);
+        let ip = test_ip(1);
+
+        assert!(limiter.try_acquire(ip));
+        assert!(limiter.try_acquire(ip));
+        // 3rd from same IP should be rejected
+        assert!(!limiter.try_acquire(ip));
+        // Different IP should still work
+        assert!(limiter.try_acquire(test_ip(2)));
+    }
+
+    #[test]
+    fn limiter_release_decrements_and_reallows() {
+        let limiter = ConnectionLimiter::new(limiter_config(true, 2, Some(1)), None);
+        let ip = test_ip(1);
+
+        assert!(limiter.try_acquire(ip));
+        // Second from same IP blocked by per-IP limit
+        assert!(!limiter.try_acquire(ip));
+
+        limiter.release(ip);
+
+        // After release, same IP can acquire again
+        assert!(limiter.try_acquire(ip));
+    }
+
+    #[test]
+    fn limiter_release_frees_total_slot() {
+        let limiter = ConnectionLimiter::new(limiter_config(true, 2, None), None);
+
+        assert!(limiter.try_acquire(test_ip(1)));
+        assert!(limiter.try_acquire(test_ip(2)));
+        assert!(!limiter.try_acquire(test_ip(3)));
+
+        limiter.release(test_ip(1));
+
+        // Slot freed, new IP can connect
+        assert!(limiter.try_acquire(test_ip(3)));
+    }
+
+    #[test]
+    fn limiter_current_connections_tracks_correctly() {
+        let limiter = ConnectionLimiter::new(limiter_config(true, 10, None), None);
+
+        assert_eq!(limiter.current_connections(), 0);
+
+        limiter.try_acquire(test_ip(1));
+        assert_eq!(limiter.current_connections(), 1);
+
+        limiter.try_acquire(test_ip(2));
+        limiter.try_acquire(test_ip(3));
+        assert_eq!(limiter.current_connections(), 3);
+
+        limiter.release(test_ip(2));
+        assert_eq!(limiter.current_connections(), 2);
+    }
+
+    #[test]
+    fn limiter_disabled_does_not_track_connections() {
+        let limiter = ConnectionLimiter::new(limiter_config(false, 10, None), None);
+
+        limiter.try_acquire(test_ip(1));
+        limiter.try_acquire(test_ip(2));
+        // When disabled, the atomic counter is never incremented
+        assert_eq!(limiter.current_connections(), 0);
+    }
+
+    #[test]
+    fn auth_disabled_always_validates() {
+        let auth = AuthMiddleware::new(
+            &auth_config(false, vec!["secret-token"]),
+            None,
+        );
+
+        assert!(auth.validate(None));
+        assert!(auth.validate(Some("wrong")));
+        assert!(auth.validate(Some("")));
+    }
+
+    #[test]
+    fn auth_valid_token_accepted() {
+        let auth = AuthMiddleware::new(
+            &auth_config(true, vec!["secret-token", "other-token"]),
+            None,
+        );
+
+        assert!(auth.validate(Some("secret-token")));
+        assert!(auth.validate(Some("other-token")));
+    }
+
+    #[test]
+    fn auth_invalid_token_rejected() {
+        let auth = AuthMiddleware::new(
+            &auth_config(true, vec!["secret-token"]),
+            None,
+        );
+
+        assert!(!auth.validate(Some("wrong-token")));
+        assert!(!auth.validate(Some("SECRET-TOKEN"))); // case-sensitive
+        assert!(!auth.validate(Some("secret-token "))); // trailing space
+    }
+
+    #[test]
+    fn auth_none_token_rejected() {
+        let auth = AuthMiddleware::new(
+            &auth_config(true, vec!["secret-token"]),
+            None,
+        );
+
+        assert!(!auth.validate(None));
+    }
+
+    #[test]
+    fn auth_bearer_prefix_stripped() {
+        let auth = AuthMiddleware::new(
+            &auth_config(true, vec!["secret-token"]),
+            None,
+        );
+
+        assert!(auth.validate(Some("Bearer secret-token")));
+        // Without prefix also works
+        assert!(auth.validate(Some("secret-token")));
+        // Wrong prefix should fail (token becomes "bearer secret-token" != "secret-token")
+        assert!(!auth.validate(Some("bearer secret-token")));
+    }
+
+    #[test]
+    fn auth_is_enabled_returns_correct_value() {
+        let enabled = AuthMiddleware::new(
+            &auth_config(true, vec!["t"]),
+            None,
+        );
+        let disabled = AuthMiddleware::new(
+            &auth_config(false, vec![]),
+            None,
+        );
+
+        assert!(enabled.is_enabled());
+        assert!(!disabled.is_enabled());
     }
 }

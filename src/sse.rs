@@ -83,7 +83,7 @@ fn process_message(
 
     std::str::from_utf8(bytes)
         .ok()
-        .map(|json_str| Ok(Event::default().data(json_str.to_owned())))
+        .map(|json_str| Ok(Event::default().data(json_str)))
 }
 
 struct SseStreamWrapper<S> {

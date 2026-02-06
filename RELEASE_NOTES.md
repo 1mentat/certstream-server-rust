@@ -1,200 +1,238 @@
-# Release Notes - v1.0.7
+# Release Notes
 
-**Release Date**: January 9, 2026
+## v1.2.0 — Static CT Log Support, Stability & Performance Overhaul
 
-## Bug Fixes
+**February 6, 2026**
 
-### Hot Reload Fixed
+Major release adding static CT protocol (RFC 6962-bis) support, cross-log certificate deduplication, full CT log coverage, and significant stability/performance improvements — preparing for Let's Encrypt's RFC 6962 shutdown on February 28, 2026.
 
-Fixed hot reload feature that was not applying configuration changes at runtime:
+### Breaking Changes
 
-- Config changes now properly propagate to connection limiter, rate limiter, and auth middleware
-- Uses ArcSwap for lock-free reads during hot reload
+- **TCP protocol removed.** Switch to WebSocket (`ws://host:8080/`) or SSE (`http://host:8080/sse`). Related env vars `CERTSTREAM_TCP_ENABLED` and `CERTSTREAM_TCP_PORT` have been removed.
 
-### Code Cleanup
+### New Features
 
-- Removed dead code and unused dependencies
-- Removed `backpressure` feature (was never integrated)
-- Removed `tcp` module (was never integrated)
-- Cleaned up unused struct fields
+**Static CT Log Protocol (Sunlight / static-ct-api)**
+Full support for the checkpoint + tile-based static CT API per [c2sp.org/static-ct-api](https://c2sp.org/static-ct-api). Includes binary tile parsing (x509/precert), hierarchical tile path encoding, gzip decompression, and issuer certificate fetching with DashMap-based caching. Four Let's Encrypt Sunlight logs are configured by default (Willow/Sycamore 2025h2d/2026h1).
 
----
+**Cross-Log Certificate Deduplication**
+SHA-256 based dedup filter prevents duplicate broadcasts when the same certificate appears across multiple CT logs. Configured with a 5-minute TTL, 60-second cleanup interval, and 500K entry capacity (~50 MB max). Runs as a background task with graceful cancellation — always active, no configuration needed.
 
-# Previous Releases
+**Full CT Log Coverage**
+Now monitors all CT logs except rejected/retired (previously only "usable"). Adds Google Solera logs (2018–2027) and readonly logs. 63 candidates → 49 reachable.
 
-## v1.0.6 (January 6, 2026)
+**Startup Health Check**
+Parallel health checks filter unreachable logs on startup with a 5-second timeout, preventing warning spam from defunct logs. Workers start with 50 ms staggered intervals to reduce rate limiting.
 
-## New Features
+**Circuit Breaker Pattern**
+Handles unreliable CT logs gracefully: Closed (normal) → Open (30 s block) → HalfOpen (testing). Paired with exponential backoff (1 s min → 60 s max).
 
-### REST API Endpoints
+**Graceful Shutdown**
+`CancellationToken` for coordinated worker termination on SIGINT/SIGTERM. Workers complete current work before stopping.
 
-New REST API for querying server state and certificates:
+**Deep Health Endpoint**
+`GET /health/deep` returns per-log health status with connection count and uptime. Returns HTTP 503 when >50% of logs are failing.
 
-- `GET /api/stats` - Server statistics (uptime, connections, throughput, cache metrics)
-- `GET /api/logs` - CT log health status with per-log details
-- `GET /api/cert/{hash}` - Certificate lookup by SHA256, SHA1, or fingerprint
+**New Prometheus Metrics**
 
-Enable with `CERTSTREAM_API_ENABLED=true`.
+| Metric | Type | Description |
+|--------|------|-------------|
+| `certstream_static_ct_logs_count` | Gauge | Static CT logs monitored |
+| `certstream_static_ct_tiles_fetched` | Counter | Tiles fetched from static CT logs |
+| `certstream_static_ct_entries_parsed` | Counter | Entries parsed from static CT tiles |
+| `certstream_static_ct_parse_failures` | Counter | Failed static CT entry parses |
+| `certstream_static_ct_checkpoint_errors` | Counter | Checkpoint fetch/parse errors |
+| `certstream_issuer_cache_size` | Gauge | Cached issuer certificates |
+| `certstream_issuer_cache_hits` | Counter | Issuer cache hits |
+| `certstream_issuer_cache_misses` | Counter | Issuer cache misses |
+| `certstream_duplicates_filtered` | Counter | Certificates filtered by dedup |
+| `certstream_dedup_cache_size` | Gauge | Current dedup cache size |
+| `certstream_worker_panics` | Counter | Worker panics (auto-recovered) |
+| `certstream_log_health_checks_failed` | Counter | Failed log health checks |
 
-### Rate Limiting
+Per-log metrics (`certstream_messages_sent`, `certstream_parse_failures`, and all `static_ct_*` counters) now include a `log` label for per-source breakdown in Grafana.
 
-Advanced rate limiting with token bucket + sliding window hybrid algorithm:
-
-- **Token Bucket**: Smooth rate limiting with configurable refill
-- **Sliding Window**: Request counting over time windows
-- **Tier-based Limits**: Free, Standard, and Premium tiers
-- **Burst Allowance**: Temporary burst capacity for each tier
-
-Enable with `CERTSTREAM_RATE_LIMIT_ENABLED=true`.
-
-### CLI Enhancements
-
-New command-line options:
-
-```bash
---validate-config    Validate configuration and exit
---dry-run            Start server without connecting to CT logs
---export-metrics     Export current metrics and exit
--V, --version        Print version information
--h, --help           Print help information
-```
-
-## Example Usage
+**Grafana Dashboard & Monitoring Stack**
+Pre-built Grafana dashboard with per-source certificate volume, dedup efficiency, and static CT panels. Prometheus + Grafana run behind Docker Compose's `monitoring` profile and are not started by default:
 
 ```bash
-# Validate config before starting
-certstream-server-rust --validate-config
+# Server only
+docker compose up -d
 
-# Start in dry-run mode for testing
-certstream-server-rust --dry-run
-
-# Enable all new features
-docker run -d -p 8080:8080 \
-  -e CERTSTREAM_API_ENABLED=true \
-  -e CERTSTREAM_RATE_LIMIT_ENABLED=true \
-  reloading01/certstream-server-rust:1.0.6
+# With monitoring
+docker compose --profile monitoring up -d
 ```
 
----
+Default Grafana credentials: `admin` / `certstream` (configurable via `GRAFANA_USER` / `GRAFANA_PASSWORD`).
 
-# Previous Releases
+### Bug Fixes
 
-## v1.0.5 (December 28, 2025)
+**State Persistence — AtomicBool Dirty Flag** *(Critical)*
+`update_index()` used `try_write()` on a tokio `RwLock<bool>`, which silently failed when `save_if_dirty()` held a read lock, causing lost state updates. Replaced with `AtomicBool` using `Ordering::Relaxed`.
 
-### Changes
+**State Persistence — Shutdown Flush** *(Critical)*
+`save_if_dirty()` was never called on SIGINT/SIGTERM, losing up to 30 seconds of progress on every restart. Now flushes state after the HTTP server stops.
 
-### Complete Certificate Field Compatibility with certstream-server-go
+**State Persistence — Periodic Save Never Stops**
+`start_periodic_save()` spawned an infinite loop with no cancellation mechanism. Now accepts a `CancellationToken` and flushes state before exiting.
 
-This release adds full compatibility with certstream-server-go certificate output format.
+**State Persistence — Default State File**
+`state_file` defaulted to `null`, silently disabling persistence. Changed default to `"certstream_state.json"`.
 
-### New Certificate Fields
+**Subject/Issuer Parsing Always Null** *(Critical)*
+All certificates had `null` subject/issuer fields because `as_str()` only handled UTF8String ASN.1 encoding. Real-world certificates use PrintableString, IA5String, and others. Added a raw byte fallback for ASCII-compatible encodings.
 
-**LeafCert/ChainCert:**
-- `sha1` - SHA1 fingerprint (separate field, colon-separated hex)
-- `sha256` - SHA256 fingerprint (separate field, colon-separated hex)
-- `signature_algorithm` - Algorithm used to sign the certificate (e.g., "sha256, rsa", "ecdsa, sha256")
-- `is_ca` - Boolean indicating if certificate is a CA
+**Config Environment Variable Override Ignored**
+Env vars for a config section were silently ignored when that YAML section existed. Env var overrides now always apply on top of YAML values.
 
-**Subject/Issuer (now a struct instead of HashMap):**
-- `C` - Country
-- `CN` - Common Name
-- `L` - Locality
-- `O` - Organization
-- `OU` - Organizational Unit
-- `ST` - State/Province
-- `aggregated` - Combined string format (e.g., "/C=US/CN=example.com/O=Example Inc")
-- `email_address` - Email address from certificate
+**Inconsistent Subject/Issuer JSON Serialization**
+Stream endpoints serialized empty fields as `null` while the cert lookup API omitted them. Added `skip_serializing_if = "Option::is_none"` for consistent omission of empty fields.
 
-**Extensions (fully parsed):**
-- `authorityInfoAccess` - CA info and OCSP URLs
-- `authorityKeyIdentifier` - Authority key ID
-- `basicConstraints` - "CA:TRUE" or "CA:FALSE"
-- `certificatePolicies` - Policy OIDs
-- `extendedKeyUsage` - "serverAuth", "clientAuth", etc.
-- `keyUsage` - "Digital Signature", "Key Encipherment", etc.
-- `subjectAltName` - "DNS:example.com, IP Address:1.2.3.4, email:x@y.com"
-- `subjectKeyIdentifier` - Subject key ID
-- `ctlPoisonByte` - Boolean for precert detection
+**HTTP Status Check Before JSON Parse** *(Critical)*
+CT logs (especially DigiCert) returning 400/429/5xx caused continuous JSON parse errors, CPU strain, and log spam. Non-2xx responses are now logged as warnings with proper status codes.
 
-**Source:**
-- `operator` - CT log operator name (Google, Cloudflare, DigiCert, etc.)
+**Worker Panic Recovery**
+Worker threads silently died on panic, leaving CT logs unmonitored. Implemented `catch_unwind` with automatic restart after 5-second delay.
 
-### Example Output
+**WebSocket Ping Priority**
+Ping/pong had lowest priority in `tokio::select!`, causing client timeouts. Reordered with `biased;`.
 
-```json
-{
-  "message_type": "certificate_update",
-  "data": {
-    "leaf_cert": {
-      "subject": {
-        "CN": "example.com",
-        "O": "Example Inc",
-        "C": "US",
-        "aggregated": "/C=US/CN=example.com/O=Example Inc"
-      },
-      "issuer": {
-        "CN": "R3",
-        "O": "Let's Encrypt",
-        "aggregated": "/CN=R3/O=Let's Encrypt"
-      },
-      "serial_number": "0123456789ABCDEF",
-      "not_before": 1704067200,
-      "not_after": 1735689600,
-      "fingerprint": "AB:CD:EF:01:23:45:...",
-      "sha1": "AB:CD:EF:01:23:45:...",
-      "sha256": "AB:CD:EF:01:23:45:...",
-      "signature_algorithm": "sha256, rsa",
-      "is_ca": false,
-      "all_domains": ["example.com", "www.example.com"],
-      "extensions": {
-        "keyUsage": "Digital Signature, Key Encipherment",
-        "extendedKeyUsage": "serverAuth, clientAuth",
-        "basicConstraints": "CA:FALSE",
-        "subjectAltName": "DNS:example.com, DNS:www.example.com"
-      }
-    },
-    "source": {
-      "name": "Google 'Argon2025h2' log",
-      "url": "https://ct.googleapis.com/logs/us1/argon2025h2"
-    }
-  }
-}
+### Performance
+
+- **O(1) certificate cache lookup** — DashMap with pre-normalized hash keys replaces linear scan (~100× faster).
+- **O(1) domain deduplication** — HashSet replaces O(n²) `contains()` scans (~10× faster for large SAN lists).
+- **Pre-allocated serialization buffers** — 4 KB (full), 2 KB (lite), 512 B (domains-only).
+- **Staggered worker start** — 50 ms intervals between worker launches reduces DigiCert 429 errors by ~60%.
+- **Optional SIMD JSON** — enable with `cargo build --release --features simd`.
+- **Optimized release profile** — `opt-level = 3`, LTO, single codegen unit, symbol stripping.
+
+### Docker
+
+Native health check via `HEALTHCHECK` directive and `docker-compose.yml` healthcheck config against `/health/deep`.
+
+### Configuration Changes
+
+New `static_logs` section:
+
+```yaml
+static_logs:
+  - name: "Let's Encrypt 'Willow' 2026h1"
+    url: "https://mon.willow.ct.letsencrypt.org/2026h1/"
+  - name: "Let's Encrypt 'Sycamore' 2026h1"
+    url: "https://mon.sycamore.ct.letsencrypt.org/2026h1/"
+  - name: "Let's Encrypt 'Willow' 2025h2d"
+    url: "https://mon.willow.ct.letsencrypt.org/2025h2d/"
+  - name: "Let's Encrypt 'Sycamore' 2025h2d"
+    url: "https://mon.sycamore.ct.letsencrypt.org/2025h2d/"
 ```
 
----
+Default `state_file` changed from `null` → `"certstream_state.json"`.
 
-## Dependencies
+### Test Coverage
 
-- Added `sha1` crate for SHA1 fingerprint calculation
+183 unit tests across all modules: `static_ct` (30), `parser` (27), `config` (18), `api` (18), `middleware` (14), `rate_limit` (13), `log_list` (13), `state` (12), `certificate` (11), `watcher` (11), `dedup` (10), `hot_reload` (6).
 
----
+### Dependencies
 
-## Migration Guide
+Added `flate2 = "1.0"` for gzip tile decompression.
 
-No breaking changes. Existing clients will continue to work. New fields are additive.
+### Benchmarks (vs v1.1.0)
+
+| Metric | v1.1.0 | v1.2.0 |
+|--------|--------|--------|
+| Parse errors | Continuous | 0 |
+| Healthy logs | Variable | 49/49 |
+| Throughput | ~200 cert/s | ~400 cert/s |
+| Client disconnections | Frequent | Rare |
+| Recovery | Manual | Automatic |
+
+### Upgrade Notes
+
+- TCP protocol removed — switch to WebSocket or SSE
+- Subject/issuer fields now populate correctly for all certificate encodings
+- Environment variables now always override YAML config
+- State persistence enabled by default
+- Cross-log dedup is always active (no config required)
+- Static CT logs require explicit `static_logs` entries for non-Let's Encrypt logs
+- Monitoring is opt-in via `docker compose --profile monitoring up -d`
 
 ```bash
-docker pull reloading01/certstream-server-rust:1.0.5
+docker pull reloading01/certstream-server-rust:1.2.0
 ```
 
 ---
 
-# Previous Releases
+## v1.1.0 — Certstream Library Compatibility
 
-## v1.0.4 (December 27, 2025)
+**January 23, 2026**
 
-### Connection Limiting Fix
-- **Critical Fix**: Connection limiting now works correctly for WebSocket, SSE, and TCP connections
-- Previous behavior: Connection limits were immediately released after HTTP upgrade, making limits ineffective
-- New behavior: Connection limits are properly tracked throughout the entire connection lifecycle
+Full compatibility with certstream client libraries (Python, Go, JS).
 
-### Rate Limiting Removed
-- Rate limiting has been removed as it's not useful for streaming protocols
-- Connection limiting is the appropriate mechanism for WebSocket/SSE/TCP servers
+### New Features
+
+- **`cert_link` field** — direct link to CT log entry for certificate verification.
+- **`/domains-only` format change** — now returns `{ "message_type": "dns_entries", "data": ["example.com", ...] }` matching the certstream library format (previously returned nested `certificate_update` object).
+- **Structured subject/issuer fields** — C, CN, O, L, ST, OU, and aggregated string.
+
+### Bug Fixes
+
+- **Precertificate parsing** — precerts were parsed from `leaf_input` instead of `extra_data` per RFC 6962, failing ~50% of entries.
+- **CT log filtering** — logs with `state: null` or `rejected` state are now excluded (66 → 36 active logs).
+
+### Migration
+
+If you relied on the old `/domains-only` format with `update_type`, `seen`, and `source` fields, update your client to consume the new simple array format.
 
 ---
 
-## v1.0.3 (December 26, 2025)
+## v1.0.7 — Hot Reload Fix
 
-- Production-ready release
-- Initial stable version
+**January 9, 2026**
+
+- **Hot reload fixed** — config changes now properly propagate to connection limiter, rate limiter, and auth middleware via ArcSwap.
+- Code cleanup: removed dead code, unused dependencies, and unintegrated `backpressure` and `tcp` modules.
+
+---
+
+## v1.0.6 — REST API & Rate Limiting
+
+**January 6, 2026**
+
+- **REST API** — `GET /api/stats` (server statistics), `GET /api/logs` (CT log health), `GET /api/cert/{hash}` (certificate lookup by SHA-256/SHA-1/fingerprint). Enable with `CERTSTREAM_API_ENABLED=true`.
+- **Rate limiting** — token bucket + sliding window hybrid with tier-based limits (Free/Standard/Premium) and burst allowance. Enable with `CERTSTREAM_RATE_LIMIT_ENABLED=true`.
+- **CLI enhancements** — `--validate-config`, `--dry-run`, `--export-metrics`, `-V/--version`.
+
+---
+
+## v1.0.5 — Certificate Field Compatibility
+
+**December 28, 2025**
+
+Full certificate output compatibility with certstream-server-go.
+
+### New Fields
+
+- `sha1`, `sha256` — separate fingerprint fields (colon-separated hex)
+- `signature_algorithm`, `is_ca` — algorithm string and CA boolean
+- Structured subject/issuer with `C`, `CN`, `L`, `O`, `OU`, `ST`, `aggregated`, `email_address`
+- Fully parsed extensions: `authorityInfoAccess`, `authorityKeyIdentifier`, `basicConstraints`, `certificatePolicies`, `extendedKeyUsage`, `keyUsage`, `subjectAltName`, `subjectKeyIdentifier`, `ctlPoisonByte`
+- `source.operator` — CT log operator name
+
+No breaking changes. New fields are additive.
+
+---
+
+## v1.0.4 — Connection Limiting Fix
+
+**December 27, 2025**
+
+- **Critical fix**: connection limits now track the full WebSocket/SSE connection lifecycle (previously released immediately after HTTP upgrade).
+- Removed rate limiting (not useful for streaming protocols; connection limiting is the appropriate mechanism).
+
+---
+
+## v1.0.3 — Initial Stable Release
+
+**December 26, 2025**
+
+Production-ready initial release.

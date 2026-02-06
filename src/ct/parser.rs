@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::net::IpAddr;
 use x509_parser::der_parser::oid;
@@ -19,47 +20,79 @@ pub struct ParsedEntry {
 
 pub fn parse_leaf_input(leaf_input: &str, extra_data: &str) -> Option<ParsedEntry> {
     let leaf_bytes = STANDARD.decode(leaf_input).ok()?;
+    let extra_bytes = STANDARD.decode(extra_data).ok()?;
 
     if leaf_bytes.len() < 15 {
         return None;
     }
 
     let entry_type = u16::from_be_bytes([leaf_bytes[10], leaf_bytes[11]]);
-    let (update_type, cert_offset, is_precert): (Cow<'static, str>, usize, bool) = match entry_type
-    {
-        0 => (Cow::Borrowed("X509LogEntry"), 12, false),
-        1 => (Cow::Borrowed("PrecertLogEntry"), 44, true),
-        _ => return None,
-    };
 
-    if leaf_bytes.len() < cert_offset + 3 {
+    match entry_type {
+        0 => parse_x509_entry(&leaf_bytes, &extra_bytes),
+        1 => parse_precert_entry(&extra_bytes),
+        _ => None,
+    }
+}
+
+fn parse_x509_entry(leaf_bytes: &[u8], extra_bytes: &[u8]) -> Option<ParsedEntry> {
+    if leaf_bytes.len() < 15 {
         return None;
     }
 
-    let cert_data = &leaf_bytes[cert_offset..];
-    let cert_len = u32::from_be_bytes([0, cert_data[0], cert_data[1], cert_data[2]]) as usize;
+    let cert_data = &leaf_bytes[12..];
+    if cert_data.len() < 3 {
+        return None;
+    }
 
+    let cert_len = u32::from_be_bytes([0, cert_data[0], cert_data[1], cert_data[2]]) as usize;
     if cert_data.len() < 3 + cert_len {
         return None;
     }
 
     let cert_bytes = &cert_data[3..3 + cert_len];
-    let mut leaf_cert = parse_certificate(cert_bytes, true)?;
-
-    if is_precert {
-        leaf_cert.extensions.ctl_poison_byte = true;
-    }
-
-    let chain = parse_chain(extra_data).unwrap_or_default();
+    let leaf_cert = parse_certificate(cert_bytes, true)?;
+    let chain = parse_chain_from_bytes(extra_bytes, 0);
 
     Some(ParsedEntry {
-        update_type,
+        update_type: Cow::Borrowed("X509LogEntry"),
         leaf_cert,
         chain,
     })
 }
 
-fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert> {
+fn parse_precert_entry(extra_bytes: &[u8]) -> Option<ParsedEntry> {
+    // RFC 6962: extra_data for precert contains:
+    // - 3 bytes: pre-certificate length
+    // - pre-certificate (full X509 with CT poison extension)
+    // - 3 bytes: certificate chain length
+    // - certificate chain
+    if extra_bytes.len() < 3 {
+        return None;
+    }
+
+    let precert_len =
+        u32::from_be_bytes([0, extra_bytes[0], extra_bytes[1], extra_bytes[2]]) as usize;
+
+    if extra_bytes.len() < 3 + precert_len {
+        return None;
+    }
+
+    let precert_bytes = &extra_bytes[3..3 + precert_len];
+    let mut leaf_cert = parse_certificate(precert_bytes, true)?;
+    leaf_cert.extensions.ctl_poison_byte = true;
+
+    let chain_offset = 3 + precert_len;
+    let chain = parse_chain_from_bytes(extra_bytes, chain_offset);
+
+    Some(ParsedEntry {
+        update_type: Cow::Borrowed("PrecertLogEntry"),
+        leaf_cert,
+        chain,
+    })
+}
+
+pub fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert> {
     let (_, cert) = X509Certificate::from_der(der_bytes).ok()?;
 
     let mut subject = extract_name(cert.subject());
@@ -77,14 +110,16 @@ fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert> {
     let is_ca = cert.is_ca();
 
     let mut all_domains = DomainList::new();
+    let mut seen_domains: HashSet<String> = HashSet::new();
 
     if let Some(ref cn) = subject.cn {
         if !cn.is_empty() && !is_ca {
+            seen_domains.insert(cn.clone());
             all_domains.push(cn.clone());
         }
     }
 
-    let extensions = parse_extensions(&cert, &mut all_domains);
+    let extensions = parse_extensions(&cert, &mut all_domains, &mut seen_domains);
 
     let as_der = if include_der {
         Some(STANDARD.encode(der_bytes))
@@ -109,14 +144,15 @@ fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert> {
     })
 }
 
-fn parse_chain(extra_data: &str) -> Option<Vec<ChainCert>> {
-    let bytes = STANDARD.decode(extra_data).ok()?;
-    if bytes.len() < 3 {
-        return None;
+fn parse_chain_from_bytes(bytes: &[u8], start_offset: usize) -> Vec<ChainCert> {
+    let mut chain = Vec::with_capacity(4);
+
+    if bytes.len() <= start_offset + 3 {
+        return chain;
     }
 
-    let mut chain = Vec::with_capacity(4);
-    let mut offset = 3;
+    // Skip the 3-byte chain length prefix
+    let mut offset = start_offset + 3;
 
     while offset + 3 < bytes.len() {
         let cert_len =
@@ -148,7 +184,7 @@ fn parse_chain(extra_data: &str) -> Option<Vec<ChainCert>> {
         offset += cert_len;
     }
 
-    Some(chain)
+    chain
 }
 
 fn extract_name(name: &X509Name) -> Subject {
@@ -157,7 +193,12 @@ fn extract_name(name: &X509Name) -> Subject {
     for rdn in name.iter() {
         for attr in rdn.iter() {
             let oid_str = attr.attr_type().to_id_string();
-            if let Ok(value) = attr.attr_value().as_str() {
+            let value = attr.attr_value();
+            let value_str = value
+                .as_str()
+                .ok()
+                .or_else(|| std::str::from_utf8(value.data).ok());
+            if let Some(value) = value_str {
                 match oid_str.as_str() {
                     "2.5.4.3" => subject.cn = Some(value.to_string()),
                     "2.5.4.6" => subject.c = Some(value.to_string()),
@@ -175,7 +216,7 @@ fn extract_name(name: &X509Name) -> Subject {
     subject
 }
 
-fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList) -> Extensions {
+fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList, seen_domains: &mut HashSet<String>) -> Extensions {
     let mut ext = Extensions::default();
     let mut san_parts: Vec<String> = Vec::new();
 
@@ -209,7 +250,7 @@ fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList) -> Ext
                         GeneralName::DNSName(dns) => {
                             san_parts.push(format!("DNS:{}", dns));
                             let domain = dns.to_string();
-                            if !all_domains.contains(&domain) {
+                            if seen_domains.insert(domain.clone()) {
                                 all_domains.push(domain);
                             }
                         }
@@ -405,3 +446,353 @@ fn extended_key_usage_to_string(eku: &ExtendedKeyUsage) -> String {
 }
 
 const OID_X509_EXT_CT_POISON: Oid<'static> = oid!(1.3.6 .1 .4 .1 .11129 .2 .4 .3);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    fn generate_self_signed_der(cn: &str) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params.distinguished_name.push(rcgen::DnType::OrganizationName, "Test Org");
+        params.distinguished_name.push(rcgen::DnType::CountryName, "US");
+        params.distinguished_name.push(rcgen::DnType::LocalityName, "San Francisco");
+        params.distinguished_name.push(rcgen::DnType::StateOrProvinceName, "California");
+        params.is_ca = rcgen::IsCa::NoCa;
+        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        cert.der().to_vec()
+    }
+
+    fn generate_cert_with_sans(cn: &str, sans: &[&str]) -> Vec<u8> {
+        let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+        let mut params = rcgen::CertificateParams::new(san_strings).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::NoCa;
+        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        cert.der().to_vec()
+    }
+
+    fn generate_ca_cert_der(cn: &str) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        cert.der().to_vec()
+    }
+
+    #[test]
+    fn test_format_key_id_empty() {
+        assert_eq!(format_key_id(&[]), "keyid:");
+    }
+
+    #[test]
+    fn test_format_key_id_single_byte() {
+        assert_eq!(format_key_id(&[0xAB]), "keyid:ab");
+    }
+
+    #[test]
+    fn test_format_key_id_multiple_bytes() {
+        assert_eq!(
+            format_key_id(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]),
+            "keyid:01:23:45:67:89:ab:cd:ef"
+        );
+    }
+
+    #[test]
+    fn test_format_serial_number_basic() {
+        assert_eq!(format_serial_number(&[0x00, 0xFF, 0x10]), "00FF10");
+    }
+
+    #[test]
+    fn test_format_serial_number_empty() {
+        let empty: &[u8] = &[];
+        assert_eq!(format_serial_number(empty), "");
+    }
+
+    #[test]
+    fn test_format_serial_number_single_byte() {
+        assert_eq!(format_serial_number(&[0x0A]), "0A");
+    }
+
+    #[test]
+    fn test_calculate_sha1_known_value() {
+        // SHA1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+        let hash = calculate_sha1(b"");
+        assert_eq!(
+            hash,
+            "DA:39:A3:EE:5E:6B:4B:0D:32:55:BF:EF:95:60:18:90:AF:D8:07:09"
+        );
+    }
+
+    #[test]
+    fn test_calculate_sha256_known_value() {
+        // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        let hash = calculate_sha256(b"");
+        assert_eq!(
+            hash,
+            "E3:B0:C4:42:98:FC:1C:14:9A:FB:F4:C8:99:6F:B9:24:27:AE:41:E4:64:9B:93:4C:A4:95:99:1B:78:52:B8:55"
+        );
+    }
+
+    #[test]
+    fn test_calculate_sha1_nonempty() {
+        // SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+        let hash = calculate_sha1(b"abc");
+        assert_eq!(
+            hash,
+            "A9:99:3E:36:47:06:81:6A:BA:3E:25:71:78:50:C2:6C:9C:D0:D8:9D"
+        );
+    }
+
+    #[test]
+    fn test_parse_ip_address_ipv4() {
+        let result = parse_ip_address(&[192, 168, 1, 1]);
+        assert_eq!(result, Some("192.168.1.1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_ip_address_ipv6() {
+        // ::1 (loopback)
+        let mut bytes = [0u8; 16];
+        bytes[15] = 1;
+        let result = parse_ip_address(&bytes);
+        assert_eq!(result, Some("::1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_ip_address_invalid_length() {
+        // 5 bytes is neither IPv4 nor IPv6
+        assert!(parse_ip_address(&[1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn test_parse_ip_address_empty() {
+        assert!(parse_ip_address(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_leaf_input_too_short() {
+        let short = STANDARD.encode([0u8; 10]);
+        let extra = STANDARD.encode([0u8; 0]);
+        assert!(parse_leaf_input(&short, &extra).is_none());
+    }
+
+    #[test]
+    fn test_parse_leaf_input_invalid_base64() {
+        assert!(parse_leaf_input("not-valid-b64!!!", "also-bad!!!").is_none());
+    }
+
+    #[test]
+    fn test_parse_leaf_input_unknown_entry_type() {
+        // Entry type at bytes 10-11, set to 99 (unknown)
+        let mut leaf = vec![0u8; 15];
+        leaf[10] = 0;
+        leaf[11] = 99;
+        let encoded = STANDARD.encode(&leaf);
+        let extra = STANDARD.encode([0u8; 0]);
+        assert!(parse_leaf_input(&encoded, &extra).is_none());
+    }
+
+    #[test]
+    fn test_parse_leaf_input_x509_entry_type_invalid_cert() {
+        // Entry type 0 (x509) but the certificate data is garbage
+        let mut leaf = vec![0u8; 20];
+        leaf[10] = 0;
+        leaf[11] = 0; // entry type = 0 (x509)
+        // bytes 12..15 encode the cert length as 3 bytes: length = 2
+        leaf[12] = 0;
+        leaf[13] = 0;
+        leaf[14] = 2;
+        // 2 bytes of garbage cert data
+        leaf[15] = 0xFF;
+        leaf[16] = 0xFF;
+        let encoded = STANDARD.encode(&leaf);
+        let extra = STANDARD.encode([0u8; 4]);
+        // Should return None because the cert bytes are not valid DER
+        assert!(parse_leaf_input(&encoded, &extra).is_none());
+    }
+
+    #[test]
+    fn test_parse_certificate_empty_bytes() {
+        assert!(parse_certificate(&[], true).is_none());
+    }
+
+    #[test]
+    fn test_parse_certificate_garbage() {
+        assert!(parse_certificate(&[0, 1, 2, 3, 4], true).is_none());
+    }
+
+    #[test]
+    fn test_parse_certificate_valid_der() {
+        let der = generate_self_signed_der("test.com");
+        let result = parse_certificate(&der, true);
+        assert!(result.is_some(), "parse_certificate should succeed for a valid DER cert");
+
+        let leaf = result.unwrap();
+
+        // Subject CN should be test.com
+        assert_eq!(leaf.subject.cn.as_deref(), Some("test.com"));
+
+        // Self-signed: issuer CN should also be test.com
+        assert_eq!(leaf.issuer.cn.as_deref(), Some("test.com"));
+
+        // Subject should contain O, C, L, ST from the generated cert
+        assert_eq!(leaf.subject.o.as_deref(), Some("Test Org"));
+        assert_eq!(leaf.subject.c.as_deref(), Some("US"));
+        assert_eq!(leaf.subject.l.as_deref(), Some("San Francisco"));
+        assert_eq!(leaf.subject.st.as_deref(), Some("California"));
+
+        // Serial number should be non-empty hex
+        assert!(!leaf.serial_number.is_empty());
+        assert!(
+            leaf.serial_number.chars().all(|c| c.is_ascii_hexdigit()),
+            "serial number should be hex: {}",
+            leaf.serial_number
+        );
+
+        // Signature algorithm: rcgen uses ECDSA P-256 by default
+        assert_eq!(leaf.signature_algorithm, "ecdsa, sha256");
+
+        // is_ca should be false (we set IsCa::NoCa)
+        assert!(!leaf.is_ca);
+
+        // SHA1 and SHA256 fingerprints should be colon-separated hex
+        assert!(leaf.sha1.contains(':'), "sha1 should be colon-separated");
+        assert!(leaf.sha256.contains(':'), "sha256 should be colon-separated");
+
+        // fingerprint == sha1
+        assert_eq!(leaf.fingerprint, leaf.sha1);
+
+        // as_der should be present when include_der=true
+        assert!(leaf.as_der.is_some());
+        // Round-trip: as_der should decode back to the original DER
+        let decoded = STANDARD.decode(leaf.as_der.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded, der);
+
+        // Validity: not_before and not_after should be nonzero timestamps
+        assert!(leaf.not_before != 0);
+        assert!(leaf.not_after != 0);
+        assert!(leaf.not_after > leaf.not_before);
+
+        // Subject aggregated field should contain /CN=test.com
+        let agg = leaf.subject.aggregated.as_ref().unwrap();
+        assert!(agg.contains("/CN=test.com"), "aggregated should contain /CN=test.com, got: {}", agg);
+        assert!(agg.contains("/O=Test Org"), "aggregated should contain /O=Test Org, got: {}", agg);
+        assert!(agg.contains("/C=US"), "aggregated should contain /C=US, got: {}", agg);
+
+        // all_domains should include "test.com" from the CN (no SANs in this cert)
+        assert!(
+            leaf.all_domains.iter().any(|d| d == "test.com"),
+            "all_domains should include test.com from CN"
+        );
+
+        // Extensions: rcgen with IsCa::NoCa omits BasicConstraints entirely,
+        // which is valid per X.509 (absence means not a CA).
+        // basic_constraints may be None or Some("CA:FALSE") depending on the generator.
+        if let Some(ref bc) = leaf.extensions.basic_constraints {
+            assert_eq!(bc, "CA:FALSE");
+        }
+
+        // subject_key_identifier may or may not be present depending on rcgen version.
+        // If present, it should start with "keyid:"
+        if let Some(ref ski) = leaf.extensions.subject_key_identifier {
+            assert!(ski.starts_with("keyid:"), "SKI should start with keyid:, got: {}", ski);
+        }
+    }
+
+    #[test]
+    fn test_parse_certificate_no_der() {
+        let der = generate_self_signed_der("example.org");
+        let result = parse_certificate(&der, false);
+        assert!(result.is_some());
+        let leaf = result.unwrap();
+        assert!(leaf.as_der.is_none(), "as_der should be None when include_der=false");
+    }
+
+    #[test]
+    fn test_parse_certificate_hashes_deterministic() {
+        let der = generate_self_signed_der("deterministic.test");
+        let a = parse_certificate(&der, true).unwrap();
+        let b = parse_certificate(&der, true).unwrap();
+        assert_eq!(a.sha1, b.sha1);
+        assert_eq!(a.sha256, b.sha256);
+        assert_eq!(a.serial_number, b.serial_number);
+    }
+
+    #[test]
+    fn test_parse_certificate_with_sans() {
+        let der = generate_cert_with_sans("primary.com", &["alt1.com", "alt2.com", "*.wildcard.com"]);
+        let leaf = parse_certificate(&der, true).unwrap();
+
+        assert_eq!(leaf.subject.cn.as_deref(), Some("primary.com"));
+
+        // all_domains should contain the CN plus all SANs (deduplicated)
+        assert!(leaf.all_domains.iter().any(|d| d == "primary.com"), "should contain CN");
+        assert!(leaf.all_domains.iter().any(|d| d == "alt1.com"), "should contain alt1.com SAN");
+        assert!(leaf.all_domains.iter().any(|d| d == "alt2.com"), "should contain alt2.com SAN");
+        assert!(leaf.all_domains.iter().any(|d| d == "*.wildcard.com"), "should contain wildcard SAN");
+
+        // SAN extension should be present
+        let san = leaf.extensions.subject_alt_name.as_ref().unwrap();
+        assert!(san.contains("DNS:alt1.com"), "SAN should contain DNS:alt1.com, got: {}", san);
+        assert!(san.contains("DNS:alt2.com"), "SAN should contain DNS:alt2.com, got: {}", san);
+        assert!(san.contains("DNS:*.wildcard.com"), "SAN should contain DNS:*.wildcard.com, got: {}", san);
+    }
+
+    #[test]
+    fn test_parse_certificate_ca_cert() {
+        let der = generate_ca_cert_der("My Root CA");
+        let leaf = parse_certificate(&der, true).unwrap();
+
+        assert_eq!(leaf.subject.cn.as_deref(), Some("My Root CA"));
+        assert!(leaf.is_ca, "CA cert should have is_ca=true");
+        assert_eq!(leaf.extensions.basic_constraints.as_deref(), Some("CA:TRUE"));
+
+        // CA certs should NOT add the CN to all_domains
+        assert!(
+            !leaf.all_domains.iter().any(|d| d == "My Root CA"),
+            "CA cert CN should not be added to all_domains"
+        );
+    }
+
+    #[test]
+    fn test_parse_chain_from_bytes_empty() {
+        let chain = parse_chain_from_bytes(&[], 0);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_parse_chain_from_bytes_too_short() {
+        // Only 3 bytes (the chain-length prefix) with zero length, no certs
+        let chain = parse_chain_from_bytes(&[0, 0, 0], 0);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_parse_chain_from_bytes_with_one_cert() {
+        let cert_der = generate_self_signed_der("chain-test.com");
+        let cert_len = cert_der.len();
+
+        // Build extra_bytes: 3-byte chain length + 3-byte cert length + cert DER
+        let chain_total_len = 3 + cert_len;
+        let mut extra = Vec::new();
+        // 3-byte chain length (big-endian u24)
+        extra.push(((chain_total_len >> 16) & 0xFF) as u8);
+        extra.push(((chain_total_len >> 8) & 0xFF) as u8);
+        extra.push((chain_total_len & 0xFF) as u8);
+        // 3-byte cert length
+        extra.push(((cert_len >> 16) & 0xFF) as u8);
+        extra.push(((cert_len >> 8) & 0xFF) as u8);
+        extra.push((cert_len & 0xFF) as u8);
+        // cert DER bytes
+        extra.extend_from_slice(&cert_der);
+
+        let chain = parse_chain_from_bytes(&extra, 0);
+        assert_eq!(chain.len(), 1, "should parse exactly one chain cert");
+        assert_eq!(chain[0].subject.cn.as_deref(), Some("chain-test.com"));
+    }
+}

@@ -1,6 +1,6 @@
 # certstream-server-rust
 
-Certstream server written in Rust. Streams SSL/TLS certificates from Certificate Transparency logs in real-time via WebSocket, SSE, and TCP.
+A high-performance **certstream server** written in Rust. Monitors Certificate Transparency logs and streams newly issued SSL/TLS certificates in real-time via WebSocket and SSE. 
 
 [![Docker Hub](https://img.shields.io/docker/pulls/reloading01/certstream-server-rust.svg)](https://hub.docker.com/r/reloading01/certstream-server-rust)
 [![Docker Image Size](https://img.shields.io/docker/image-size/reloading01/certstream-server-rust/latest)](https://hub.docker.com/r/reloading01/certstream-server-rust)
@@ -10,32 +10,33 @@ Certstream server written in Rust. Streams SSL/TLS certificates from Certificate
 
 ## What is Certstream?
 
-Certstream aggregates certificates from Certificate Transparency logs and streams them in real-time. This is a Rust rewrite that works as a drop-in replacement for [certstream-server](https://github.com/CaliDog/certstream-server) (Elixir) and [certstream-server-go](https://github.com/d-Rickyy-b/certstream-server-go).
+Certstream aggregates certificates from Certificate Transparency (CT) logs and streams them in real-time. It provides a firehose of newly issued SSL/TLS certificates that you can filter and process for your own purposes.
+
+This Rust implementation delivers better performance than certstream-server-go while maintaining full compatibility with existing certstream clients.
 
 ### Why Rust?
 
-- ~12MB memory idle, ~19MB under load
-- Sub-millisecond latency (tested 0.33ms min)
-- Handles 50,000+ concurrent connections
-- ~6% CPU with 500+ clients
+- 27 MB memory idle, 198 MB under load (500 clients)
+- 8.4 ms average latency
+- 48,600 messages/second throughput
+- 23% CPU with 500 clients
 - Single binary, no dependencies
 
 ## Features
 
-- WebSocket, SSE, and raw TCP streaming
-- Pre-serialized messages (serialize once, broadcast to all)
-- Works with existing certstream clients
-- Prometheus metrics endpoint
-- TLS support
-- 60+ CT logs monitored
-- State persistence (resume from last position after restart)
-- Connection limiting (max total and per-IP)
-- Token authentication (Bearer token based)
-- Hot reload (config changes without restart)
-- CT log health management (automatic retry, circuit breaker)
-- REST API for stats, logs health, and certificate lookup
-- Rate limiting (token bucket + sliding window, tier-based)
-- CLI with validation, dry-run, and metrics export
+- WebSocket and Server-Sent Events (SSE)
+- Pre-serialized messages for efficient broadcasting
+- 60+ Certificate Transparency logs monitored (Google, Cloudflare, DigiCert, Sectigo, Let's Encrypt)
+- State persistence - resume from last position after restart
+- Connection limiting - protect against abuse with per-IP and total limits
+- Token authentication - Bearer token based API access control
+- Hot reload - config changes apply without restart
+- Rate limiting - token bucket + sliding window algorithm
+- Circuit breaker - automatic isolation of failing CT logs with exponential backoff
+- Prometheus metrics endpoint (/metrics)
+- Health check endpoint (/health)
+- REST API for server stats and CT log health
+- Certificate lookup by SHA256, SHA1, or fingerprint
 
 ## Documentation
 
@@ -47,31 +48,19 @@ Visit **[certstream.dev](https://certstream.dev/)** for:
 ## Quick Start
 
 ```bash
-# Basic
 docker run -d -p 8080:8080 reloading01/certstream-server-rust:latest
 
-# All protocols enabled
-docker run -d -p 8080:8080 -p 8081:8081 \
-  -e CERTSTREAM_SSE_ENABLED=true \
-  -e CERTSTREAM_TCP_ENABLED=true \
-  reloading01/certstream-server-rust:latest
-
-# With state persistence (resume after restart)
 docker run -d -p 8080:8080 \
-  -v certstream-state:/data \
-  -e CERTSTREAM_CT_LOG_STATE_FILE=/data/state.json \
+  -e CERTSTREAM_SSE_ENABLED=true \
   reloading01/certstream-server-rust:latest
 
-# Production setup
 docker run -d \
   --name certstream \
   --restart unless-stopped \
   -p 8080:8080 \
-  -p 8081:8081 \
   -v certstream-state:/data \
   -e CERTSTREAM_CT_LOG_STATE_FILE=/data/state.json \
   -e CERTSTREAM_SSE_ENABLED=true \
-  -e CERTSTREAM_TCP_ENABLED=true \
   -e CERTSTREAM_CONNECTION_LIMIT_ENABLED=true \
   reloading01/certstream-server-rust:latest
 ```
@@ -91,8 +80,6 @@ docker run -d \
 |----------|---------|-------------|
 | `CERTSTREAM_WS_ENABLED` | true | Enable WebSocket |
 | `CERTSTREAM_SSE_ENABLED` | false | Enable SSE |
-| `CERTSTREAM_TCP_ENABLED` | false | Enable TCP |
-| `CERTSTREAM_TCP_PORT` | 8081 | TCP port |
 | `CERTSTREAM_METRICS_ENABLED` | true | Enable /metrics endpoint |
 | `CERTSTREAM_HEALTH_ENABLED` | true | Enable /health endpoint |
 | `CERTSTREAM_EXAMPLE_JSON_ENABLED` | true | Enable /example.json endpoint |
@@ -138,30 +125,9 @@ Rate limiting uses a hybrid token bucket + sliding window algorithm with tier-ba
 | `CERTSTREAM_HOT_RELOAD_ENABLED` | false | Enable hot reload |
 | `CERTSTREAM_HOT_RELOAD_WATCH_PATH` | - | Config file to watch |
 
-### CLI Options
-
-```bash
-certstream-server-rust [OPTIONS]
-
-OPTIONS:
-    --validate-config    Validate configuration and exit
-    --dry-run            Start server without connecting to CT logs
-    --export-metrics     Export current metrics and exit
-    -V, --version        Print version information
-    -h, --help           Print help information
-```
-
 ### Build from Source
 
 ```bash
-# Docker
-docker build -t certstream-server-rust .
-docker run -d -p 8080:8080 certstream-server-rust
-
-# Cargo
-cargo build --release
-./target/release/certstream-server-rust
-
 # Docker Compose
 docker compose up -d
 ```
@@ -184,15 +150,12 @@ docker compose up -d
 | `http://host:8080/sse?stream=full` | Full |
 | `http://host:8080/sse?stream=domains` | Domains only |
 
-### TCP
-
-Connect to port `8081`. Send `f` for full, `d` for domains, or nothing for lite.
-
 ### HTTP
 
 | Endpoint | Description |
 |----------|-------------|
-| `/health` | Health check |
+| `/health` | Basic health check (returns "OK") |
+| `/health/deep` | Detailed health with log status, connections, uptime (JSON) |
 | `/metrics` | Prometheus metrics |
 | `/example.json` | Example message |
 
@@ -216,33 +179,42 @@ curl http://localhost:8080/api/logs
 
 # Lookup certificate by SHA256 hash
 curl http://localhost:8080/api/cert/F0E2023BCAACBF9D40A4E2C767E77B46BA96AE81240EBC525FA43C0A50BFACDE
+
+# Deep health check (returns JSON with detailed status)
+curl http://localhost:8080/health/deep
+# {"status":"healthy","logs_healthy":27,"logs_degraded":0,"logs_unhealthy":0,"logs_total":27,"active_connections":0,"uptime_secs":3600}
 ```
 
-## Performance
+## Performance Comparison
 
-Load tested with 500 concurrent WebSocket clients (same machine, same conditions):
+Benchmarked with 500 concurrent WebSocket clients, 60 seconds, identical conditions (2 CPU cores, 2GB RAM per container):
 
-| Metric | Rust | Go |
-|--------|------|-----|
-| Memory (idle) | ~26 MB | ~100 MB |
-| Memory (avg under load) | 22 MB | 254 MB |
-| CPU (avg under load) | ~29% | ~76% |
-| Latency (avg) | 3.4ms | 31ms |
-| Latency (min) | 0.16ms | 1.7ms |
-| Throughput | 677K msg | 267K msg |
+| Metric | Rust | Go | Elixir |
+|--------|------|-----|--------|
+| Memory (idle) | 27 MB | 49 MB | 230 MB |
+| Memory (under load) | 198 MB | 309 MB | 649 MB |
+| CPU (idle) | 5% | 36% | 172% |
+| CPU (under load) | 23% | 34% | 206% |
+| Throughput | 48.6K msg/s | 27K msg/s | 19K msg/s |
+| Avg Latency | 8.4 ms | 9.2 ms | 26.8 ms |
+| P99 Latency | 172 ms | 187 ms | 297 ms |
+| Connect Time | 162 ms | 156 ms | 784 ms |
 
-**Result**: 12x less memory, 9x faster latency, 2.5x higher throughput.
+**Rust vs Elixir**: 8.5x less memory, 2.5x higher throughput, 3.2x lower latency
+**Rust vs Go**: 1.6x less memory, 1.8x higher throughput, similar latency
 
-## CT Logs
+## Certificate Transparency Logs
 
-Monitors 60+ logs including:
+Certstream monitors 60+ CT logs from major providers:
 
-- **Google**: Argon, Xenon, Solera, Submariner
-- **Cloudflare**: Nimbus
-- **DigiCert**: Wyvern, Sphinx
-- **Sectigo**: Elephant, Tiger, Dodo
-- **Let's Encrypt**: Sapling, Clicky
-- TrustAsia, Nordu, and others
+| Provider | Logs |
+|----------|------|
+| Google | Argon, Xenon, Solera, Submariner |
+| Cloudflare | Nimbus |
+| DigiCert | Wyvern, Sphinx |
+| Sectigo | Elephant, Tiger, Dodo |
+| Let's Encrypt | Sapling, Clicky |
+| Others | TrustAsia, Nordu, and more |
 
 ## Release Notes
 

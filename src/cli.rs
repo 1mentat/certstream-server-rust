@@ -1,6 +1,6 @@
 use std::env;
 
-pub const VERSION: &str = "1.0.7";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
 pub struct CliArgs {
