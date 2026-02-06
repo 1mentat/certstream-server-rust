@@ -3,20 +3,40 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quick Start - certstream-server-rust</title>
-    <meta name="description" content="Get started with certstream-server-rust in seconds. Run your own CT log streaming server locally.">
+    <title>Certstream Quick Start - Run Your Own CT Log Server in Seconds</title>
+    <meta name="description" content="Get started with certstream-server-rust in under a minute. Run your own certificate transparency log streaming server with Docker. Connect via Python, JavaScript, or cURL.">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="https://certstream.dev/quickstart.html">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://certstream.dev/quickstart.html">
-    <meta property="og:title" content="Quick Start - certstream-server-rust">
-    <meta property="og:description" content="Get started with certstream-server-rust in seconds.">
+    <meta property="og:title" content="Certstream Quick Start - Self-Host CT Log Streaming">
+    <meta property="og:description" content="Run your own certstream server with Docker in seconds. Connect via WebSocket or SSE. Code examples for Python, JavaScript, and cURL.">
     <meta name="theme-color" content="#b7410e">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "HowTo",
+        "name": "How to set up certstream-server-rust",
+        "description": "Run your own certificate transparency log streaming server with Docker",
+        "step": [
+            {
+                "@type": "HowToStep",
+                "name": "Run the server",
+                "text": "docker run -d -p 8080:8080 reloading01/certstream-server-rust:latest"
+            },
+            {
+                "@type": "HowToStep",
+                "name": "Connect via WebSocket",
+                "text": "Connect to ws://localhost:8080/ using Python, JavaScript, or any WebSocket client"
+            }
+        ]
+    }
+    </script>
 </head>
 <body>
     <header>
@@ -27,6 +47,7 @@
                     <li><a href="/">Home</a></li>
                     <li><a href="docs.html">API Docs</a></li>
                     <li><a href="quickstart.html" class="active">Quick Start</a></li>
+                    <li><a href="architecture.html">Architecture</a></li>
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
@@ -45,6 +66,7 @@
             <li><a href="/">Home</a></li>
             <li><a href="docs.html">API Docs</a></li>
             <li><a href="quickstart.html" class="active">Quick Start</a></li>
+            <li><a href="architecture.html">Architecture</a></li>
             <li><a href="https://github.com/burakozcn01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
@@ -52,8 +74,8 @@
     <main>
         <div class="wrap">
             <div class="page-header">
-                <h1>Quick Start</h1>
-                <p>Get your own certstream server running in seconds</p>
+                <h1>Certstream Quick Start Guide</h1>
+                <p>Run your own certificate transparency streaming server in seconds</p>
             </div>
         </div>
 
@@ -158,7 +180,7 @@ ws.onmessage = (event) => {
                 <a href="https://github.com/burakozcn01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
                 <a href="https://github.com/burakozcn01/certstream-server-rust/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
             </div>
-            <p>certstream-server-rust v1.0.7</p>
+            <p>certstream-server-rust</p>
         </div>
     </footer>
 </body>

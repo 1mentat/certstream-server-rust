@@ -19,6 +19,7 @@ pub struct CertificateData {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub chain: Option<Vec<ChainCert>>,
     pub cert_index: u64,
+    pub cert_link: String,
     pub seen: f64,
     pub source: Arc<Source>,
 }
@@ -146,15 +147,7 @@ pub struct Source {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainsOnlyMessage {
     pub message_type: Cow<'static, str>,
-    pub data: DomainsOnlyData,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DomainsOnlyData {
-    pub update_type: Cow<'static, str>,
-    pub all_domains: DomainList,
-    pub seen: f64,
-    pub source: Arc<Source>,
+    pub data: DomainList,
 }
 
 #[derive(Debug, Clone)]
@@ -166,18 +159,32 @@ pub struct PreSerializedMessage {
 
 impl PreSerializedMessage {
     pub fn from_certificate(msg: &CertificateMessage) -> Option<Self> {
-        let full = serde_json::to_vec(msg).ok()?;
+        let mut full = Vec::with_capacity(4096);
+        let mut lite_buf = Vec::with_capacity(2048);
+        let mut domains_buf = Vec::with_capacity(512);
 
-        let lite_msg = msg.to_lite();
-        let lite = serde_json::to_vec(&lite_msg).ok()?;
+        #[cfg(feature = "simd")]
+        {
+            full = simd_json::to_vec(msg).ok()?;
+            let lite_msg = msg.to_lite();
+            lite_buf = simd_json::to_vec(&lite_msg).ok()?;
+            let domains_msg = msg.to_domains_only();
+            domains_buf = simd_json::to_vec(&domains_msg).ok()?;
+        }
 
-        let domains_msg = msg.to_domains_only();
-        let domains_only = serde_json::to_vec(&domains_msg).ok()?;
+        #[cfg(not(feature = "simd"))]
+        {
+            serde_json::to_writer(&mut full, msg).ok()?;
+            let lite_msg = msg.to_lite();
+            serde_json::to_writer(&mut lite_buf, &lite_msg).ok()?;
+            let domains_msg = msg.to_domains_only();
+            serde_json::to_writer(&mut domains_buf, &domains_msg).ok()?;
+        }
 
         Some(Self {
             full: Bytes::from(full),
-            lite: Bytes::from(lite),
-            domains_only: Bytes::from(domains_only),
+            lite: Bytes::from(lite_buf),
+            domains_only: Bytes::from(domains_buf),
         })
     }
 }
@@ -193,6 +200,7 @@ struct LiteData<'a> {
     update_type: &'a Cow<'static, str>,
     leaf_cert: LiteLeafCert<'a>,
     cert_index: u64,
+    cert_link: &'a str,
     seen: f64,
     source: &'a Arc<Source>,
 }
@@ -216,13 +224,8 @@ struct LiteLeafCert<'a> {
 impl CertificateMessage {
     pub fn to_domains_only(&self) -> DomainsOnlyMessage {
         DomainsOnlyMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: DomainsOnlyData {
-                update_type: self.data.update_type.clone(),
-                all_domains: self.data.leaf_cert.all_domains.clone(),
-                seen: self.data.seen,
-                source: Arc::clone(&self.data.source),
-            },
+            message_type: Cow::Borrowed("dns_entries"),
+            data: self.data.leaf_cert.all_domains.clone(),
         }
     }
 
@@ -246,6 +249,7 @@ impl CertificateMessage {
                     extensions: &self.data.leaf_cert.extensions,
                 },
                 cert_index: self.data.cert_index,
+                cert_link: &self.data.cert_link,
                 seen: self.data.seen,
                 source: &self.data.source,
             },
@@ -255,5 +259,144 @@ impl CertificateMessage {
     #[inline]
     pub fn pre_serialize(self) -> Option<Arc<PreSerializedMessage>> {
         PreSerializedMessage::from_certificate(&self).map(Arc::new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smallvec::smallvec;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    fn make_test_message() -> CertificateMessage {
+        CertificateMessage {
+            message_type: Cow::Borrowed("certificate_update"),
+            data: CertificateData {
+                update_type: Cow::Borrowed("X509LogEntry"),
+                leaf_cert: LeafCert {
+                    subject: Subject {
+                        cn: Some("example.com".into()),
+                        ..Default::default()
+                    },
+                    issuer: Subject {
+                        cn: Some("Test CA".into()),
+                        ..Default::default()
+                    },
+                    serial_number: "01".into(),
+                    not_before: 1700000000,
+                    not_after: 1730000000,
+                    fingerprint: "AA:BB".into(),
+                    sha1: "CC:DD".into(),
+                    sha256: "EE:FF".into(),
+                    signature_algorithm: "sha256, rsa".into(),
+                    is_ca: false,
+                    all_domains: smallvec!["example.com".into(), "www.example.com".into()],
+                    as_der: None,
+                    extensions: Extensions::default(),
+                },
+                chain: None,
+                cert_index: 12345,
+                cert_link: "https://ct.example.com/entry/12345".into(),
+                seen: 1700000000.0,
+                source: Arc::new(Source {
+                    name: Arc::from("Test Log"),
+                    url: Arc::from("https://ct.example.com/"),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn test_build_aggregated_all_fields() {
+        let mut subject = Subject {
+            c: Some("US".into()),
+            cn: Some("example.com".into()),
+            l: Some("City".into()),
+            o: Some("Org".into()),
+            ou: Some("Unit".into()),
+            st: Some("State".into()),
+            aggregated: None,
+            email_address: None,
+        };
+        subject.build_aggregated();
+        assert_eq!(
+            subject.aggregated.as_deref(),
+            Some("/C=US/CN=example.com/L=City/O=Org/OU=Unit/ST=State")
+        );
+    }
+
+    #[test]
+    fn test_build_aggregated_only_cn() {
+        let mut subject = Subject {
+            cn: Some("example.com".into()),
+            ..Default::default()
+        };
+        subject.build_aggregated();
+        assert_eq!(subject.aggregated.as_deref(), Some("/CN=example.com"));
+    }
+
+    #[test]
+    fn test_build_aggregated_empty_subject() {
+        let mut subject = Subject::default();
+        subject.build_aggregated();
+        assert_eq!(subject.aggregated.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_to_domains_only_message_type() {
+        let msg = make_test_message();
+        let domains_msg = msg.to_domains_only();
+        assert_eq!(domains_msg.message_type, "dns_entries");
+    }
+
+    #[test]
+    fn test_to_domains_only_contains_correct_domains() {
+        let msg = make_test_message();
+        let domains_msg = msg.to_domains_only();
+        assert_eq!(domains_msg.data.len(), 2);
+        assert_eq!(domains_msg.data[0], "example.com");
+        assert_eq!(domains_msg.data[1], "www.example.com");
+    }
+
+    #[test]
+    fn test_pre_serialize_returns_some() {
+        let msg = make_test_message();
+        let result = msg.pre_serialize();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_pre_serialize_full_contains_certificate_update() {
+        let msg = make_test_message();
+        let pre = msg.pre_serialize().unwrap();
+        let full_str = std::str::from_utf8(&pre.full).unwrap();
+        assert!(full_str.contains("certificate_update"));
+    }
+
+    #[test]
+    fn test_pre_serialize_lite_does_not_contain_chain() {
+        let msg = make_test_message();
+        let pre = msg.pre_serialize().unwrap();
+        let lite_str = std::str::from_utf8(&pre.lite).unwrap();
+        assert!(!lite_str.contains("\"chain\""));
+    }
+
+    #[test]
+    fn test_pre_serialize_domains_contains_dns_entries() {
+        let msg = make_test_message();
+        let pre = msg.pre_serialize().unwrap();
+        let domains_str = std::str::from_utf8(&pre.domains_only).unwrap();
+        assert!(domains_str.contains("dns_entries"));
+    }
+
+    #[test]
+    fn test_is_false_with_true_value() {
+        assert!(!is_false(&true));
+    }
+
+    #[test]
+    fn test_is_false_with_false_value() {
+        assert!(is_false(&false));
     }
 }

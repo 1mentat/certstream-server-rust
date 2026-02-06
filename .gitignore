@@ -5,3 +5,4 @@
 *.crt
 config.yaml
 config.yml
+.DS_Store.DS_Store

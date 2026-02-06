@@ -11,15 +11,17 @@ pub struct CustomCtLog {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct StaticCtLog {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProtocolConfig {
     #[serde(default = "default_true")]
     pub websocket: bool,
     #[serde(default)]
     pub sse: bool,
-    #[serde(default)]
-    pub tcp: bool,
-    #[serde(default)]
-    pub tcp_port: Option<u16>,
     #[serde(default = "default_true")]
     pub metrics: bool,
     #[serde(default = "default_true")]
@@ -35,8 +37,6 @@ impl Default for ProtocolConfig {
         Self {
             websocket: true,
             sse: false,
-            tcp: false,
-            tcp_port: None,
             metrics: true,
             health: true,
             example_json: true,
@@ -61,7 +61,7 @@ pub struct CtLogConfig {
     pub unhealthy_threshold: u32,
     #[serde(default = "default_health_check_interval_secs")]
     pub health_check_interval_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_state_file")]
     pub state_file: Option<String>,
     #[serde(default = "default_batch_size")]
     pub batch_size: u64,
@@ -79,7 +79,7 @@ impl Default for CtLogConfig {
             healthy_threshold: default_healthy_threshold(),
             unhealthy_threshold: default_unhealthy_threshold(),
             health_check_interval_secs: default_health_check_interval_secs(),
-            state_file: None,
+            state_file: default_state_file(),
             batch_size: default_batch_size(),
             poll_interval_ms: default_poll_interval_ms(),
         }
@@ -112,6 +112,9 @@ fn default_batch_size() -> u64 {
 }
 fn default_poll_interval_ms() -> u64 {
     1000
+}
+fn default_state_file() -> Option<String> {
+    Some("certstream_state.json".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,21 +276,12 @@ fn default_header_name() -> String {
     "Authorization".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HotReloadConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub watch_path: Option<String>,
-}
-
-impl Default for HotReloadConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            watch_path: None,
-        }
-    }
 }
 
 fn default_true() -> bool {
@@ -304,6 +298,7 @@ pub struct Config {
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub custom_logs: Vec<CustomCtLog>,
+    pub static_logs: Vec<StaticCtLog>,
     pub protocols: ProtocolConfig,
     pub ct_log: CtLogConfig,
     pub connection_limit: ConnectionLimitConfig,
@@ -325,6 +320,8 @@ struct YamlConfig {
     tls_key: Option<String>,
     #[serde(default)]
     custom_logs: Vec<CustomCtLog>,
+    #[serde(default)]
+    static_logs: Vec<StaticCtLog>,
     #[serde(default)]
     protocols: Option<ProtocolConfig>,
     #[serde(default)]
@@ -391,124 +388,91 @@ impl Config {
         let tls_cert = env::var("CERTSTREAM_TLS_CERT").ok().or(yaml_config.tls_cert);
         let tls_key = env::var("CERTSTREAM_TLS_KEY").ok().or(yaml_config.tls_key);
 
-        let protocols = yaml_config.protocols.unwrap_or_else(|| {
-            let ws = env::var("CERTSTREAM_WS_ENABLED")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true);
-            let sse = env::var("CERTSTREAM_SSE_ENABLED")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false);
-            let tcp = env::var("CERTSTREAM_TCP_ENABLED")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false);
-            let tcp_port = env::var("CERTSTREAM_TCP_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok());
-            let metrics = env::var("CERTSTREAM_METRICS_ENABLED")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true);
-            let health = env::var("CERTSTREAM_HEALTH_ENABLED")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true);
-            let example_json = env::var("CERTSTREAM_EXAMPLE_JSON_ENABLED")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true);
-            let api = env::var("CERTSTREAM_API_ENABLED")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false);
+        let mut protocols = yaml_config.protocols.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_WS_ENABLED") {
+            protocols.websocket = v.parse().unwrap_or(protocols.websocket);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_SSE_ENABLED") {
+            protocols.sse = v.parse().unwrap_or(protocols.sse);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_METRICS_ENABLED") {
+            protocols.metrics = v.parse().unwrap_or(protocols.metrics);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_HEALTH_ENABLED") {
+            protocols.health = v.parse().unwrap_or(protocols.health);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_EXAMPLE_JSON_ENABLED") {
+            protocols.example_json = v.parse().unwrap_or(protocols.example_json);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_API_ENABLED") {
+            protocols.api = v.parse().unwrap_or(protocols.api);
+        }
 
-            ProtocolConfig {
-                websocket: ws,
-                sse,
-                tcp,
-                tcp_port,
-                metrics,
-                health,
-                example_json,
-                api,
-            }
-        });
+        let mut ct_log = yaml_config.ct_log.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_RETRY_MAX_ATTEMPTS") {
+            ct_log.retry_max_attempts = v.parse().unwrap_or(ct_log.retry_max_attempts);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_RETRY_INITIAL_DELAY_MS") {
+            ct_log.retry_initial_delay_ms = v.parse().unwrap_or(ct_log.retry_initial_delay_ms);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_RETRY_MAX_DELAY_MS") {
+            ct_log.retry_max_delay_ms = v.parse().unwrap_or(ct_log.retry_max_delay_ms);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_REQUEST_TIMEOUT_SECS") {
+            ct_log.request_timeout_secs = v.parse().unwrap_or(ct_log.request_timeout_secs);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_UNHEALTHY_THRESHOLD") {
+            ct_log.unhealthy_threshold = v.parse().unwrap_or(ct_log.unhealthy_threshold);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_HEALTHY_THRESHOLD") {
+            ct_log.healthy_threshold = v.parse().unwrap_or(ct_log.healthy_threshold);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_HEALTH_CHECK_INTERVAL_SECS") {
+            ct_log.health_check_interval_secs = v.parse().unwrap_or(ct_log.health_check_interval_secs);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_STATE_FILE") {
+            ct_log.state_file = Some(v);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_BATCH_SIZE") {
+            ct_log.batch_size = v.parse().unwrap_or(ct_log.batch_size);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_POLL_INTERVAL_MS") {
+            ct_log.poll_interval_ms = v.parse().unwrap_or(ct_log.poll_interval_ms);
+        }
 
-        let ct_log = yaml_config.ct_log.unwrap_or_else(|| {
-            let mut cfg = CtLogConfig::default();
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_RETRY_MAX_ATTEMPTS") {
-                cfg.retry_max_attempts = v.parse().unwrap_or(cfg.retry_max_attempts);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_RETRY_INITIAL_DELAY_MS") {
-                cfg.retry_initial_delay_ms = v.parse().unwrap_or(cfg.retry_initial_delay_ms);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_RETRY_MAX_DELAY_MS") {
-                cfg.retry_max_delay_ms = v.parse().unwrap_or(cfg.retry_max_delay_ms);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_REQUEST_TIMEOUT_SECS") {
-                cfg.request_timeout_secs = v.parse().unwrap_or(cfg.request_timeout_secs);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_UNHEALTHY_THRESHOLD") {
-                cfg.unhealthy_threshold = v.parse().unwrap_or(cfg.unhealthy_threshold);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_HEALTHY_THRESHOLD") {
-                cfg.healthy_threshold = v.parse().unwrap_or(cfg.healthy_threshold);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_HEALTH_CHECK_INTERVAL_SECS") {
-                cfg.health_check_interval_secs = v.parse().unwrap_or(cfg.health_check_interval_secs);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_STATE_FILE") {
-                cfg.state_file = Some(v);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_BATCH_SIZE") {
-                cfg.batch_size = v.parse().unwrap_or(cfg.batch_size);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CT_LOG_POLL_INTERVAL_MS") {
-                cfg.poll_interval_ms = v.parse().unwrap_or(cfg.poll_interval_ms);
-            }
-            cfg
-        });
+        let mut connection_limit = yaml_config.connection_limit.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_CONNECTION_LIMIT_ENABLED") {
+            connection_limit.enabled = v.parse().unwrap_or(connection_limit.enabled);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CONNECTION_LIMIT_MAX_CONNECTIONS") {
+            connection_limit.max_connections = v.parse().unwrap_or(connection_limit.max_connections);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CONNECTION_LIMIT_PER_IP_LIMIT") {
+            connection_limit.per_ip_limit = v.parse().ok();
+        }
 
-        let connection_limit = yaml_config.connection_limit.unwrap_or_else(|| {
-            let mut cfg = ConnectionLimitConfig::default();
-            if let Ok(v) = env::var("CERTSTREAM_CONNECTION_LIMIT_ENABLED") {
-                cfg.enabled = v.parse().unwrap_or(false);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CONNECTION_LIMIT_MAX_CONNECTIONS") {
-                cfg.max_connections = v.parse().unwrap_or(cfg.max_connections);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_CONNECTION_LIMIT_PER_IP_LIMIT") {
-                cfg.per_ip_limit = v.parse().ok();
-            }
-            cfg
-        });
-
-        let rate_limit = yaml_config.rate_limit.unwrap_or_else(|| {
-            let mut cfg = RateLimitConfig::default();
-            if let Ok(v) = env::var("CERTSTREAM_RATE_LIMIT_ENABLED") {
-                cfg.enabled = v.parse().unwrap_or(false);
-            }
-            cfg
-        });
+        let mut rate_limit = yaml_config.rate_limit.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_RATE_LIMIT_ENABLED") {
+            rate_limit.enabled = v.parse().unwrap_or(rate_limit.enabled);
+        }
 
         let api = yaml_config.api.unwrap_or_default();
 
-        let auth = yaml_config.auth.unwrap_or_else(|| {
-            let mut cfg = AuthConfig::default();
-            if let Ok(v) = env::var("CERTSTREAM_AUTH_ENABLED") {
-                cfg.enabled = v.parse().unwrap_or(false);
-            }
-            if let Ok(v) = env::var("CERTSTREAM_AUTH_TOKENS") {
-                cfg.tokens = v.split(',').map(|s| s.trim().to_string()).collect();
-            }
-            if let Ok(v) = env::var("CERTSTREAM_AUTH_HEADER_NAME") {
-                cfg.header_name = v;
-            }
-            cfg
-        });
+        let mut auth = yaml_config.auth.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_AUTH_ENABLED") {
+            auth.enabled = v.parse().unwrap_or(auth.enabled);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_AUTH_TOKENS") {
+            auth.tokens = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Ok(v) = env::var("CERTSTREAM_AUTH_HEADER_NAME") {
+            auth.header_name = v;
+        }
 
-        let hot_reload = yaml_config.hot_reload.unwrap_or_else(|| {
-            let mut cfg = HotReloadConfig::default();
-            if let Ok(v) = env::var("CERTSTREAM_HOT_RELOAD_ENABLED") {
-                cfg.enabled = v.parse().unwrap_or(false);
-            }
-            cfg
-        });
+        let mut hot_reload = yaml_config.hot_reload.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_HOT_RELOAD_ENABLED") {
+            hot_reload.enabled = v.parse().unwrap_or(hot_reload.enabled);
+        }
 
         Self {
             host,
@@ -519,6 +483,7 @@ impl Config {
             tls_cert,
             tls_key,
             custom_logs: yaml_config.custom_logs,
+            static_logs: yaml_config.static_logs,
             protocols,
             ct_log,
             connection_limit,
@@ -580,13 +545,11 @@ impl Config {
             });
         }
 
-        if self.rate_limit.enabled {
-            if self.rate_limit.free_refill_rate <= 0.0 {
-                errors.push(ConfigValidationError {
-                    field: "rate_limit.free_refill_rate".to_string(),
-                    message: "Refill rate must be positive".to_string(),
-                });
-            }
+        if self.rate_limit.enabled && self.rate_limit.free_refill_rate <= 0.0 {
+            errors.push(ConfigValidationError {
+                field: "rate_limit.free_refill_rate".to_string(),
+                message: "Refill rate must be positive".to_string(),
+            });
         }
 
         if errors.is_empty() {
@@ -607,11 +570,16 @@ impl Config {
         for path in config_paths.into_iter().flatten() {
             if Path::new(&path).exists() {
                 if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(config) = serde_yaml::from_str::<YamlConfig>(&content) {
-                        return YamlConfigWithPath {
-                            config,
-                            path: Some(path),
-                        };
+                    match serde_yaml::from_str::<YamlConfig>(&content) {
+                        Ok(config) => {
+                            return YamlConfigWithPath {
+                                config,
+                                path: Some(path),
+                            };
+                        }
+                        Err(e) => {
+                            eprintln!("WARNING: failed to parse {}: {}", path, e);
+                        }
                     }
                 }
             }
@@ -625,5 +593,211 @@ impl Config {
 
     pub fn has_tls(&self) -> bool {
         self.tls_cert.is_some() && self.tls_key.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            host: "0.0.0.0".parse().unwrap(),
+            port: 8080,
+            log_level: "info".to_string(),
+            buffer_size: 1000,
+            ct_logs_url: "https://example.com".to_string(),
+            tls_cert: None,
+            tls_key: None,
+            custom_logs: vec![],
+            static_logs: vec![],
+            protocols: ProtocolConfig::default(),
+            ct_log: CtLogConfig::default(),
+            connection_limit: ConnectionLimitConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            api: ApiConfig::default(),
+            auth: AuthConfig::default(),
+            hot_reload: HotReloadConfig::default(),
+            config_path: None,
+        }
+    }
+
+    #[test]
+    fn test_default_state_file() {
+        let val = default_state_file();
+        assert_eq!(val, Some("certstream_state.json".to_string()));
+    }
+
+    #[test]
+    fn test_ct_log_config_defaults() {
+        let config = CtLogConfig::default();
+        assert_eq!(config.retry_max_attempts, 3);
+        assert_eq!(config.retry_initial_delay_ms, 1000);
+        assert_eq!(config.retry_max_delay_ms, 30000);
+        assert_eq!(config.request_timeout_secs, 30);
+        assert_eq!(config.healthy_threshold, 2);
+        assert_eq!(config.unhealthy_threshold, 5);
+        assert_eq!(config.health_check_interval_secs, 60);
+        assert_eq!(config.state_file, Some("certstream_state.json".to_string()));
+        assert_eq!(config.batch_size, 256);
+        assert_eq!(config.poll_interval_ms, 1000);
+    }
+
+    #[test]
+    fn test_protocol_config_defaults() {
+        let config = ProtocolConfig::default();
+        assert!(config.websocket);
+        assert!(!config.sse);
+        assert!(config.metrics);
+        assert!(config.health);
+        assert!(config.example_json);
+        assert!(!config.api);
+    }
+
+    #[test]
+    fn test_connection_limit_config_defaults() {
+        let config = ConnectionLimitConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.max_connections, 10000);
+        assert!(config.per_ip_limit.is_none());
+    }
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let config = AuthConfig::default();
+        assert!(!config.enabled);
+        assert!(config.tokens.is_empty());
+        assert_eq!(config.header_name, "Authorization");
+        assert!(config.standard_tokens.is_empty());
+        assert!(config.premium_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_static_ct_log_deserialize() {
+        let yaml = r#"
+name: "Test Log"
+url: "https://test.example.com/log/"
+"#;
+        let log: StaticCtLog = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(log.name, "Test Log");
+        assert_eq!(log.url, "https://test.example.com/log/");
+    }
+
+    #[test]
+    fn test_custom_ct_log_deserialize() {
+        let yaml = r#"
+name: "Custom Log"
+url: "https://custom.example.com/ct"
+"#;
+        let log: CustomCtLog = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(log.name, "Custom Log");
+        assert_eq!(log.url, "https://custom.example.com/ct");
+    }
+
+    #[test]
+    fn test_yaml_config_with_static_logs() {
+        let yaml = r#"
+host: "127.0.0.1"
+port: 9090
+static_logs:
+  - name: "Log A"
+    url: "https://a.example.com/"
+  - name: "Log B"
+    url: "https://b.example.com/"
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.static_logs.len(), 2);
+        assert_eq!(config.static_logs[0].name, "Log A");
+        assert_eq!(config.static_logs[1].name, "Log B");
+    }
+
+    #[test]
+    fn test_yaml_config_empty_static_logs() {
+        let yaml = r#"
+host: "127.0.0.1"
+port: 9090
+"#;
+        let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.static_logs.is_empty());
+    }
+
+    #[test]
+    fn test_has_tls_both_set() {
+        let config = Config {
+            tls_cert: Some("cert.pem".to_string()),
+            tls_key: Some("key.pem".to_string()),
+            ..test_config()
+        };
+        assert!(config.has_tls());
+    }
+
+    #[test]
+    fn test_has_tls_none() {
+        assert!(!test_config().has_tls());
+    }
+
+    #[test]
+    fn test_has_tls_partial() {
+        let config = Config {
+            tls_cert: Some("cert.pem".to_string()),
+            ..test_config()
+        };
+        assert!(!config.has_tls());
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        assert!(test_config().validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_zero_port() {
+        let config = Config { port: 0, ..test_config() };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "port"));
+    }
+
+    #[test]
+    fn test_validate_zero_buffer_size() {
+        let config = Config { buffer_size: 0, ..test_config() };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "buffer_size"));
+    }
+
+    #[test]
+    fn test_validate_empty_ct_logs_url() {
+        let config = Config {
+            ct_logs_url: "".to_string(),
+            ..test_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_rate_limit_config_defaults() {
+        let config = RateLimitConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.free_max_tokens, 100.0);
+        assert_eq!(config.free_refill_rate, 10.0);
+        assert_eq!(config.window_seconds, 60);
+        assert_eq!(config.window_max_requests, 1000);
+    }
+
+    #[test]
+    fn test_ct_log_config_deserialize_with_state_file() {
+        let yaml = r#"
+retry_max_attempts: 5
+state_file: "my_state.json"
+batch_size: 512
+"#;
+        let config: CtLogConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.retry_max_attempts, 5);
+        assert_eq!(config.state_file, Some("my_state.json".to_string()));
+        assert_eq!(config.batch_size, 512);
+        assert_eq!(config.retry_initial_delay_ms, 1000);
     }
 }

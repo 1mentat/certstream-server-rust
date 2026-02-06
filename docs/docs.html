@@ -3,20 +3,36 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>API Documentation - certstream-server-rust</title>
-    <meta name="description" content="API documentation for certstream-server-rust. WebSocket, SSE, and TCP endpoints for real-time certificate transparency log streaming.">
+    <title>Certstream API Documentation - WebSocket, SSE Endpoints</title>
+    <meta name="description" content="Complete API documentation for certstream-server-rust. Connect to real-time certificate streams via WebSocket or SSE. Code examples in Python, JavaScript, Go, and cURL. Environment variables and YAML configuration reference.">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="https://certstream.dev/docs.html">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://certstream.dev/docs.html">
-    <meta property="og:title" content="API Documentation - certstream-server-rust">
-    <meta property="og:description" content="WebSocket, SSE, and TCP endpoints for real-time CT log streaming.">
+    <meta property="og:title" content="Certstream API Documentation - WebSocket, SSE Streaming">
+    <meta property="og:description" content="Connect to certstream via WebSocket or SSE. Real-time CT log streaming with code examples in Python, JavaScript, Go, and cURL.">
     <meta name="theme-color" content="#b7410e">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "TechArticle",
+        "headline": "Certstream API Documentation",
+        "description": "Complete API reference for certstream-server-rust WebSocket and SSE endpoints",
+        "author": {
+            "@type": "Person",
+            "name": "burakozcn01"
+        },
+        "publisher": {
+            "@type": "Organization",
+            "name": "certstream-server-rust"
+        }
+    }
+    </script>
 </head>
 <body>
     <header>
@@ -27,6 +43,7 @@
                     <li><a href="/">Home</a></li>
                     <li><a href="docs.html" class="active">API Docs</a></li>
                     <li><a href="quickstart.html">Quick Start</a></li>
+                    <li><a href="architecture.html">Architecture</a></li>
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
@@ -45,6 +62,7 @@
             <li><a href="/">Home</a></li>
             <li><a href="docs.html" class="active">API Docs</a></li>
             <li><a href="quickstart.html">Quick Start</a></li>
+            <li><a href="architecture.html">Architecture</a></li>
             <li><a href="https://github.com/burakozcn01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
@@ -52,8 +70,8 @@
     <main>
         <div class="wrap">
             <div class="page-header">
-                <h1>API Documentation</h1>
-                <p>WebSocket, SSE, and TCP endpoints for real-time certificate streaming</p>
+                <h1>Certstream API Documentation</h1>
+                <p>Connect to real-time certificate streams via WebSocket or SSE</p>
             </div>
         </div>
 
@@ -66,7 +84,7 @@
                 <div class="features-list">
                     <div class="feature-item">
                         <h3>Overview</h3>
-                        <p>Certstream aggregates certificates from Certificate Transparency logs and streams them in real-time. This is a Rust rewrite that works as a drop-in replacement for certstream-server (Elixir) and certstream-server-go.</p>
+                        <p>Certstream aggregates certificates from Certificate Transparency logs and streams them in real-time. This Rust implementation is a drop-in replacement for certstream-server (Elixir) and certstream-server-go with better performance.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Why Rust?</h3>
@@ -86,7 +104,7 @@
             <div class="wrap">
                 <div class="section-header">
                     <h2>Endpoints</h2>
-                    <p>Connect using WebSocket, Server-Sent Events, or raw TCP</p>
+                    <p>Connect using WebSocket or Server-Sent Events</p>
                 </div>
                 <table class="endpoints-table">
                     <thead>
@@ -128,14 +146,14 @@
                             <td>Server-Sent Events domains only</td>
                         </tr>
                         <tr>
-                            <td><code>ws.certstream.dev:8081</code></td>
-                            <td>TCP</td>
-                            <td>Raw TCP (send f/d/nothing for full/domains/lite)</td>
-                        </tr>
-                        <tr>
                             <td><code>https://ws.certstream.dev/health</code></td>
                             <td>HTTP</td>
-                            <td>Health check endpoint</td>
+                            <td>Basic health check (returns "OK")</td>
+                        </tr>
+                        <tr>
+                            <td><code>https://ws.certstream.dev/health/deep</code></td>
+                            <td>HTTP</td>
+                            <td>Detailed health with log status, connections, uptime (JSON)</td>
                         </tr>
                         <tr>
                             <td><code>https://ws.certstream.dev/metrics</code></td>
@@ -454,16 +472,6 @@ docker compose up -d</pre>
                             <td>Enable SSE</td>
                         </tr>
                         <tr>
-                            <td><code>CERTSTREAM_TCP_ENABLED</code></td>
-                            <td>false</td>
-                            <td>Enable TCP</td>
-                        </tr>
-                        <tr>
-                            <td><code>CERTSTREAM_TCP_PORT</code></td>
-                            <td>8081</td>
-                            <td>TCP port</td>
-                        </tr>
-                        <tr>
                             <td><code>CERTSTREAM_METRICS_ENABLED</code></td>
                             <td>true</td>
                             <td>Enable /metrics endpoint</td>
@@ -549,7 +557,7 @@ docker compose up -d</pre>
                     <tbody>
                         <tr>
                             <td><code>CERTSTREAM_CT_LOG_STATE_FILE</code></td>
-                            <td>-</td>
+                            <td>certstream_state.json</td>
                             <td>State file path</td>
                         </tr>
                         <tr>
@@ -616,8 +624,6 @@ docker compose up -d</pre>
 <span class="str">protocols</span>:
   <span class="str">websocket</span>: <span class="var">true</span>
   <span class="str">sse</span>: <span class="var">true</span>
-  <span class="str">tcp</span>: <span class="var">true</span>
-  <span class="str">tcp_port</span>: <span class="var">8081</span>
   <span class="str">metrics</span>: <span class="var">true</span>
   <span class="str">health</span>: <span class="var">true</span>
   <span class="str">example_json</span>: <span class="var">true</span>
@@ -646,7 +652,19 @@ docker compose up -d</pre>
 
 <span class="str">custom_logs</span>:
   - <span class="str">name</span>: <span class="str">"My Custom CT Log"</span>
-    <span class="str">url</span>: <span class="str">"https://ct.example.com/log"</span></pre>
+    <span class="str">url</span>: <span class="str">"https://ct.example.com/log"</span>
+
+<span class="cm"># Static CT logs (Sunlight / static-ct-api protocol)</span>
+<span class="cm"># Use monitoring prefix (mon.*) for read access</span>
+<span class="str">static_logs</span>:
+  - <span class="str">name</span>: <span class="str">"Let's Encrypt 'Willow' 2025h2d"</span>
+    <span class="str">url</span>: <span class="str">"https://mon.willow.ct.letsencrypt.org/2025h2d/"</span>
+  - <span class="str">name</span>: <span class="str">"Let's Encrypt 'Willow' 2026h1"</span>
+    <span class="str">url</span>: <span class="str">"https://mon.willow.ct.letsencrypt.org/2026h1/"</span>
+  - <span class="str">name</span>: <span class="str">"Let's Encrypt 'Sycamore' 2025h2d"</span>
+    <span class="str">url</span>: <span class="str">"https://mon.sycamore.ct.letsencrypt.org/2025h2d/"</span>
+  - <span class="str">name</span>: <span class="str">"Let's Encrypt 'Sycamore' 2026h1"</span>
+    <span class="str">url</span>: <span class="str">"https://mon.sycamore.ct.letsencrypt.org/2026h1/"</span></pre>
                     </div>
                 </div>
                 <p style="margin-top: 1rem; color: var(--text-muted);">Config search order: <code>CERTSTREAM_CONFIG</code> env var → <code>./config.yaml</code> → <code>./config.yml</code> → <code>/etc/certstream/config.yaml</code></p>
@@ -707,8 +725,96 @@ docker compose up -d</pre>
         <section>
             <div class="wrap">
                 <div class="section-header">
+                    <h2>Prometheus Metrics</h2>
+                    <p>Key metrics available at the <code>/metrics</code> endpoint</p>
+                </div>
+                <h3 style="margin-bottom: 1rem; margin-top: 2rem;">Core Metrics</h3>
+                <table class="endpoints-table">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>certstream_messages_sent</code></td>
+                            <td>counter</td>
+                            <td>Total certificate messages broadcast</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_parse_failures</code></td>
+                            <td>counter</td>
+                            <td>Failed certificate parses (RFC 6962)</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_ct_logs_count</code></td>
+                            <td>gauge</td>
+                            <td>Number of RFC 6962 CT logs monitored</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_worker_panics</code></td>
+                            <td>counter</td>
+                            <td>Worker panic count (auto-recovered)</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <h3 style="margin-bottom: 1rem; margin-top: 2rem;">Static CT Metrics (v1.2.0)</h3>
+                <table class="endpoints-table">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Type</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>certstream_static_ct_logs_count</code></td>
+                            <td>gauge</td>
+                            <td>Number of static CT logs monitored</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_static_ct_tiles_fetched</code></td>
+                            <td>counter</td>
+                            <td>Total tiles fetched from static CT logs</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_static_ct_entries_parsed</code></td>
+                            <td>counter</td>
+                            <td>Entries successfully parsed from tiles</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_static_ct_checkpoint_errors</code></td>
+                            <td>counter</td>
+                            <td>Checkpoint fetch/parse failures</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_issuer_cache_size</code></td>
+                            <td>gauge</td>
+                            <td>Cached issuer certificates</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_duplicates_filtered</code></td>
+                            <td>counter</td>
+                            <td>Duplicate certificates filtered by dedup</td>
+                        </tr>
+                        <tr>
+                            <td><code>certstream_dedup_cache_size</code></td>
+                            <td>gauge</td>
+                            <td>Current dedup cache entries</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section>
+            <div class="wrap">
+                <div class="section-header">
                     <h2>CT Logs Monitored</h2>
-                    <p>60+ Certificate Transparency logs including</p>
+                    <p>49+ RFC 6962 logs + static CT logs with cross-log deduplication</p>
                 </div>
                 <div class="features-list">
                     <div class="feature-item">
@@ -728,8 +834,8 @@ docker compose up -d</pre>
                         <p>Elephant, Tiger, Dodo</p>
                     </div>
                     <div class="feature-item">
-                        <h3>Let's Encrypt</h3>
-                        <p>Sapling, Clicky</p>
+                        <h3>Let's Encrypt (Static CT)</h3>
+                        <p>Willow 2025h2/2026h1, Sycamore 2025h2/2026h1</p>
                     </div>
                     <div class="feature-item">
                         <h3>Others</h3>
@@ -750,7 +856,7 @@ docker compose up -d</pre>
                 <a href="https://github.com/burakozcn01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
                 <a href="https://github.com/burakozcn01/certstream-server-rust/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
             </div>
-            <p>certstream-server-rust v1.0.7</p>
+            <p>certstream-server-rust</p>
         </div>
     </footer>
 </body>
