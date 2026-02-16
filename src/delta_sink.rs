@@ -654,4 +654,124 @@ mod tests {
             .expect("as_der column should be StringArray");
         assert_eq!(as_der_col.value(0), "");
     }
+
+    #[tokio::test]
+    async fn test_open_or_create_table_creates_new_table() {
+        let test_name = "table_creation";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+
+        // Clean up any existing test data
+        let _ = std::fs::remove_dir_all(&table_path);
+
+        // Create parent directory if needed
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let result = open_or_create_table(&table_path, &schema).await;
+
+        // Verify table was created successfully
+        assert!(result.is_ok(), "table creation should succeed");
+
+        let table = result.unwrap();
+
+        // Verify table version is 0 (newly created)
+        assert_eq!(table.version(), 0, "new table should have version 0");
+
+        // Verify schema exists and has correct field count
+        let table_schema = table.get_schema().expect("should have schema");
+        let field_count = table_schema.fields().count();
+        assert_eq!(
+            field_count, 20,
+            "table schema should have 20 fields"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_open_or_create_table_reopens_existing_table() {
+        let test_name = "table_reopen";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+
+        // Clean up any existing test data
+        let _ = std::fs::remove_dir_all(&table_path);
+
+        // Create parent directory if needed
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+
+        // First call: create the table
+        let result1 = open_or_create_table(&table_path, &schema).await;
+        assert!(result1.is_ok(), "first table creation should succeed");
+
+        let table1 = result1.unwrap();
+        let version1 = table1.version();
+
+        // Second call: should open existing table
+        let result2 = open_or_create_table(&table_path, &schema).await;
+        assert!(result2.is_ok(), "reopening table should succeed");
+
+        let table2 = result2.unwrap();
+        let version2 = table2.version();
+
+        // Verify that reopening the table doesn't create a new version
+        // (version should still be 0 since we haven't written any data)
+        assert_eq!(version1, version2, "table versions should match");
+        assert_eq!(
+            version2, 0,
+            "table should still have version 0 after reopening"
+        );
+
+        // Verify schema is still correct
+        let table_schema = table2.get_schema().expect("should have schema");
+        let field_count = table_schema.fields().count();
+        assert_eq!(
+            field_count, 20,
+            "reopened table schema should have 20 fields"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_open_or_create_table_preserves_seen_date_partition() {
+        let test_name = "table_partition";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+
+        // Clean up any existing test data
+        let _ = std::fs::remove_dir_all(&table_path);
+
+        // Create parent directory if needed
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let result = open_or_create_table(&table_path, &schema).await;
+
+        assert!(result.is_ok(), "table creation should succeed");
+
+        let table = result.unwrap();
+
+        // Get table metadata
+        let metadata = table
+            .metadata()
+            .expect("should have metadata");
+
+        // Verify partition columns are set correctly
+        let partition_columns: Vec<String> = metadata
+            .partition_columns
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            partition_columns, vec!["seen_date"],
+            "table should have seen_date as partition column"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
 }
