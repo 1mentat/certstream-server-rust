@@ -1,4 +1,5 @@
-use crate::models::CertificateMessage;
+use crate::config::DeltaSinkConfig;
+use crate::models::{CertificateMessage, PreSerializedMessage};
 use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -9,7 +10,10 @@ use deltalake::protocol::SaveMode;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
 use serde_json;
 use std::sync::Arc;
-use tracing::warn;
+use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Represents a flattened certificate record for Delta table storage.
 ///
@@ -503,6 +507,169 @@ pub async fn flush_buffer(
             }
         }
     }
+}
+
+/// Main async task for the Delta sink.
+///
+/// Receives certificate messages from a broadcast channel, deserializes them into
+/// `DeltaCertRecord` structs, buffers them, and periodically flushes to the Delta table.
+/// Implements batching (AC3.1), time-based flush (AC3.2), and graceful shutdown (AC3.3).
+///
+/// # Arguments
+/// * `config` - Configuration containing table path, batch size, and flush interval
+/// * `rx` - Broadcast receiver for `Arc<PreSerializedMessage>` events
+/// * `shutdown` - CancellationToken for graceful shutdown signal
+///
+/// # Behavior
+/// 1. Opens or creates the Delta table on startup
+/// 2. Subscribes to broadcast channel via `rx.recv()`
+/// 3. Deserializes `msg.full` JSON into `DeltaCertRecord`
+/// 4. Buffers records and flushes when size threshold (batch_size) or time threshold (flush_interval_secs) is reached
+/// 5. On graceful shutdown, flushes remaining buffered records and exits
+/// 6. Lagged messages are logged and skipped (AC4.3)
+/// 7. Deserialization failures are logged and skipped (AC1.5)
+pub async fn run_delta_sink(
+    config: DeltaSinkConfig,
+    mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
+    shutdown: CancellationToken,
+) {
+    let schema = delta_schema();
+
+    // Try to open or create the table; if it fails, log error and return
+    let mut table = match open_or_create_table(&config.table_path, &schema).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                error = %e,
+                table_path = %config.table_path,
+                "Failed to open or create Delta table at startup, delta-sink task exiting"
+            );
+            return;
+        }
+    };
+
+    info!(
+        table_path = %config.table_path,
+        batch_size = config.batch_size,
+        flush_interval_secs = config.flush_interval_secs,
+        "Delta sink task started"
+    );
+
+    let mut flush_interval = tokio::time::interval(Duration::from_secs(config.flush_interval_secs));
+    let mut buffer: Vec<DeltaCertRecord> = Vec::with_capacity(config.batch_size);
+    let table_path = config.table_path.clone();
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(msg) => {
+                        // Deserialize msg.full into DeltaCertRecord
+                        match DeltaCertRecord::from_json(&msg.full) {
+                            Ok(record) => {
+                                buffer.push(record);
+
+                                // If buffer.len() >= config.batch_size: flush (AC3.1)
+                                if buffer.len() >= config.batch_size {
+                                    let (new_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                                    table = new_table;
+
+                                    match flush_result {
+                                        Ok(count) => {
+                                            debug!(
+                                                records_written = count,
+                                                buffer_size = buffer.len(),
+                                                "Batch flush completed"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                buffer_size = buffer.len(),
+                                                "Batch flush failed, buffer retained for retry"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // On deser failure: log warning, skip (AC1.5)
+                                warn!(
+                                    error = %e,
+                                    "Failed to deserialize message, skipping"
+                                );
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Log warning with count, continue (AC4.3)
+                        warn!(
+                            lagged = n,
+                            "Sink receiver lagged, skipping {} messages",
+                            n
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Channel closed, break
+                        info!("Broadcast channel closed, exiting receive loop");
+                        break;
+                    }
+                }
+            }
+            _ = flush_interval.tick() => {
+                // Time-triggered flush (AC3.2)
+                if !buffer.is_empty() {
+                    let (new_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                    table = new_table;
+
+                    match flush_result {
+                        Ok(count) => {
+                            debug!(
+                                records_written = count,
+                                buffer_size = buffer.len(),
+                                "Timer-triggered flush completed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                buffer_size = buffer.len(),
+                                "Timer-triggered flush failed, buffer retained for retry"
+                            );
+                        }
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                // Graceful shutdown: flush remaining buffer (AC3.3)
+                if !buffer.is_empty() {
+                    info!(
+                        records_in_buffer = buffer.len(),
+                        "Graceful shutdown initiated, flushing remaining buffer"
+                    );
+                    let (_final_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+
+                    match flush_result {
+                        Ok(count) => {
+                            info!(
+                                records_written = count,
+                                "Final shutdown flush completed successfully"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Final shutdown flush failed"
+                            );
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    info!("Delta sink task stopped");
 }
 
 #[cfg(test)]
