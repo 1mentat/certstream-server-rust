@@ -1,6 +1,5 @@
 use crate::config::DeltaSinkConfig;
 use crate::models::{CertificateMessage, PreSerializedMessage};
-use bytes::Bytes;
 use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -386,6 +385,38 @@ pub fn records_to_batch(
     )
 }
 
+/// Checks if buffer has exceeded the overflow threshold and drops oldest half if needed.
+///
+/// This is a testable helper function for the buffer overflow logic (AC3.4).
+/// If the buffer size exceeds 2 * batch_size, drops the oldest half of the records.
+///
+/// # Arguments
+/// * `buffer` - Mutable reference to the record buffer
+/// * `batch_size` - Maximum records per batch (used to calculate threshold)
+///
+/// # Returns
+/// * The number of records dropped (0 if no overflow)
+///
+/// # Behavior
+/// * If `buffer.len() > 2 * batch_size`: drops oldest half, returns count dropped
+/// * Otherwise: no modification, returns 0
+fn check_buffer_overflow(buffer: &mut Vec<DeltaCertRecord>, batch_size: usize) -> usize {
+    if buffer.len() > 2 * batch_size {
+        let dropped = buffer.len() / 2;
+        warn!(
+            dropped_records = dropped,
+            buffer_size = buffer.len(),
+            batch_size = batch_size,
+            "Buffer overflow: dropping oldest {} records",
+            dropped
+        );
+        buffer.drain(..dropped);
+        dropped
+    } else {
+        0
+    }
+}
+
 /// Writes buffered certificate records to the Delta table.
 ///
 /// This function handles batching, overflow protection, and error recovery.
@@ -421,16 +452,7 @@ pub async fn flush_buffer(
     }
 
     // Check buffer overflow: if exceeds 2 * batch_size, drop oldest half
-    if buffer.len() > 2 * batch_size {
-        let dropped = buffer.len() / 2;
-        warn!(
-            dropped_records = dropped,
-            buffer_size = buffer.len(),
-            batch_size = batch_size,
-            "Buffer overflow: dropping oldest {} records", dropped
-        );
-        buffer.drain(..dropped);
-    }
+    check_buffer_overflow(buffer, batch_size);
 
     let record_count = buffer.len();
     let table_path = table.table_uri();
@@ -558,7 +580,6 @@ pub async fn run_delta_sink(
 
     let mut flush_interval = tokio::time::interval(Duration::from_secs(config.flush_interval_secs));
     let mut buffer: Vec<DeltaCertRecord> = Vec::with_capacity(config.batch_size);
-    let _table_path = config.table_path.clone();
 
     loop {
         tokio::select! {
@@ -676,6 +697,7 @@ pub async fn run_delta_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn make_test_json_bytes() -> Vec<u8> {
         let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
@@ -1075,17 +1097,6 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&table_path);
-    }
-
-    // Helper function for buffer overflow testing (testable helper for AC3.4)
-    fn check_buffer_overflow(buffer: &mut Vec<DeltaCertRecord>, batch_size: usize) -> usize {
-        if buffer.len() > 2 * batch_size {
-            let dropped = buffer.len() / 2;
-            buffer.drain(..dropped);
-            dropped
-        } else {
-            0
-        }
     }
 
     #[test]
