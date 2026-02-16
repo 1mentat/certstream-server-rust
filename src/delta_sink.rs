@@ -478,9 +478,12 @@ mod tests {
         let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
 
         // chain is at index 19
-        let chain_col = batch.column(19);
-        // Verify it's a ListArray by checking it has list-like properties
-        assert_eq!(chain_col.data_type().to_string().contains("List"), true);
+        let chain_col = batch
+            .column(19)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("chain column should be ListArray");
+        assert_eq!(chain_col.len(), 1);
     }
 
     #[test]
@@ -491,9 +494,12 @@ mod tests {
         let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
 
         // all_domains is at index 17
-        let all_domains_col = batch.column(17);
-        // Verify it's a ListArray
-        assert_eq!(all_domains_col.data_type().to_string().contains("List"), true);
+        let all_domains_col = batch
+            .column(17)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("all_domains column should be ListArray");
+        assert_eq!(all_domains_col.len(), 1);
     }
 
     #[test]
