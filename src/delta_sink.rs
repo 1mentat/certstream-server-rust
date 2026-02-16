@@ -300,80 +300,19 @@ pub fn records_to_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CertificateData, ChainCert, Extensions, LeafCert, Source, Subject};
-    use smallvec::smallvec;
-    use std::borrow::Cow;
-    use std::sync::Arc;
 
-    fn make_test_message() -> CertificateMessage {
-        CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: LeafCert {
-                    subject: {
-                        let mut s = Subject::default();
-                        s.cn = Some("example.com".into());
-                        s.aggregated = Some("/CN=example.com".into());
-                        s
-                    },
-                    issuer: {
-                        let mut s = Subject::default();
-                        s.cn = Some("Test CA".into());
-                        s.aggregated = Some("/CN=Test CA".into());
-                        s
-                    },
-                    serial_number: "01".into(),
-                    not_before: 1700000000,
-                    not_after: 1730000000,
-                    fingerprint: "AA:BB".into(),
-                    sha1: "CC:DD".into(),
-                    sha256: "EE:FF".into(),
-                    signature_algorithm: "sha256, rsa".into(),
-                    is_ca: false,
-                    all_domains: smallvec!["example.com".into(), "www.example.com".into()],
-                    as_der: Some("base64encodedderdata".into()),
-                    extensions: Extensions::default(),
-                },
-                chain: Some(vec![ChainCert {
-                    subject: {
-                        let mut s = Subject::default();
-                        s.cn = Some("Intermediate CA".into());
-                        s.aggregated = Some("/CN=Intermediate CA".into());
-                        s
-                    },
-                    issuer: {
-                        let mut s = Subject::default();
-                        s.cn = Some("Root CA".into());
-                        s.aggregated = Some("/CN=Root CA".into());
-                        s
-                    },
-                    serial_number: "02".into(),
-                    not_before: 1600000000,
-                    not_after: 1800000000,
-                    fingerprint: "GG:HH".into(),
-                    sha1: "II:JJ".into(),
-                    sha256: "KK:LL".into(),
-                    signature_algorithm: "sha256, rsa".into(),
-                    is_ca: true,
-                    as_der: None,
-                    extensions: Extensions::default(),
-                }]),
-                cert_index: 12345,
-                cert_link: "https://ct.example.com/entry/12345".into(),
-                seen: 1700000000.0,
-                source: Arc::new(Source {
-                    name: Arc::from("Test Log"),
-                    url: Arc::from("https://ct.example.com/"),
-                }),
-            },
-        }
+    fn make_test_json_bytes() -> Vec<u8> {
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        json_str.as_bytes().to_vec()
+    }
+
+    fn make_test_record() -> DeltaCertRecord {
+        DeltaCertRecord::from_json(&make_test_json_bytes()).expect("failed to deserialize test record")
     }
 
     #[test]
     fn test_from_json_deserializes_all_fields() {
-        let msg = make_test_message();
-        let json_bytes = serde_json::to_vec(&msg).expect("serialization failed");
+        let json_bytes = make_test_json_bytes();
 
         let record = DeltaCertRecord::from_json(&json_bytes).expect("deserialization failed");
 
@@ -399,20 +338,16 @@ mod tests {
 
     #[test]
     fn test_from_json_derives_seen_date() {
-        let msg = make_test_message();
-        let json_bytes = serde_json::to_vec(&msg).expect("serialization failed");
-
+        let json_bytes = make_test_json_bytes();
         let record = DeltaCertRecord::from_json(&json_bytes).expect("deserialization failed");
 
-        // 1700000000 seconds since epoch is approximately 2023-11-15
-        assert_eq!(record.seen_date, "2023-11-15");
+        // 1700000000 seconds since epoch is 2023-11-14 in UTC
+        assert_eq!(record.seen_date, "2023-11-14");
     }
 
     #[test]
     fn test_from_json_serializes_chain_to_json_strings() {
-        let msg = make_test_message();
-        let json_bytes = serde_json::to_vec(&msg).expect("serialization failed");
-
+        let json_bytes = make_test_json_bytes();
         let record = DeltaCertRecord::from_json(&json_bytes).expect("deserialization failed");
 
         assert_eq!(record.chain.len(), 1);
@@ -422,34 +357,221 @@ mod tests {
 
     #[test]
     fn test_from_json_with_empty_chain() {
-        let mut msg = make_test_message();
-        msg.data.chain = None;
-
-        let json_bytes = serde_json::to_vec(&msg).expect("serialization failed");
-        let record = DeltaCertRecord::from_json(&json_bytes).expect("deserialization failed");
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_bytes = json_str.as_bytes();
+        let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
         assert_eq!(record.chain.len(), 0);
     }
 
     #[test]
     fn test_from_json_with_empty_as_der() {
-        let mut msg = make_test_message();
-        msg.data.leaf_cert.as_der = None;
-
-        let json_bytes = serde_json::to_vec(&msg).expect("serialization failed");
-        let record = DeltaCertRecord::from_json(&json_bytes).expect("deserialization failed");
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":null,"extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_bytes = json_str.as_bytes();
+        let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
         assert_eq!(record.as_der, "");
     }
 
     #[test]
     fn test_from_json_with_empty_domains() {
-        let mut msg = make_test_message();
-        msg.data.leaf_cert.all_domains = smallvec![];
-
-        let json_bytes = serde_json::to_vec(&msg).expect("serialization failed");
-        let record = DeltaCertRecord::from_json(&json_bytes).expect("deserialization failed");
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_bytes = json_str.as_bytes();
+        let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
         assert_eq!(record.all_domains.len(), 0);
+    }
+
+    #[test]
+    fn test_delta_schema_has_correct_field_count() {
+        let schema = delta_schema();
+        assert_eq!(schema.fields().len(), 20);
+    }
+
+    #[test]
+    fn test_delta_schema_field_types() {
+        let schema = delta_schema();
+        let fields = schema.fields();
+
+        // Check cert_index is UInt64
+        assert_eq!(fields[0].name(), "cert_index");
+        assert_eq!(fields[0].data_type(), &DataType::UInt64);
+
+        // Check update_type is Utf8
+        assert_eq!(fields[1].name(), "update_type");
+        assert_eq!(fields[1].data_type(), &DataType::Utf8);
+
+        // Check seen is Timestamp(Microsecond, UTC)
+        assert_eq!(fields[2].name(), "seen");
+        match fields[2].data_type() {
+            DataType::Timestamp(unit, tz) => {
+                assert_eq!(*unit, TimeUnit::Microsecond);
+                assert_eq!(tz.as_deref(), Some("UTC"));
+            }
+            _ => panic!("expected Timestamp for seen field"),
+        }
+
+        // Check all_domains is List(Utf8)
+        assert_eq!(fields[17].name(), "all_domains");
+        match fields[17].data_type() {
+            DataType::List(inner_field) => {
+                assert_eq!(inner_field.data_type(), &DataType::Utf8);
+            }
+            _ => panic!("expected List for all_domains field"),
+        }
+
+        // Check is_ca is Boolean
+        assert_eq!(fields[13].name(), "is_ca");
+        assert_eq!(fields[13].data_type(), &DataType::Boolean);
+
+        // Check chain is List(Utf8)
+        assert_eq!(fields[19].name(), "chain");
+        match fields[19].data_type() {
+            DataType::List(inner_field) => {
+                assert_eq!(inner_field.data_type(), &DataType::Utf8);
+            }
+            _ => panic!("expected List for chain field"),
+        }
+    }
+
+    #[test]
+    fn test_records_to_batch_creates_correct_row_count() {
+        let schema = delta_schema();
+        let records: Vec<DeltaCertRecord> = (0..5)
+            .map(|_| make_test_record())
+            .collect();
+
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+        assert_eq!(batch.num_rows(), 5);
+    }
+
+    #[test]
+    fn test_records_to_batch_creates_correct_column_count() {
+        let schema = delta_schema();
+        let record = make_test_record();
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+        assert_eq!(batch.num_columns(), 20);
+    }
+
+    #[test]
+    fn test_records_to_batch_contains_as_der_string() {
+        let schema = delta_schema();
+        let record = make_test_record();
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+
+        // as_der is at index 18
+        let as_der_col = batch
+            .column(18)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("as_der column should be StringArray");
+        assert_eq!(as_der_col.value(0), "base64encodedderdata");
+    }
+
+    #[test]
+    fn test_records_to_batch_contains_chain_as_list() {
+        let schema = delta_schema();
+        let record = make_test_record();
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+
+        // chain is at index 19
+        let chain_col = batch.column(19);
+        // Verify it's a ListArray by checking it has list-like properties
+        assert_eq!(chain_col.data_type().to_string().contains("List"), true);
+    }
+
+    #[test]
+    fn test_records_to_batch_contains_all_domains_list() {
+        let schema = delta_schema();
+        let record = make_test_record();
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+
+        // all_domains is at index 17
+        let all_domains_col = batch.column(17);
+        // Verify it's a ListArray
+        assert_eq!(all_domains_col.data_type().to_string().contains("List"), true);
+    }
+
+    #[test]
+    fn test_records_to_batch_is_ca_boolean_values() {
+        let schema = delta_schema();
+        let record = make_test_record();
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+
+        // is_ca is at index 13
+        let is_ca_col = batch
+            .column(13)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("is_ca column should be BooleanArray");
+        assert_eq!(is_ca_col.value(0), false);
+    }
+
+    #[test]
+    fn test_records_to_batch_seen_timestamp() {
+        let schema = delta_schema();
+        let record = make_test_record();
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+
+        // seen is at index 2
+        let seen_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("seen column should be TimestampMicrosecondArray");
+
+        // 1700000000 seconds = 1700000000000000 microseconds
+        let expected_micros = 1700000000i64 * 1_000_000;
+        assert_eq!(seen_col.value(0), expected_micros);
+    }
+
+    #[test]
+    fn test_records_to_batch_multiple_records() {
+        let schema = delta_schema();
+        let records: Vec<DeltaCertRecord> = (0..3)
+            .map(|_| make_test_record())
+            .collect();
+
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+
+        assert_eq!(batch.num_rows(), 3);
+
+        // Check cert_index column (index 0) - all records have the same cert_index from the test data
+        let cert_index_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("cert_index column should be UInt64Array");
+        assert_eq!(cert_index_col.value(0), 12345);
+        assert_eq!(cert_index_col.value(1), 12345);
+        assert_eq!(cert_index_col.value(2), 12345);
+    }
+
+    #[test]
+    fn test_records_to_batch_with_empty_domains_and_chain() {
+        let schema = delta_schema();
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":null,"extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_bytes = json_str.as_bytes();
+        let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
+
+        let batch = records_to_batch(&[record], &schema).expect("batch creation failed");
+
+        // Verify batch was created successfully with 1 row
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 20);
+
+        // as_der should be empty string (index 18)
+        let as_der_col = batch
+            .column(18)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("as_der column should be StringArray");
+        assert_eq!(as_der_col.value(0), "");
     }
 }
