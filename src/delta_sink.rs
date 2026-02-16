@@ -10,7 +10,7 @@ use deltalake::protocol::SaveMode;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
 use serde_json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -469,20 +469,24 @@ pub async fn flush_buffer(
         }
     };
 
-    // Write to Delta using DeltaOps
+    // Write to Delta using DeltaOps with timing
+    let start_time = Instant::now();
     let result = DeltaOps(table)
         .write(vec![batch])
         .with_save_mode(SaveMode::Append)
         .await;
+    let elapsed = start_time.elapsed();
 
     match result {
         Ok(new_table) => {
             // Success: clear buffer and return new table
+            metrics::histogram!("certstream_delta_flush_duration_seconds").record(elapsed.as_secs_f64());
             buffer.clear();
             (new_table, Ok(record_count))
         }
         Err(e) => {
             // Failure: retain buffer, reopen table, return error
+            metrics::histogram!("certstream_delta_flush_duration_seconds").record(elapsed.as_secs_f64());
             warn!(
                 error = %e,
                 "Delta write failed, retaining buffer for retry"
@@ -591,6 +595,9 @@ pub async fn run_delta_sink(
                             Ok(record) => {
                                 buffer.push(record);
 
+                                // Update buffer size gauge
+                                metrics::gauge!("certstream_delta_buffer_size").set(buffer.len() as f64);
+
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
                                     let (new_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
@@ -603,6 +610,8 @@ pub async fn run_delta_sink(
                                                 buffer_size = buffer.len(),
                                                 "Batch flush completed"
                                             );
+                                            metrics::counter!("certstream_delta_records_written").increment(count as u64);
+                                            metrics::counter!("certstream_delta_flushes").increment(1);
                                         }
                                         Err(e) => {
                                             warn!(
@@ -610,6 +619,7 @@ pub async fn run_delta_sink(
                                                 buffer_size = buffer.len(),
                                                 "Batch flush failed, buffer retained for retry"
                                             );
+                                            metrics::counter!("certstream_delta_write_errors").increment(1);
                                         }
                                     }
                                 }
@@ -630,6 +640,7 @@ pub async fn run_delta_sink(
                             "Sink receiver lagged, skipping {} messages",
                             n
                         );
+                        metrics::counter!("certstream_delta_messages_lagged").increment(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Channel closed, break
@@ -651,6 +662,8 @@ pub async fn run_delta_sink(
                                 buffer_size = buffer.len(),
                                 "Timer-triggered flush completed"
                             );
+                            metrics::counter!("certstream_delta_records_written").increment(count as u64);
+                            metrics::counter!("certstream_delta_flushes").increment(1);
                         }
                         Err(e) => {
                             warn!(
@@ -658,6 +671,7 @@ pub async fn run_delta_sink(
                                 buffer_size = buffer.len(),
                                 "Timer-triggered flush failed, buffer retained for retry"
                             );
+                            metrics::counter!("certstream_delta_write_errors").increment(1);
                         }
                     }
                 }
@@ -677,12 +691,15 @@ pub async fn run_delta_sink(
                                 records_written = count,
                                 "Final shutdown flush completed successfully"
                             );
+                            metrics::counter!("certstream_delta_records_written").increment(count as u64);
+                            metrics::counter!("certstream_delta_flushes").increment(1);
                         }
                         Err(e) => {
                             warn!(
                                 error = %e,
                                 "Final shutdown flush failed"
                             );
+                            metrics::counter!("certstream_delta_write_errors").increment(1);
                         }
                     }
                 }
