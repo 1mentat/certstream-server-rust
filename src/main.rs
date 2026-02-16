@@ -2,6 +2,7 @@ mod api;
 mod cli;
 mod config;
 mod ct;
+mod delta_sink;
 mod dedup;
 mod health;
 mod hot_reload;
