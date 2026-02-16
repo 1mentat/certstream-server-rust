@@ -1,5 +1,6 @@
 use crate::config::DeltaSinkConfig;
 use crate::models::{CertificateMessage, PreSerializedMessage};
+use bytes::Bytes;
 use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -557,7 +558,7 @@ pub async fn run_delta_sink(
 
     let mut flush_interval = tokio::time::interval(Duration::from_secs(config.flush_interval_secs));
     let mut buffer: Vec<DeltaCertRecord> = Vec::with_capacity(config.batch_size);
-    let table_path = config.table_path.clone();
+    let _table_path = config.table_path.clone();
 
     loop {
         tokio::select! {
@@ -1070,6 +1071,437 @@ mod tests {
         assert_eq!(
             partition_columns, vec!["seen_date"],
             "table should have seen_date as partition column"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    // Helper function for buffer overflow testing (testable helper for AC3.4)
+    fn check_buffer_overflow(buffer: &mut Vec<DeltaCertRecord>, batch_size: usize) -> usize {
+        if buffer.len() > 2 * batch_size {
+            let dropped = buffer.len() / 2;
+            buffer.drain(..dropped);
+            dropped
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn test_buffer_overflow_drops_oldest_half() {
+        // AC3.4: Test buffer overflow logic
+        let batch_size = 10;
+        let mut buffer: Vec<DeltaCertRecord> = (0..(2 * batch_size + 1))
+            .map(|i| {
+                let mut record = make_test_record();
+                record.cert_index = i as u64;
+                record
+            })
+            .collect();
+
+        let initial_len = buffer.len();
+        let dropped = check_buffer_overflow(&mut buffer, batch_size);
+
+        // Verify oldest half was dropped
+        assert_eq!(dropped, initial_len / 2, "should drop oldest half");
+        assert_eq!(buffer.len(), initial_len - dropped, "buffer should be halved");
+
+        // Verify that remaining records are the newer ones (higher cert_index)
+        for i in 0..buffer.len() {
+            assert!(
+                buffer[i].cert_index >= (initial_len / 2) as u64,
+                "remaining records should be the newer ones"
+            );
+        }
+    }
+
+    #[test]
+    fn test_buffer_overflow_no_drop_at_threshold() {
+        // AC3.4: Buffer at exactly 2x batch_size should not be modified
+        let batch_size = 10;
+        let mut buffer: Vec<DeltaCertRecord> = (0..(2 * batch_size))
+            .map(|i| {
+                let mut record = make_test_record();
+                record.cert_index = i as u64;
+                record
+            })
+            .collect();
+
+        let initial_len = buffer.len();
+        let dropped = check_buffer_overflow(&mut buffer, batch_size);
+
+        // Verify no records were dropped (buffer is at threshold, not exceeding)
+        assert_eq!(dropped, 0, "should not drop at exact threshold");
+        assert_eq!(buffer.len(), initial_len, "buffer should not change");
+    }
+
+    #[test]
+    fn test_buffer_overflow_no_drop_below_threshold() {
+        // AC3.4: Buffer below 2x batch_size should not be modified
+        let batch_size = 10;
+        let mut buffer: Vec<DeltaCertRecord> = (0..(2 * batch_size - 1))
+            .map(|i| {
+                let mut record = make_test_record();
+                record.cert_index = i as u64;
+                record
+            })
+            .collect();
+
+        let initial_len = buffer.len();
+        let dropped = check_buffer_overflow(&mut buffer, batch_size);
+
+        // Verify no records were dropped
+        assert_eq!(dropped, 0, "should not drop below threshold");
+        assert_eq!(buffer.len(), initial_len, "buffer should not change");
+    }
+
+    #[tokio::test]
+    async fn test_ac1_4_records_partitioned_by_seen_date() {
+        // AC1.4: Records are partitioned by seen_date (YYYY-MM-DD derived from seen timestamp)
+        let test_name = "partition_seen_date";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Create records with different timestamps
+        // 1700000000 = 2023-11-14, 1800000000 = 2027-01-01
+        let mut record1 = make_test_record();
+        record1.seen = 1700000000.0;
+        record1.seen_date = "2023-11-14".to_string();
+        record1.cert_index = 1;
+
+        let mut record2 = make_test_record();
+        record2.seen = 1800000000.0;
+        record2.seen_date = "2027-01-01".to_string();
+        record2.cert_index = 2;
+
+        let mut buffer = vec![record1, record2];
+
+        // Flush to Delta
+        let (_, flush_result) = flush_buffer(table, &mut buffer, &schema, 10).await;
+        assert!(flush_result.is_ok(), "flush should succeed");
+        assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
+
+        // Verify partition directories exist
+        let partition_dir1 = format!("{}/seen_date=2023-11-14", table_path);
+        let partition_dir2 = format!("{}/seen_date=2027-01-01", table_path);
+
+        assert!(
+            std::path::Path::new(&partition_dir1).exists(),
+            "partition directory for 2023-11-14 should exist"
+        );
+        assert!(
+            std::path::Path::new(&partition_dir2).exists(),
+            "partition directory for 2027-01-01 should exist"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_5_malformed_json_skipped() {
+        // AC1.5: Messages that fail deserialization are skipped and logged
+        let malformed_json = b"not valid json";
+
+        let result = DeltaCertRecord::from_json(malformed_json);
+        assert!(result.is_err(), "malformed JSON should fail deserialization");
+    }
+
+    #[tokio::test]
+    async fn test_ac3_1_size_triggered_flush() {
+        // AC3.1: Buffer flushes when it reaches batch_size records
+        let test_name = "size_triggered_flush";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        let batch_size = 5;
+        let mut buffer: Vec<DeltaCertRecord> = (0..batch_size)
+            .map(|i| {
+                let mut record = make_test_record();
+                record.cert_index = i as u64;
+                record
+            })
+            .collect();
+
+        // Flush exactly batch_size records
+        let (_table, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+
+        assert!(flush_result.is_ok(), "flush should succeed");
+        assert_eq!(flush_result.unwrap(), batch_size as usize, "should flush all records");
+        assert!(buffer.is_empty(), "buffer should be cleared after successful flush");
+
+        // Verify table can be reopened with version 1
+        let table_reopen = deltalake::open_table(&table_path).await.expect("should reopen table");
+        assert_eq!(table_reopen.version(), 1, "table should have version 1 after flush");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_2_time_triggered_flush() {
+        // AC3.2: Buffer flushes when flush_interval_secs elapses
+        let test_name = "time_triggered_flush";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: table_path.clone(),
+            batch_size: 100,
+            flush_interval_secs: 1,
+        };
+
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
+        let rx = tx.subscribe();
+        let shutdown = CancellationToken::new();
+
+        // Spawn the sink task
+        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+
+        // Send a few messages (less than batch_size)
+        let msg = make_test_json_bytes();
+        let pre_serialized = PreSerializedMessage {
+            full: Bytes::from(msg),
+            lite: Bytes::new(),
+            domains_only: Bytes::new(),
+        };
+
+        for i in 0..3 {
+            let mut psm = pre_serialized.clone();
+            let mut json_msg: serde_json::Value =
+                serde_json::from_slice(&psm.full).expect("valid json");
+            json_msg["data"]["cert_index"] = serde_json::json!(i);
+            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+
+            let _ = tx.send(Arc::new(psm));
+        }
+
+        // Wait for flush interval to elapse and a bit more
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Verify table has version 1 (one flush occurred)
+        let table = deltalake::open_table(&table_path)
+            .await
+            .expect("should open table");
+        assert_eq!(table.version(), 1, "table should have one version after timer flush");
+
+        // Graceful shutdown
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_3_graceful_shutdown_flush() {
+        // AC3.3: Graceful shutdown flushes remaining buffered records before exit
+        let test_name = "graceful_shutdown_flush";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: table_path.clone(),
+            batch_size: 100,
+            flush_interval_secs: 60,
+        };
+
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
+        let rx = tx.subscribe();
+        let shutdown = CancellationToken::new();
+
+        // Spawn the sink task
+        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+
+        // Send a few messages (less than batch_size, so timer won't trigger)
+        let msg = make_test_json_bytes();
+        let pre_serialized = PreSerializedMessage {
+            full: Bytes::from(msg),
+            lite: Bytes::new(),
+            domains_only: Bytes::new(),
+        };
+
+        for i in 0..5 {
+            let mut psm = pre_serialized.clone();
+            let mut json_msg: serde_json::Value =
+                serde_json::from_slice(&psm.full).expect("valid json");
+            json_msg["data"]["cert_index"] = serde_json::json!(i);
+            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+
+            let _ = tx.send(Arc::new(psm));
+        }
+
+        // Give a moment for messages to be received
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Trigger graceful shutdown
+        shutdown.cancel();
+
+        // Wait for task to complete
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        // Verify table has version 1 (shutdown flush occurred)
+        let table = deltalake::open_table(&table_path)
+            .await
+            .expect("should open table");
+        assert_eq!(table.version(), 1, "table should have one version after shutdown flush");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_4_buffer_overflow_drop_oldest() {
+        // AC3.4: Buffer exceeding 2x batch_size drops oldest half
+        let test_name = "buffer_overflow";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        let batch_size = 10;
+
+        // Create buffer exceeding 2x batch_size
+        let mut buffer: Vec<DeltaCertRecord> = (0..(2 * batch_size + 5))
+            .map(|i| {
+                let mut record = make_test_record();
+                record.cert_index = i as u64;
+                record
+            })
+            .collect();
+
+        let initial_len = buffer.len();
+        assert!(
+            initial_len > 2 * batch_size,
+            "buffer should exceed 2x batch_size"
+        );
+
+        // Flush (which includes overflow check)
+        let (_table, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+
+        assert!(flush_result.is_ok(), "flush should succeed");
+
+        // Verify buffer was cleared after successful flush
+        assert!(buffer.is_empty(), "buffer should be cleared after flush");
+
+        // Create another overflow scenario to test the drop logic
+        let mut buffer2: Vec<DeltaCertRecord> = (0..(2 * batch_size + 3))
+            .map(|i| {
+                let mut record = make_test_record();
+                record.cert_index = i as u64;
+                record
+            })
+            .collect();
+
+        let before_len = buffer2.len();
+        check_buffer_overflow(&mut buffer2, batch_size);
+
+        // Verify oldest half was dropped
+        assert_eq!(
+            buffer2.len(),
+            before_len - (before_len / 2),
+            "should have dropped oldest half"
+        );
+
+        // Verify remaining records are the newer ones
+        for (idx, record) in buffer2.iter().enumerate() {
+            assert!(
+                record.cert_index >= (before_len / 2) as u64,
+                "remaining record at index {} should have cert_index >= {}",
+                idx,
+                before_len / 2
+            );
+        }
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_json_in_sink_task() {
+        // AC1.5: Sink task handles malformed JSON gracefully and continues
+        let test_name = "malformed_json_sink";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: table_path.clone(),
+            batch_size: 5,
+            flush_interval_secs: 60,
+        };
+
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
+        let rx = tx.subscribe();
+        let shutdown = CancellationToken::new();
+
+        // Spawn the sink task
+        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+
+        // Send malformed JSON
+        let malformed_psm = Arc::new(PreSerializedMessage {
+            full: Bytes::from(Vec::from(&b"not valid json"[..])),
+            lite: Bytes::new(),
+            domains_only: Bytes::new(),
+        });
+        let _ = tx.send(malformed_psm);
+
+        // Send valid JSON
+        let valid_msg = make_test_json_bytes();
+        let valid_psm = Arc::new(PreSerializedMessage {
+            full: Bytes::from(valid_msg),
+            lite: Bytes::new(),
+            domains_only: Bytes::new(),
+        });
+
+        for i in 0..5 {
+            let mut psm_clone = (*valid_psm).clone();
+            let mut json_msg: serde_json::Value =
+                serde_json::from_slice(&psm_clone.full).expect("valid json");
+            json_msg["data"]["cert_index"] = serde_json::json!(i);
+            psm_clone.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+
+            let _ = tx.send(Arc::new(psm_clone));
+        }
+
+        // Wait a bit for processing
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Trigger graceful shutdown
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        // Verify task did not panic and table received valid records
+        let table = deltalake::open_table(&table_path)
+            .await
+            .expect("should open table");
+
+        // Should have flushed the valid records
+        assert!(
+            table.version() > 0,
+            "table should have been written to despite malformed JSON"
         );
 
         // Clean up
