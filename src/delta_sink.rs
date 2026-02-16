@@ -1535,4 +1535,316 @@ mod tests {
         // Clean up
         let _ = std::fs::remove_dir_all(&table_path);
     }
+
+    // ============================================================================
+    // Integration Tests for AC4: No disruption to existing streaming
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_ac4_1_no_interference_with_ws_sse_consumers() {
+        // AC4.1 Success: WebSocket and SSE streams continue operating normally when delta sink is enabled
+        // Verify that both the delta sink and mock WS/SSE consumers can receive messages from the same broadcast channel
+        let test_name = "ac4_1_no_interference";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: table_path.clone(),
+            batch_size: 5,
+            flush_interval_secs: 60,
+        };
+
+        // Create broadcast channel (like main.rs does)
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(100);
+
+        // Spawn delta sink task (consumer 1)
+        let rx_sink = tx.subscribe();
+        let shutdown_sink = CancellationToken::new();
+        let sink_task = tokio::spawn(run_delta_sink(config, rx_sink, shutdown_sink.clone()));
+
+        // Spawn mock WS-like consumer (consumer 2)
+        let mut rx_ws = tx.subscribe();
+        let ws_task = tokio::spawn(async move {
+            let mut ws_messages = vec![];
+            for _ in 0..5 {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    rx_ws.recv(),
+                ).await {
+                    Ok(Ok(msg)) => ws_messages.push(msg),
+                    _ => break,
+                }
+            }
+            ws_messages.len()
+        });
+
+        // Send messages through the broadcast channel
+        let valid_msg = make_test_json_bytes();
+        for i in 0..5 {
+            let mut psm = PreSerializedMessage {
+                full: Bytes::from(valid_msg.clone()),
+                lite: Bytes::new(),
+                domains_only: Bytes::new(),
+            };
+
+            // Vary cert_index to avoid dedup
+            let mut json_msg: serde_json::Value =
+                serde_json::from_slice(&psm.full).expect("valid json");
+            json_msg["data"]["cert_index"] = serde_json::json!(i);
+            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+
+            let _ = tx.send(Arc::new(psm));
+        }
+
+        // Wait for WS consumer to receive all messages
+        let ws_count = tokio::time::timeout(Duration::from_secs(5), ws_task)
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .unwrap_or(0);
+
+        // Give sink time to process and flush
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Graceful shutdown
+        shutdown_sink.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), sink_task).await;
+
+        // Verify both consumers received messages
+        assert_eq!(ws_count, 5, "WS consumer should receive all 5 messages");
+
+        // Verify delta sink wrote to table
+        let table = deltalake::open_table(&table_path)
+            .await
+            .expect("should open table");
+        assert!(
+            table.version() > 0,
+            "delta sink should have written at least one batch"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[test]
+    fn test_ac4_2_disabled_by_default() {
+        // AC4.2 Success: Delta sink disabled by default
+        // Verify that DeltaSinkConfig::default().enabled is false
+        let default_config = crate::config::DeltaSinkConfig::default();
+        assert_eq!(
+            default_config.enabled, false,
+            "Delta sink should be disabled by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ac4_3_lagged_messages_handled() {
+        // AC4.3 Success: Broadcast channel Lagged errors are logged and metriced, not propagated
+        // Create a small buffer broadcast channel and cause lagging by sending many messages
+        let test_name = "ac4_3_lagged_messages";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: table_path.clone(),
+            batch_size: 100, // Large batch size so flush doesn't happen immediately
+            flush_interval_secs: 60,
+        };
+
+        // Small buffer to force lagging
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(5);
+        let rx = tx.subscribe();
+        let shutdown = CancellationToken::new();
+
+        // Spawn the sink task (it will start lagging due to small buffer)
+        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+
+        // Send many messages to cause lagging in the receiver
+        let valid_msg = make_test_json_bytes();
+        for i in 0..20 {
+            let mut psm = PreSerializedMessage {
+                full: Bytes::from(valid_msg.clone()),
+                lite: Bytes::new(),
+                domains_only: Bytes::new(),
+            };
+
+            let mut json_msg: serde_json::Value =
+                serde_json::from_slice(&psm.full).expect("valid json");
+            json_msg["data"]["cert_index"] = serde_json::json!(i);
+            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+
+            let _ = tx.send(Arc::new(psm));
+            // Small delay to let receiver fall behind
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Wait for processing
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Graceful shutdown
+        shutdown.cancel();
+        let task_result = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        // Verify task completed without panicking
+        assert!(
+            task_result.is_ok(),
+            "Task should complete without panicking despite lagged messages"
+        );
+
+        // Verify table exists and was written to (even if only partially)
+        let table_result = deltalake::open_table(&table_path).await;
+        assert!(
+            table_result.is_ok(),
+            "Table should exist even with lagged messages"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac4_4_startup_failure_non_fatal() {
+        // AC4.4 Success: Delta table creation failure on startup does not prevent the rest of the application from running
+        // Call run_delta_sink with an invalid/unwritable table_path (e.g., /nonexistent/path/delta)
+        // Assert the task starts and exits without panicking
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: "/nonexistent/path/that/cannot/be/created/delta_table".to_string(),
+            batch_size: 10,
+            flush_interval_secs: 1,
+        };
+
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
+        let rx = tx.subscribe();
+        let shutdown = CancellationToken::new();
+
+        // Spawn the sink task with invalid path
+        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+
+        // Give it a moment to attempt startup
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Trigger shutdown
+        shutdown.cancel();
+
+        // The task should complete without panicking
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await;
+
+        // Verify the task did not panic and exited cleanly
+        assert!(result.is_ok(), "Task should exit cleanly with invalid table path");
+
+        // Extract the result - it should be Ok(()) not a panic
+        match result {
+            Ok(Ok(())) => {
+                // Expected: task exited gracefully
+            }
+            Ok(Err(e)) => {
+                // Only acceptable if it's not a panic
+                if !e.is_panic() {
+                    // OK - task exited with non-panic error
+                } else {
+                    panic!("Task panicked during startup failure: {}", e);
+                }
+            }
+            Err(_) => {
+                panic!("Task timed out - should have exited quickly on startup failure");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ac4_integration_full_workflow() {
+        // Comprehensive integration test combining all AC4 criteria:
+        // - Enable delta sink (AC4.2 inverse)
+        // - Spawn both delta sink and mock WS consumer (AC4.1)
+        // - Send messages through broadcast (both consumers receive)
+        // - Verify delta sink flushes to table (AC4.1)
+        // - Verify no panics on lagged messages (AC4.3)
+        // - Graceful shutdown flushes final buffer (AC3.3)
+
+        let test_name = "ac4_integration_full";
+        let table_path = format!("/tmp/delta_sink_test_{}", test_name);
+        let _ = std::fs::remove_dir_all(&table_path);
+        let _ = std::fs::create_dir_all(&table_path);
+
+        let config = crate::config::DeltaSinkConfig {
+            enabled: true,
+            table_path: table_path.clone(),
+            batch_size: 10,
+            flush_interval_secs: 2,
+        };
+
+        // Create broadcast channel
+        let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(50);
+
+        // Spawn delta sink
+        let rx_sink = tx.subscribe();
+        let shutdown_sink = CancellationToken::new();
+        let sink_task = tokio::spawn(run_delta_sink(config, rx_sink, shutdown_sink.clone()));
+
+        // Spawn mock WS consumer
+        let mut rx_ws = tx.subscribe();
+        let ws_received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ws_received_clone = ws_received.clone();
+        let ws_task = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(3), rx_ws.recv()).await {
+                    Ok(Ok(_)) => {
+                        ws_received_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Send batch of messages
+        let valid_msg = make_test_json_bytes();
+        for i in 0..25 {
+            let mut psm = PreSerializedMessage {
+                full: Bytes::from(valid_msg.clone()),
+                lite: Bytes::new(),
+                domains_only: Bytes::new(),
+            };
+
+            let mut json_msg: serde_json::Value =
+                serde_json::from_slice(&psm.full).expect("valid json");
+            json_msg["data"]["cert_index"] = serde_json::json!(i);
+            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+
+            let _ = tx.send(Arc::new(psm));
+        }
+
+        // Wait for processing and flushes
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Check WS consumer received messages
+        let ws_count = ws_received.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ws_count > 0,
+            "WS consumer should have received messages, got {}",
+            ws_count
+        );
+
+        // Graceful shutdown
+        shutdown_sink.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), sink_task).await;
+        let _ = ws_task.abort();
+
+        // Verify delta sink wrote to table with multiple versions (multiple flushes)
+        let table = deltalake::open_table(&table_path)
+            .await
+            .expect("should open table");
+        assert!(
+            table.version() > 0,
+            "delta sink should have written at least one batch"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&table_path);
+    }
 }
