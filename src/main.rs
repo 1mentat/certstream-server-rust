@@ -127,6 +127,16 @@ async fn main() {
     dedup_filter.clone().start_cleanup_task(shutdown_token.clone());
     info!("cross-log dedup filter enabled");
 
+    if config.delta_sink.enabled {
+        let delta_rx = tx.subscribe();
+        let delta_config = config.delta_sink.clone();
+        let delta_shutdown = shutdown_token.clone();
+        tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_rx, delta_shutdown));
+        info!("delta sink enabled, writing to: {}", config.delta_sink.table_path);
+    } else {
+        info!("delta sink disabled");
+    }
+
     let ct_log_config = Arc::new(config.ct_log.clone());
     let log_tracker = Arc::new(LogTracker::new());
     let server_stats = Arc::new(ServerStats::new());
@@ -574,6 +584,12 @@ fn print_config_validation(config: &Config) {
             println!("Rate limit enabled: {}", config.rate_limit.enabled);
             println!("Auth enabled: {}", config.auth.enabled);
             println!("Hot reload enabled: {}", config.hot_reload.enabled);
+            println!("Delta sink enabled: {}", config.delta_sink.enabled);
+            if config.delta_sink.enabled {
+                println!("  Table path: {}", config.delta_sink.table_path);
+                println!("  Batch size: {}", config.delta_sink.batch_size);
+                println!("  Flush interval: {}s", config.delta_sink.flush_interval_secs);
+            }
         }
         Err(errors) => {
             eprintln!("Configuration validation failed:");
