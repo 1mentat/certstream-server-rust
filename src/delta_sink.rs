@@ -3,6 +3,9 @@ use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::kernel::{DataType as DeltaDataType, PrimitiveType, StructField};
+use deltalake::operations::create::CreateBuilder;
+use deltalake::{DeltaTable, DeltaTableError};
 use serde_json;
 use std::sync::Arc;
 
@@ -137,6 +140,77 @@ pub fn delta_schema() -> Arc<Schema> {
             false,
         ),
     ]))
+}
+
+/// Converts Arrow schema to Delta StructField for table creation.
+///
+/// # Arguments
+/// * `schema` - Arrow schema to convert
+///
+/// # Returns
+/// * Vec of Delta StructField definitions
+fn arrow_schema_to_delta_struct_fields(schema: &Schema) -> Vec<StructField> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            StructField::new(
+                field.name().to_string(),
+                arrow_dtype_to_delta_dtype(field.data_type()),
+                field.is_nullable(),
+            )
+        })
+        .collect()
+}
+
+/// Converts Arrow DataType to Delta DataType.
+///
+/// # Arguments
+/// * `dtype` - Arrow data type
+///
+/// # Returns
+/// * Equivalent Delta DataType
+fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
+    match dtype {
+        DataType::UInt64 => DeltaDataType::Primitive(PrimitiveType::Long),
+        DataType::Utf8 => DeltaDataType::Primitive(PrimitiveType::String),
+        DataType::Timestamp(_, _) => DeltaDataType::Primitive(PrimitiveType::Timestamp),
+        DataType::Int64 => DeltaDataType::Primitive(PrimitiveType::Long),
+        DataType::Boolean => DeltaDataType::Primitive(PrimitiveType::Boolean),
+        DataType::List(_) => DeltaDataType::Primitive(PrimitiveType::String), // For simplicity, store as JSON string
+        _ => DeltaDataType::Primitive(PrimitiveType::String),
+    }
+}
+
+/// Opens an existing Delta table or creates a new one if it doesn't exist.
+///
+/// # Arguments
+/// * `table_path` - Path to the Delta table directory
+/// * `schema` - Arrow schema for the table
+///
+/// # Returns
+/// * `Ok(DeltaTable)` - The opened or created table
+/// * `Err(DeltaTableError)` - If opening or creating fails
+pub async fn open_or_create_table(
+    table_path: &str,
+    schema: &Arc<Schema>,
+) -> Result<DeltaTable, DeltaTableError> {
+    // First, try to open an existing table
+    match deltalake::open_table(table_path).await {
+        Ok(table) => Ok(table),
+        Err(_) => {
+            // Table doesn't exist, create a new one
+            let struct_fields = arrow_schema_to_delta_struct_fields(schema);
+
+            let table = CreateBuilder::new()
+                .with_location(table_path)
+                .with_columns(struct_fields)
+                .with_partition_columns(vec!["seen_date"])
+                .await?;
+
+            Ok(table)
+        }
+    }
 }
 
 /// Converts a batch of `DeltaCertRecord`s into an Arrow `RecordBatch`.
