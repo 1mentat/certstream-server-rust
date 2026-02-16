@@ -5,9 +5,11 @@ use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
-use deltalake::{DeltaTable, DeltaTableError};
+use deltalake::protocol::SaveMode;
+use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
 use serde_json;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Represents a flattened certificate record for Delta table storage.
 ///
@@ -377,6 +379,130 @@ pub fn records_to_batch(
             Arc::new(chain),
         ],
     )
+}
+
+/// Writes buffered certificate records to the Delta table.
+///
+/// This function handles batching, overflow protection, and error recovery.
+/// The buffer may be retained on write failure for retry on the next flush cycle.
+///
+/// # Arguments
+/// * `table` - The DeltaTable to write to (consumed by DeltaOps, returns updated table)
+/// * `buffer` - Mutable reference to the record buffer
+/// * `schema` - Arrow schema for the table
+/// * `batch_size` - Maximum records per batch (used for overflow check)
+///
+/// # Returns
+/// * A tuple of (updated DeltaTable, Result<usize, Box<dyn Error + Send + Sync>>)
+///   - On success: (new_table, Ok(count of records written))
+///   - On failure: (reopened_table, Err(error))
+///
+/// # Behavior
+/// 1. Returns early if buffer is empty: (table, Ok(0))
+/// 2. Checks buffer overflow: if len > 2 * batch_size, drops oldest half
+/// 3. Converts buffer to RecordBatch
+/// 4. Writes to Delta with Append mode
+/// 5. On success: clears buffer and returns new table
+/// 6. On failure: retains buffer, reopens table, returns error
+pub async fn flush_buffer(
+    table: DeltaTable,
+    buffer: &mut Vec<DeltaCertRecord>,
+    schema: &Arc<Schema>,
+    batch_size: usize,
+) -> (DeltaTable, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
+    // If buffer is empty, return early
+    if buffer.is_empty() {
+        return (table, Ok(0));
+    }
+
+    // Check buffer overflow: if exceeds 2 * batch_size, drop oldest half
+    if buffer.len() > 2 * batch_size {
+        let dropped = buffer.len() / 2;
+        warn!(
+            dropped_records = dropped,
+            buffer_size = buffer.len(),
+            batch_size = batch_size,
+            "Buffer overflow: dropping oldest {} records", dropped
+        );
+        buffer.drain(..dropped);
+    }
+
+    let record_count = buffer.len();
+    let table_path = table.table_uri();
+
+    // Convert buffer to RecordBatch
+    let batch = match records_to_batch(buffer, schema) {
+        Ok(b) => b,
+        Err(e) => {
+            // Retain buffer, return error
+            return (
+                table,
+                Err(format!("Failed to convert records to batch: {}", e).into()),
+            );
+        }
+    };
+
+    // Write to Delta using DeltaOps
+    let result = DeltaOps(table)
+        .write(vec![batch])
+        .with_save_mode(SaveMode::Append)
+        .await;
+
+    match result {
+        Ok(new_table) => {
+            // Success: clear buffer and return new table
+            buffer.clear();
+            (new_table, Ok(record_count))
+        }
+        Err(e) => {
+            // Failure: retain buffer, reopen table, return error
+            warn!(
+                error = %e,
+                "Delta write failed, retaining buffer for retry"
+            );
+
+            // Reopen table to get a fresh handle per specification
+            match deltalake::open_table(&table_path).await {
+                Ok(reopened_table) => {
+                    (
+                        reopened_table,
+                        Err(format!("Failed to write records to Delta: {}", e).into()),
+                    )
+                }
+                Err(reopen_err) => {
+                    // If reopen also fails, we have a critical situation
+                    // The table may be corrupted or inaccessible
+                    // We'll still try to continue by using open_or_create
+                    warn!(
+                        error = %reopen_err,
+                        "Failed to reopen table after write failure"
+                    );
+
+                    // Try open_or_create as a recovery measure
+                    match open_or_create_table(&table_path, schema).await {
+                        Ok(recovery_table) => {
+                            (
+                                recovery_table,
+                                Err(format!("Failed to write records to Delta: {} (reopen also failed)", e).into()),
+                            )
+                        }
+                        Err(recovery_err) => {
+                            // Last resort failed - we can't recover
+                            warn!(
+                                write_error = %e,
+                                reopen_error = %reopen_err,
+                                recovery_error = %recovery_err,
+                                "All table recovery attempts failed"
+                            );
+                            // This is critical - table is inaccessible
+                            // Panic to avoid silent data loss
+                            panic!("Unable to recover Delta table after write and reopen failures");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
