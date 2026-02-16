@@ -438,26 +438,28 @@ fn check_buffer_overflow(buffer: &mut Vec<DeltaCertRecord>, batch_size: usize) -
 /// * `batch_size` - Maximum records per batch (used for overflow check)
 ///
 /// # Returns
-/// * A tuple of (updated DeltaTable, Result<usize, Box<dyn Error + Send + Sync>>)
-///   - On success: (new_table, Ok(count of records written))
-///   - On failure: (reopened_table, Err(error))
+/// * A tuple of (Option<DeltaTable>, Result<usize, Box<dyn Error + Send + Sync>>)
+///   - On success: (Some(new_table), Ok(count of records written))
+///   - On failure with recovery: (Some(reopened_table), Err(error))
+///   - On failure with exhausted recovery: (None, Err(error)) — table is inaccessible
 ///
 /// # Behavior
-/// 1. Returns early if buffer is empty: (table, Ok(0))
+/// 1. Returns early if buffer is empty: (Some(table), Ok(0))
 /// 2. Checks buffer overflow: if len > 2 * batch_size, drops oldest half
 /// 3. Converts buffer to RecordBatch
 /// 4. Writes to Delta with Append mode
 /// 5. On success: clears buffer and returns new table
-/// 6. On failure: retains buffer, reopens table, returns error
+/// 6. On failure: retains buffer, attempts recovery (reopen, open_or_create), returns error
+/// 7. If ALL recovery attempts fail: returns None instead of panicking (AC4.4)
 pub async fn flush_buffer(
     table: DeltaTable,
     buffer: &mut Vec<DeltaCertRecord>,
     schema: &Arc<Schema>,
     batch_size: usize,
-) -> (DeltaTable, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
+) -> (Option<DeltaTable>, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
     // If buffer is empty, return early
     if buffer.is_empty() {
-        return (table, Ok(0));
+        return (Some(table), Ok(0));
     }
 
     // Check buffer overflow: if exceeds 2 * batch_size, drop oldest half
@@ -472,7 +474,7 @@ pub async fn flush_buffer(
         Err(e) => {
             // Retain buffer, return error
             return (
-                table,
+                Some(table),
                 Err(format!("Failed to convert records to batch: {}", e).into()),
             );
         }
@@ -491,7 +493,7 @@ pub async fn flush_buffer(
             // Success: clear buffer and return new table
             metrics::histogram!("certstream_delta_flush_duration_seconds").record(elapsed.as_secs_f64());
             buffer.clear();
-            (new_table, Ok(record_count))
+            (Some(new_table), Ok(record_count))
         }
         Err(e) => {
             // Failure: retain buffer, reopen table, return error
@@ -505,7 +507,7 @@ pub async fn flush_buffer(
             match deltalake::open_table(&table_path).await {
                 Ok(reopened_table) => {
                     (
-                        reopened_table,
+                        Some(reopened_table),
                         Err(format!("Failed to write records to Delta: {}", e).into()),
                     )
                 }
@@ -522,7 +524,7 @@ pub async fn flush_buffer(
                     match open_or_create_table(&table_path, schema).await {
                         Ok(recovery_table) => {
                             (
-                                recovery_table,
+                                Some(recovery_table),
                                 Err(format!("Failed to write records to Delta: {} (reopen also failed)", e).into()),
                             )
                         }
@@ -541,7 +543,7 @@ pub async fn flush_buffer(
                             match fallback_table {
                                 Ok(recovered_table) => {
                                     (
-                                        recovered_table,
+                                        Some(recovered_table),
                                         Err(format!("Failed to write records to Delta: {} (recovery succeeded)", e).into()),
                                     )
                                 }
@@ -550,14 +552,13 @@ pub async fn flush_buffer(
                                     error!(
                                         error = %final_recovery_err,
                                         table_path = %table_path,
-                                        "Final recovery attempt failed - table will be unavailable for this flush cycle"
+                                        "Final recovery attempt failed - table will be unavailable for this flush cycle, returning None"
                                     );
+                                    // Per AC4.4: Table failures must be non-fatal to real-time streaming.
                                     // We cannot recover a table handle through normal means.
-                                    // As a last resort, attempt one more time with a fresh call.
-                                    // This accommodates transient errors that might resolve on retry.
-                                    let last_attempt = open_or_create_table(&table_path, schema).await;
+                                    // Return None instead of panicking - caller will handle gracefully.
                                     (
-                                        last_attempt.expect("Unable to recover Delta table after all recovery attempts"),
+                                        None,
                                         Err(format!("Failed to write records to Delta: {} (all recovery attempts failed)", e).into()),
                                     )
                                 }
@@ -664,9 +665,21 @@ pub async fn run_delta_sink(
 
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
-                                    let (new_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
-                                    table = new_table;
-                                    record_flush_metrics(&flush_result, "Batch flush");
+                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                                    match new_table_opt {
+                                        Some(new_table) => {
+                                            table = new_table;
+                                            record_flush_metrics(&flush_result, "Batch flush");
+                                        }
+                                        None => {
+                                            // Table is inaccessible - log and break out of main loop
+                                            error!(
+                                                error = %flush_result.as_ref().err().unwrap(),
+                                                "Table became inaccessible after failed flush, exiting delta-sink"
+                                            );
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -697,9 +710,21 @@ pub async fn run_delta_sink(
             _ = flush_interval.tick() => {
                 // Time-triggered flush (AC3.2)
                 if !buffer.is_empty() {
-                    let (new_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
-                    table = new_table;
-                    record_flush_metrics(&flush_result, "Timer-triggered flush");
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                    match new_table_opt {
+                        Some(new_table) => {
+                            table = new_table;
+                            record_flush_metrics(&flush_result, "Timer-triggered flush");
+                        }
+                        None => {
+                            // Table is inaccessible - log and break out of main loop
+                            error!(
+                                error = %flush_result.as_ref().err().unwrap(),
+                                "Table became inaccessible during timer flush, exiting delta-sink"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             _ = shutdown.cancelled() => {
@@ -709,8 +734,14 @@ pub async fn run_delta_sink(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (_final_table, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
                     record_flush_metrics(&flush_result, "Shutdown flush");
+                    if table_opt.is_none() {
+                        warn!(
+                            error = %flush_result.as_ref().err().unwrap(),
+                            "Table became inaccessible during shutdown flush, exiting with error"
+                        );
+                    }
                 }
                 break;
             }
@@ -1221,7 +1252,8 @@ mod tests {
         let mut buffer = vec![record1, record2];
 
         // Flush to Delta
-        let (_, flush_result) = flush_buffer(table, &mut buffer, &schema, 10).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10).await;
+        assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
 
@@ -1274,8 +1306,9 @@ mod tests {
             .collect();
 
         // Flush exactly batch_size records
-        let (_table, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
 
+        assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), batch_size as usize, "should flush all records");
         assert!(buffer.is_empty(), "buffer should be cleared after successful flush");
@@ -1435,8 +1468,9 @@ mod tests {
         );
 
         // Flush (which includes overflow check)
-        let (_table, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
 
+        assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
 
         // Verify buffer was cleared after successful flush
