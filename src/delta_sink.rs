@@ -3,7 +3,7 @@ use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use deltalake::arrow::record_batch::RecordBatch;
-use deltalake::kernel::{DataType as DeltaDataType, PrimitiveType, StructField};
+use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
 use deltalake::{DeltaTable, DeltaTableError};
 use serde_json;
@@ -177,7 +177,14 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
         DataType::Timestamp(_, _) => DeltaDataType::Primitive(PrimitiveType::Timestamp),
         DataType::Int64 => DeltaDataType::Primitive(PrimitiveType::Long),
         DataType::Boolean => DeltaDataType::Primitive(PrimitiveType::Boolean),
-        DataType::List(_) => DeltaDataType::Primitive(PrimitiveType::String), // For simplicity, store as JSON string
+        DataType::List(inner_field) => {
+            // Convert List(T) to Array(T) in Delta schema
+            let element_type = arrow_dtype_to_delta_dtype(inner_field.data_type());
+            DeltaDataType::Array(Box::new(ArrayType::new(
+                element_type,
+                inner_field.is_nullable(),
+            )))
+        }
         _ => DeltaDataType::Primitive(PrimitiveType::String),
     }
 }
@@ -198,7 +205,7 @@ pub async fn open_or_create_table(
     // First, try to open an existing table
     match deltalake::open_table(table_path).await {
         Ok(table) => Ok(table),
-        Err(_) => {
+        Err(DeltaTableError::NotATable(_)) => {
             // Table doesn't exist, create a new one
             let struct_fields = arrow_schema_to_delta_struct_fields(schema);
 
@@ -210,6 +217,7 @@ pub async fn open_or_create_table(
 
             Ok(table)
         }
+        Err(e) => Err(e),
     }
 }
 
