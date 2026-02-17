@@ -399,6 +399,15 @@ async fn run_writer(
 ) -> WriterResult {
     let schema = delta_schema();
 
+    // Ensure the table directory exists
+    if let Err(e) = std::fs::create_dir_all(&table_path) {
+        warn!(error = %e, table_path = %table_path, "Failed to create table directory");
+        return WriterResult {
+            total_records_written: 0,
+            write_errors: 1,
+        };
+    }
+
     // Open or create the delta table
     let mut table = match open_or_create_table(&table_path, &schema).await {
         Ok(t) => {
@@ -744,10 +753,10 @@ async fn run_fetcher(
         let total_entries = work_item.end - work_item.start + 1;
         let num_batches = (total_entries + batch_size - 1) / batch_size;
 
-        for (batch_idx, batch_start) in (work_item.start..=work_item.end)
-            .step_by(batch_size as usize)
-            .enumerate()
-        {
+        let mut batch_start = work_item.start;
+        let mut batch_idx: usize = 0;
+
+        while batch_start <= work_item.end {
             // Check for shutdown
             if shutdown.is_cancelled() {
                 info!(
@@ -769,6 +778,11 @@ async fn run_fetcher(
             let mut backoff_ms = 1000u64;
             const MAX_BACKOFF_MS: u64 = 60000;
 
+            // Track the highest cert_index seen in this batch for advancing.
+            // RFC 6962 servers may return fewer entries than requested; we advance
+            // to max_cert_index+1 to avoid creating gaps in the delta table.
+            let mut max_cert_index_seen: Option<u64> = None;
+
             loop {
                 let fetch_result = match log_type {
                     LogType::Rfc6962 => {
@@ -786,7 +800,11 @@ async fn run_fetcher(
 
                 match fetch_result {
                     Ok(messages) => {
-                        // Convert and send records
+                        // Convert and send records, tracking highest cert_index
+                        for msg in &messages {
+                            let idx = msg.data.cert_index;
+                            max_cert_index_seen = Some(max_cert_index_seen.map_or(idx, |prev: u64| prev.max(idx)));
+                        }
                         for msg in messages {
                             let record = DeltaCertRecord::from_message(&msg);
                             if tx.send(record).await.is_err() {
@@ -875,22 +893,39 @@ async fn run_fetcher(
                 }
             }
 
-            // Progress logging: log every 10 batches or at 10% milestones
-            let current_batch_num = batch_idx + 1;
-            let percentage = (current_batch_num as f64 / num_batches as f64 * 100.0) as u32;
-            let last_logged_percentage = if batch_idx == 0 { 0 } else { ((batch_idx as f64 / num_batches as f64 * 100.0) as u32 / 10) * 10 };
-            let current_milestone_percentage = (percentage / 10) * 10;
+            // Advance batch_start based on actual entries received.
+            // For RFC 6962: server may return fewer entries than requested; advance to
+            // max_cert_index+1 to cover the actual range without creating gaps.
+            // For Static CT: tile entries have fixed cert_index = tile_index*256 + i.
+            // If no entries were returned (errors or empty), advance by batch_size to avoid infinite loop.
+            let prev_batch_start = batch_start;
+            batch_start = match max_cert_index_seen {
+                Some(max_idx) => max_idx + 1,
+                None => batch_start + batch_size, // Fallback: advance by batch_size on empty/error
+            };
+            batch_idx += 1;
 
-            // Log if: every 10 batches OR when crossing a 10% milestone
-            if current_batch_num % 10 == 0 || (current_milestone_percentage > last_logged_percentage && current_milestone_percentage > 0) {
-                info!(
-                    source_url = %source_url,
-                    fetched = total_records,
-                    batch_idx = current_batch_num,
-                    total_batches = num_batches,
-                    progress_percent = percentage,
-                    "fetcher progress"
-                );
+            // Progress logging: log every 10 batches or at 10% milestones
+            // Skip progress for single-batch work items (the "fetcher complete" log is sufficient)
+            if num_batches > 1 {
+                let current_batch_num = batch_idx;
+                let progress = (batch_start.saturating_sub(work_item.start)) as f64 / total_entries as f64;
+                let percentage = (progress * 100.0).min(100.0) as u32;
+                let prev_progress = (prev_batch_start.saturating_sub(work_item.start)) as f64 / total_entries as f64;
+                let prev_milestone = ((prev_progress * 100.0).min(100.0) as u32 / 10) * 10;
+                let current_milestone_percentage = (percentage / 10) * 10;
+
+                // Log if: every 10 batches OR when crossing a 10% milestone
+                if current_batch_num % 10 == 0 || (current_milestone_percentage > prev_milestone && current_milestone_percentage > 0) {
+                    info!(
+                        source_url = %source_url,
+                        fetched = total_records,
+                        batch_idx = current_batch_num,
+                        total_batches = num_batches,
+                        progress_percent = percentage,
+                        "fetcher progress"
+                    );
+                }
             }
         }
     }
