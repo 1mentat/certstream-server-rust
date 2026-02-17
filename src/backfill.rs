@@ -544,8 +544,11 @@ async fn run_fetcher(
             let batch_end = (batch_start + batch_size - 1).min(work_item.end);
 
             // Fetch entries with retry logic
-            let mut retry_count = 0;
-            let max_retries = 3;
+            // Separate retry counters for rate-limited vs other errors
+            let mut rate_limit_retry_count = 0;
+            let mut other_retry_count = 0;
+            let max_rate_limit_retries = 10; // Rate limited errors: persistent retry with exponential backoff
+            let max_other_retries = 3; // HTTP errors and invalid responses: finite retry
             let mut backoff_ms = 1000u64;
             const MAX_BACKOFF_MS: u64 = 60000;
 
@@ -558,7 +561,9 @@ async fn run_fetcher(
                         // For StaticCt, calculate tile index and offset
                         let tile_index = batch_start / 256;
                         let offset_in_tile = (batch_start % 256) as usize;
-                        fetch::fetch_tile_entries(&client, &source_url, tile_index, 1, offset_in_tile, &source, request_timeout, &issuer_cache).await
+                        // Use partial_width=0 for full tiles (server returns all 256 entries)
+                        // In backfill mode, we control the tile index and let the server return all entries
+                        fetch::fetch_tile_entries(&client, &source_url, tile_index, 0, offset_in_tile, &source, request_timeout, &issuer_cache).await
                     }
                 };
 
@@ -575,7 +580,7 @@ async fn run_fetcher(
                         break;
                     }
                     Err(fetch::FetchError::RateLimited(_)) => {
-                        if retry_count >= max_retries {
+                        if rate_limit_retry_count >= max_rate_limit_retries {
                             warn!(
                                 source_url = %source_url,
                                 batch_start = batch_start,
@@ -584,7 +589,7 @@ async fn run_fetcher(
                             );
                             break;
                         }
-                        retry_count += 1;
+                        rate_limit_retry_count += 1;
                         warn!(
                             source_url = %source_url,
                             batch_start = batch_start,
@@ -605,7 +610,7 @@ async fn run_fetcher(
                         break;
                     }
                     Err(fetch::FetchError::HttpError(e)) => {
-                        if retry_count >= max_retries {
+                        if other_retry_count >= max_other_retries {
                             warn!(
                                 source_url = %source_url,
                                 batch_start = batch_start,
@@ -615,7 +620,7 @@ async fn run_fetcher(
                             );
                             break;
                         }
-                        retry_count += 1;
+                        other_retry_count += 1;
                         warn!(
                             source_url = %source_url,
                             batch_start = batch_start,
@@ -628,7 +633,7 @@ async fn run_fetcher(
                         backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     }
                     Err(fetch::FetchError::InvalidResponse(e)) => {
-                        if retry_count >= max_retries {
+                        if other_retry_count >= max_other_retries {
                             warn!(
                                 source_url = %source_url,
                                 batch_start = batch_start,
@@ -638,7 +643,7 @@ async fn run_fetcher(
                             );
                             break;
                         }
-                        retry_count += 1;
+                        other_retry_count += 1;
                         warn!(
                             source_url = %source_url,
                             batch_start = batch_start,
@@ -653,16 +658,23 @@ async fn run_fetcher(
                 }
             }
 
-            // Progress logging
-            let percentage = ((batch_idx + 1) as f64 / num_batches as f64 * 100.0) as u32;
-            info!(
-                source_url = %source_url,
-                fetched = total_records,
-                batch_idx = batch_idx + 1,
-                total_batches = num_batches,
-                progress_percent = percentage,
-                "fetcher progress"
-            );
+            // Progress logging: log every 10 batches or at 10% milestones
+            let current_batch_num = batch_idx + 1;
+            let percentage = (current_batch_num as f64 / num_batches as f64 * 100.0) as u32;
+            let last_logged_percentage = if batch_idx == 0 { 0 } else { ((batch_idx as f64 / num_batches as f64 * 100.0) as u32 / 10) * 10 };
+            let current_milestone_percentage = (percentage / 10) * 10;
+
+            // Log if: every 10 batches OR when crossing a 10% milestone
+            if current_batch_num % 10 == 0 || (current_milestone_percentage > last_logged_percentage && current_milestone_percentage > 0) {
+                info!(
+                    source_url = %source_url,
+                    fetched = total_records,
+                    batch_idx = current_batch_num,
+                    total_batches = num_batches,
+                    progress_percent = percentage,
+                    "fetcher progress"
+                );
+            }
         }
     }
 
