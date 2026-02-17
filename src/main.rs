@@ -127,15 +127,17 @@ async fn main() {
     dedup_filter.clone().start_cleanup_task(shutdown_token.clone());
     info!("cross-log dedup filter enabled");
 
-    if config.delta_sink.enabled {
+    let delta_sink_handle = if config.delta_sink.enabled {
         let delta_rx = tx.subscribe();
         let delta_config = config.delta_sink.clone();
         let delta_shutdown = shutdown_token.clone();
-        tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_rx, delta_shutdown));
+        let handle = tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_rx, delta_shutdown));
         info!("delta sink enabled, writing to: {}", config.delta_sink.table_path);
+        Some(handle)
     } else {
         info!("delta sink disabled");
-    }
+        None
+    };
 
     let ct_log_config = Arc::new(config.ct_log.clone());
     let log_tracker = Arc::new(LogTracker::new());
@@ -215,6 +217,15 @@ async fn main() {
         run_tls_server(addr, app, &tls_cert, &tls_key, shutdown_token.clone()).await;
     } else {
         run_plain_server(addr, app, shutdown_token.clone()).await;
+    }
+
+    // Wait for delta sink to complete its shutdown flush before dropping the runtime
+    if let Some(handle) = delta_sink_handle {
+        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+            Ok(Ok(())) => info!("delta sink shutdown complete"),
+            Ok(Err(e)) => warn!(error = %e, "delta sink task panicked during shutdown"),
+            Err(_) => warn!("delta sink shutdown timed out after 30s"),
+        }
     }
 
     info!("flushing state before exit...");
