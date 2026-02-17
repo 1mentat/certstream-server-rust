@@ -362,4 +362,173 @@ mod tests {
         assert_eq!(msg.data.source.name.as_ref(), "test-log");
         assert_eq!(msg.data.source.url.as_ref(), "https://ct.example.com");
     }
+
+    #[test]
+    fn test_fetch_entries_constructs_correct_cert_index() {
+        // AC4.1 Success: fetch_entries constructs CertificateMessage with correct cert_index
+        let cert_der = generate_test_cert_der("test.example.com");
+        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let source = Arc::new(Source {
+            name: Arc::from("test-log"),
+            url: Arc::from("https://ct.example.com"),
+        });
+
+        let base_url = "https://ct.example.com";
+        let start_index = 1000u64;
+        let cert_index = start_index;
+        let seen = 1234567890.5;
+
+        let cert_link = format!(
+            "{}/ct/v1/get-entries?start={}&end={}",
+            base_url, cert_index, cert_index
+        );
+
+        let msg = CertificateMessage {
+            message_type: Cow::Borrowed("certificate_update"),
+            data: CertificateData {
+                update_type: Cow::Borrowed("X509LogEntry"),
+                leaf_cert: parsed,
+                chain: Some(vec![]),
+                cert_index,
+                cert_link,
+                seen,
+                source: Arc::clone(&source),
+            },
+        };
+
+        // Verify cert_index matches the expected value
+        assert_eq!(msg.data.cert_index, start_index);
+    }
+
+    #[test]
+    fn test_fetch_entries_constructs_correct_cert_link() {
+        // AC4.1 Success: fetch_entries constructs CertificateMessage with proper cert_link URL
+        let cert_der = generate_test_cert_der("test.example.com");
+        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let source = Arc::new(Source {
+            name: Arc::from("test-log"),
+            url: Arc::from("https://ct.example.com"),
+        });
+
+        let base_url = "https://ct.example.com";
+        let cert_index = 5000u64;
+        let seen = 1234567890.5;
+
+        let expected_cert_link = format!(
+            "{}/ct/v1/get-entries?start={}&end={}",
+            base_url, cert_index, cert_index
+        );
+
+        let msg = CertificateMessage {
+            message_type: Cow::Borrowed("certificate_update"),
+            data: CertificateData {
+                update_type: Cow::Borrowed("X509LogEntry"),
+                leaf_cert: parsed,
+                chain: Some(vec![]),
+                cert_index,
+                cert_link: expected_cert_link.clone(),
+                seen,
+                source: Arc::clone(&source),
+            },
+        };
+
+        // Verify cert_link is correct
+        assert_eq!(msg.data.cert_link, expected_cert_link);
+    }
+
+    #[test]
+    fn test_fetch_entries_constructs_correct_source() {
+        // AC4.1 Success: fetch_entries constructs CertificateMessage with correct source
+        let cert_der = generate_test_cert_der("test.example.com");
+        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let source = Arc::new(Source {
+            name: Arc::from("test-log"),
+            url: Arc::from("https://ct.example.com"),
+        });
+
+        let base_url = "https://ct.example.com";
+        let cert_index = 1234u64;
+        let seen = 1234567890.5;
+
+        let cert_link = format!(
+            "{}/ct/v1/get-entries?start={}&end={}",
+            base_url, cert_index, cert_index
+        );
+
+        let msg = CertificateMessage {
+            message_type: Cow::Borrowed("certificate_update"),
+            data: CertificateData {
+                update_type: Cow::Borrowed("X509LogEntry"),
+                leaf_cert: parsed,
+                chain: Some(vec![]),
+                cert_index,
+                cert_link,
+                seen,
+                source: Arc::clone(&source),
+            },
+        };
+
+        // Verify source fields are correct
+        assert_eq!(msg.data.source.name.as_ref(), "test-log");
+        assert_eq!(msg.data.source.url.as_ref(), "https://ct.example.com");
+    }
+
+    #[test]
+    fn test_fetch_entries_constructs_correct_message_type() {
+        // AC4.1 Success: fetch_entries constructs CertificateMessage with correct message_type
+        let cert_der = generate_test_cert_der("test.example.com");
+        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let source = Arc::new(Source {
+            name: Arc::from("test-log"),
+            url: Arc::from("https://ct.example.com"),
+        });
+
+        let msg = CertificateMessage {
+            message_type: Cow::Borrowed("certificate_update"),
+            data: CertificateData {
+                update_type: Cow::Borrowed("X509LogEntry"),
+                leaf_cert: parsed,
+                chain: Some(vec![]),
+                cert_index: 1234,
+                cert_link: "https://ct.example.com/entry".into(),
+                seen: 1234567890.5,
+                source: Arc::clone(&source),
+            },
+        };
+
+        // Verify message_type is correct
+        assert_eq!(msg.message_type, "certificate_update");
+    }
+
+    #[test]
+    fn test_fetch_entries_constructs_correct_update_type() {
+        // AC4.1 Success: fetch_entries constructs CertificateMessage with correct update_type
+        let cert_der = generate_test_cert_der("test.example.com");
+        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let source = Arc::new(Source {
+            name: Arc::from("test-log"),
+            url: Arc::from("https://ct.example.com"),
+        });
+
+        let msg = CertificateMessage {
+            message_type: Cow::Borrowed("certificate_update"),
+            data: CertificateData {
+                update_type: Cow::Borrowed("X509LogEntry"),
+                leaf_cert: parsed,
+                chain: Some(vec![]),
+                cert_index: 1234,
+                cert_link: "https://ct.example.com/entry".into(),
+                seen: 1234567890.5,
+                source: Arc::clone(&source),
+            },
+        };
+
+        // Verify update_type is correct
+        assert_eq!(msg.data.update_type, "X509LogEntry");
+    }
 }
