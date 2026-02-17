@@ -53,7 +53,21 @@ impl DeltaCertRecord {
     /// * `Err(serde_json::Error)` if deserialization fails
     pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         let msg: CertificateMessage = serde_json::from_slice(bytes)?;
+        Ok(Self::from_message(&msg))
+    }
 
+    /// Convert directly from a `CertificateMessage` reference to a `DeltaCertRecord`.
+    ///
+    /// This method provides the same field mapping as `from_json()` but operates on the
+    /// in-memory struct directly, avoiding JSON serialization/deserialization round-trips.
+    /// Produces byte-identical records to `from_json()` when given the same message data.
+    ///
+    /// # Arguments
+    /// * `msg` - Reference to a CertificateMessage
+    ///
+    /// # Returns
+    /// * `DeltaCertRecord` with all fields populated
+    pub fn from_message(msg: &CertificateMessage) -> Self {
         // Convert seen (f64 seconds since epoch) to a date string (YYYY-MM-DD)
         let seen_date = {
             let seconds = msg.data.seen as i64;
@@ -69,10 +83,14 @@ impl DeltaCertRecord {
         let chain = msg
             .data
             .chain
-            .unwrap_or_default()
-            .into_iter()
-            .map(|cert| serde_json::to_string(&cert).unwrap_or_default())
-            .collect();
+            .as_ref()
+            .map(|chains| {
+                chains
+                    .iter()
+                    .map(|cert| serde_json::to_string(cert).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Extract all_domains as Vec<String>
         let all_domains: Vec<String> = msg
@@ -83,28 +101,28 @@ impl DeltaCertRecord {
             .cloned()
             .collect();
 
-        Ok(DeltaCertRecord {
+        DeltaCertRecord {
             cert_index: msg.data.cert_index,
             update_type: msg.data.update_type.to_string(),
             seen: msg.data.seen,
             seen_date,
             source_name: msg.data.source.name.to_string(),
             source_url: msg.data.source.url.to_string(),
-            cert_link: msg.data.cert_link,
-            serial_number: msg.data.leaf_cert.serial_number,
-            fingerprint: msg.data.leaf_cert.fingerprint,
-            sha256: msg.data.leaf_cert.sha256,
-            sha1: msg.data.leaf_cert.sha1,
+            cert_link: msg.data.cert_link.clone(),
+            serial_number: msg.data.leaf_cert.serial_number.clone(),
+            fingerprint: msg.data.leaf_cert.fingerprint.clone(),
+            sha256: msg.data.leaf_cert.sha256.clone(),
+            sha1: msg.data.leaf_cert.sha1.clone(),
             not_before: msg.data.leaf_cert.not_before,
             not_after: msg.data.leaf_cert.not_after,
             is_ca: msg.data.leaf_cert.is_ca,
-            signature_algorithm: msg.data.leaf_cert.signature_algorithm,
-            subject_aggregated: msg.data.leaf_cert.subject.aggregated.unwrap_or_default(),
-            issuer_aggregated: msg.data.leaf_cert.issuer.aggregated.unwrap_or_default(),
+            signature_algorithm: msg.data.leaf_cert.signature_algorithm.clone(),
+            subject_aggregated: msg.data.leaf_cert.subject.aggregated.clone().unwrap_or_default(),
+            issuer_aggregated: msg.data.leaf_cert.issuer.aggregated.clone().unwrap_or_default(),
             all_domains,
-            as_der: msg.data.leaf_cert.as_der.unwrap_or_default(),
+            as_der: msg.data.leaf_cert.as_der.clone().unwrap_or_default(),
             chain,
-        })
+        }
     }
 }
 
@@ -835,6 +853,43 @@ mod tests {
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
         assert_eq!(record.all_domains.len(), 0);
+    }
+
+    #[test]
+    fn test_from_message_matches_from_json() {
+        // AC4.1 Success: from_message() produces byte-identical DeltaCertRecord to from_json()
+        let json_bytes = make_test_json_bytes();
+
+        // Deserialize to CertificateMessage
+        let msg: CertificateMessage = serde_json::from_slice(&json_bytes).expect("valid json");
+
+        // Create record via from_json
+        let record_from_json = DeltaCertRecord::from_json(&json_bytes).expect("from_json failed");
+
+        // Create record via from_message
+        let record_from_message = DeltaCertRecord::from_message(&msg);
+
+        // Verify all fields match
+        assert_eq!(record_from_json.cert_index, record_from_message.cert_index);
+        assert_eq!(record_from_json.update_type, record_from_message.update_type);
+        assert_eq!(record_from_json.seen, record_from_message.seen);
+        assert_eq!(record_from_json.seen_date, record_from_message.seen_date);
+        assert_eq!(record_from_json.source_name, record_from_message.source_name);
+        assert_eq!(record_from_json.source_url, record_from_message.source_url);
+        assert_eq!(record_from_json.cert_link, record_from_message.cert_link);
+        assert_eq!(record_from_json.serial_number, record_from_message.serial_number);
+        assert_eq!(record_from_json.fingerprint, record_from_message.fingerprint);
+        assert_eq!(record_from_json.sha256, record_from_message.sha256);
+        assert_eq!(record_from_json.sha1, record_from_message.sha1);
+        assert_eq!(record_from_json.not_before, record_from_message.not_before);
+        assert_eq!(record_from_json.not_after, record_from_message.not_after);
+        assert_eq!(record_from_json.is_ca, record_from_message.is_ca);
+        assert_eq!(record_from_json.signature_algorithm, record_from_message.signature_algorithm);
+        assert_eq!(record_from_json.subject_aggregated, record_from_message.subject_aggregated);
+        assert_eq!(record_from_json.issuer_aggregated, record_from_message.issuer_aggregated);
+        assert_eq!(record_from_json.all_domains, record_from_message.all_domains);
+        assert_eq!(record_from_json.as_der, record_from_message.as_der);
+        assert_eq!(record_from_json.chain, record_from_message.chain);
     }
 
     #[test]

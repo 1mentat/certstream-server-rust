@@ -1,5 +1,6 @@
 mod log_list;
 mod parser;
+pub mod fetch;
 pub mod static_ct;
 pub mod watcher;
 
