@@ -8,6 +8,7 @@ use tracing::debug;
 use crate::models::{CertificateData, CertificateMessage, ChainCert, Source};
 
 use super::parse_leaf_input;
+use crate::ct::parser::ParsedEntry;
 
 /// Errors that can occur when fetching CT log entries.
 #[derive(Debug, Error)]
@@ -44,6 +45,88 @@ pub(crate) struct RawEntry {
     pub extra_data: String,
 }
 
+/// Build a CertificateMessage from a parsed entry (pure function for testability).
+///
+/// # Arguments
+/// * `parsed` - The parsed entry containing leaf cert, chain, and update type
+/// * `cert_index` - The certificate index in the log
+/// * `source` - Source metadata
+/// * `base_url` - Base URL of the CT log
+/// * `seen` - Timestamp when the entry was seen
+///
+/// # Returns
+/// A `CertificateMessage` with all fields populated.
+fn build_rfc6962_certificate_message(
+    parsed: ParsedEntry,
+    cert_index: u64,
+    source: &Arc<Source>,
+    base_url: &str,
+    seen: f64,
+) -> CertificateMessage {
+    let cert_link = format!(
+        "{}/ct/v1/get-entries?start={}&end={}",
+        base_url, cert_index, cert_index
+    );
+
+    CertificateMessage {
+        message_type: Cow::Borrowed("certificate_update"),
+        data: CertificateData {
+            update_type: parsed.update_type,
+            leaf_cert: parsed.leaf_cert,
+            chain: if parsed.chain.is_empty() { None } else { Some(parsed.chain) },
+            cert_index,
+            cert_link,
+            seen,
+            source: Arc::clone(source),
+        },
+    }
+}
+
+/// Build a CertificateMessage from a static CT tile leaf (pure function for testability).
+///
+/// # Arguments
+/// * `parsed` - The parsed certificate
+/// * `is_precert` - Whether this is a precert
+/// * `chain` - The chain of issuer certificates
+/// * `tile_index` - The tile index
+/// * `index_in_tile` - The index within the tile
+/// * `source` - Source metadata
+/// * `base_url` - Base URL of the CT log
+/// * `seen` - Timestamp when the entry was seen
+///
+/// # Returns
+/// A `CertificateMessage` with all fields populated.
+fn build_static_ct_certificate_message(
+    parsed: crate::ct::parser::ParsedEntry,
+    is_precert: bool,
+    chain: Vec<ChainCert>,
+    tile_index: u64,
+    index_in_tile: usize,
+    source: &Arc<Source>,
+    base_url: &str,
+    seen: f64,
+) -> CertificateMessage {
+    let path = super::static_ct::encode_tile_path(tile_index);
+    let cert_link = format!("{}/tile/data/{}", base_url.trim_end_matches('/'), path);
+
+    CertificateMessage {
+        message_type: Cow::Borrowed("certificate_update"),
+        data: CertificateData {
+            update_type: if is_precert {
+                Cow::Borrowed("PrecertLogEntry")
+            } else {
+                Cow::Borrowed("X509LogEntry")
+            },
+            leaf_cert: parsed.leaf_cert,
+            chain: if chain.is_empty() { None } else { Some(chain) },
+            cert_index: tile_index * 256 + index_in_tile as u64,
+            cert_link,
+            seen,
+            source: Arc::clone(source),
+        },
+    }
+}
+
 /// Fetch the tree size from an RFC 6962 CT log.
 ///
 /// # Arguments
@@ -66,7 +149,6 @@ pub async fn get_tree_size(
         let status = response.status().as_u16();
         return match status {
             429 | 503 => Err(FetchError::RateLimited(status)),
-            400 => Err(FetchError::NotAvailable(status)),
             _ => Err(FetchError::NotAvailable(status)),
         };
     }
@@ -112,7 +194,6 @@ pub async fn fetch_entries(
         let status = response.status().as_u16();
         return match status {
             429 | 503 => Err(FetchError::RateLimited(status)),
-            400 => Err(FetchError::NotAvailable(status)),
             _ => Err(FetchError::NotAvailable(status)),
         };
     }
@@ -131,28 +212,12 @@ pub async fn fetch_entries(
             Some(p) => p,
             None => {
                 debug!(cert_index, "skipped unparseable cert");
+                metrics::counter!("certstream_parse_failures").increment(1);
                 continue;
             }
         };
 
-        let cert_link = format!(
-            "{}/ct/v1/get-entries?start={}&end={}",
-            base_url, cert_index, cert_index
-        );
-
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: parsed.update_type,
-                leaf_cert: parsed.leaf_cert,
-                chain: Some(parsed.chain),
-                cert_index,
-                cert_link,
-                seen,
-                source: Arc::clone(source),
-            },
-        };
-
+        let msg = build_rfc6962_certificate_message(parsed, cert_index, source, base_url, seen);
         messages.push(msg);
     }
 
@@ -191,7 +256,6 @@ pub async fn fetch_tile_entries(
         let status = response.status().as_u16();
         return match status {
             429 | 503 => Err(FetchError::RateLimited(status)),
-            400 => Err(FetchError::NotAvailable(status)),
             _ => Err(FetchError::NotAvailable(status)),
         };
     }
@@ -204,10 +268,20 @@ pub async fn fetch_tile_entries(
     let seen = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
 
     for (i, leaf) in leaves.iter().enumerate().skip(offset_in_tile) {
+        // Create a ParsedEntry to use the pure function
         let parsed = match super::parse_certificate(&leaf.cert_der, true) {
-            Some(p) => p,
+            Some(leaf_cert) => ParsedEntry {
+                update_type: if leaf.is_precert {
+                    Cow::Borrowed("PrecertLogEntry")
+                } else {
+                    Cow::Borrowed("X509LogEntry")
+                },
+                leaf_cert,
+                chain: Vec::new(), // Will be resolved below
+            },
             None => {
                 debug!(index = i, "skipped unparseable cert from tile");
+                metrics::counter!("certstream_static_ct_parse_failures").increment(1);
                 continue;
             }
         };
@@ -238,26 +312,16 @@ pub async fn fetch_tile_entries(
             }
         }
 
-        // Build the cert_link URL for Static CT
-        let cert_link = format!("{}/tile/data/", base_url.trim_end_matches('/'));
-
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: if leaf.is_precert {
-                    Cow::Borrowed("PrecertLogEntry")
-                } else {
-                    Cow::Borrowed("X509LogEntry")
-                },
-                leaf_cert: parsed,
-                chain: if chain.is_empty() { None } else { Some(chain) },
-                cert_index: tile_index * 256 + i as u64,
-                cert_link,
-                seen,
-                source: Arc::clone(source),
-            },
-        };
-
+        let msg = build_static_ct_certificate_message(
+            parsed,
+            leaf.is_precert,
+            chain,
+            tile_index,
+            i,
+            source,
+            base_url,
+            seen,
+        );
         messages.push(msg);
     }
 
@@ -286,7 +350,6 @@ pub async fn get_checkpoint_tree_size(
         let status = response.status().as_u16();
         return match status {
             429 | 503 => Err(FetchError::RateLimited(status)),
-            400 => Err(FetchError::NotAvailable(status)),
             _ => Err(FetchError::NotAvailable(status)),
         };
     }
@@ -318,11 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn test_build_certificate_message() {
+    fn test_build_rfc6962_certificate_message() {
         let cert_der = generate_test_cert_der("test.example.com");
 
         // Parse the certificate
-        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+        let leaf_cert = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        // Create a ParsedEntry
+        let parsed = ParsedEntry {
+            update_type: Cow::Borrowed("X509LogEntry"),
+            leaf_cert,
+            chain: vec![],
+        };
 
         // Create a source
         let source = Arc::new(Source {
@@ -330,34 +400,24 @@ mod tests {
             url: Arc::from("https://ct.example.com"),
         });
 
-        // Build a CertificateMessage
+        // Build a CertificateMessage using the pure function
         let cert_index = 12345u64;
         let base_url = "https://ct.example.com";
         let seen = 1234567890.5;
 
-        let cert_link = format!(
-            "{}/ct/v1/get-entries?start={}&end={}",
-            base_url, cert_index, cert_index
-        );
-
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: parsed,
-                chain: Some(vec![]),
-                cert_index,
-                cert_link: cert_link.clone(),
-                seen,
-                source: Arc::clone(&source),
-            },
-        };
+        let msg = super::build_rfc6962_certificate_message(parsed, cert_index, &source, base_url, seen);
 
         // Verify the fields
         assert_eq!(msg.message_type, "certificate_update");
         assert_eq!(msg.data.update_type, "X509LogEntry");
         assert_eq!(msg.data.cert_index, cert_index);
-        assert_eq!(msg.data.cert_link, cert_link);
+        assert_eq!(
+            msg.data.cert_link,
+            format!(
+                "{}/ct/v1/get-entries?start={}&end={}",
+                base_url, cert_index, cert_index
+            )
+        );
         assert_eq!(msg.data.seen, seen);
         assert_eq!(msg.data.source.name.as_ref(), "test-log");
         assert_eq!(msg.data.source.url.as_ref(), "https://ct.example.com");
@@ -367,7 +427,13 @@ mod tests {
     fn test_fetch_entries_constructs_correct_cert_index() {
         // AC4.1 Success: fetch_entries constructs CertificateMessage with correct cert_index
         let cert_der = generate_test_cert_der("test.example.com");
-        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+        let leaf_cert = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let parsed = ParsedEntry {
+            update_type: Cow::Borrowed("X509LogEntry"),
+            leaf_cert,
+            chain: vec![],
+        };
 
         let source = Arc::new(Source {
             name: Arc::from("test-log"),
@@ -379,23 +445,7 @@ mod tests {
         let cert_index = start_index;
         let seen = 1234567890.5;
 
-        let cert_link = format!(
-            "{}/ct/v1/get-entries?start={}&end={}",
-            base_url, cert_index, cert_index
-        );
-
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: parsed,
-                chain: Some(vec![]),
-                cert_index,
-                cert_link,
-                seen,
-                source: Arc::clone(&source),
-            },
-        };
+        let msg = super::build_rfc6962_certificate_message(parsed, cert_index, &source, base_url, seen);
 
         // Verify cert_index matches the expected value
         assert_eq!(msg.data.cert_index, start_index);
@@ -405,7 +455,13 @@ mod tests {
     fn test_fetch_entries_constructs_correct_cert_link() {
         // AC4.1 Success: fetch_entries constructs CertificateMessage with proper cert_link URL
         let cert_der = generate_test_cert_der("test.example.com");
-        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+        let leaf_cert = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let parsed = ParsedEntry {
+            update_type: Cow::Borrowed("X509LogEntry"),
+            leaf_cert,
+            chain: vec![],
+        };
 
         let source = Arc::new(Source {
             name: Arc::from("test-log"),
@@ -421,18 +477,7 @@ mod tests {
             base_url, cert_index, cert_index
         );
 
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: parsed,
-                chain: Some(vec![]),
-                cert_index,
-                cert_link: expected_cert_link.clone(),
-                seen,
-                source: Arc::clone(&source),
-            },
-        };
+        let msg = super::build_rfc6962_certificate_message(parsed, cert_index, &source, base_url, seen);
 
         // Verify cert_link is correct
         assert_eq!(msg.data.cert_link, expected_cert_link);
@@ -442,7 +487,13 @@ mod tests {
     fn test_fetch_entries_constructs_correct_source() {
         // AC4.1 Success: fetch_entries constructs CertificateMessage with correct source
         let cert_der = generate_test_cert_der("test.example.com");
-        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+        let leaf_cert = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let parsed = ParsedEntry {
+            update_type: Cow::Borrowed("X509LogEntry"),
+            leaf_cert,
+            chain: vec![],
+        };
 
         let source = Arc::new(Source {
             name: Arc::from("test-log"),
@@ -453,23 +504,7 @@ mod tests {
         let cert_index = 1234u64;
         let seen = 1234567890.5;
 
-        let cert_link = format!(
-            "{}/ct/v1/get-entries?start={}&end={}",
-            base_url, cert_index, cert_index
-        );
-
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: parsed,
-                chain: Some(vec![]),
-                cert_index,
-                cert_link,
-                seen,
-                source: Arc::clone(&source),
-            },
-        };
+        let msg = super::build_rfc6962_certificate_message(parsed, cert_index, &source, base_url, seen);
 
         // Verify source fields are correct
         assert_eq!(msg.data.source.name.as_ref(), "test-log");
@@ -480,25 +515,20 @@ mod tests {
     fn test_fetch_entries_constructs_correct_message_type() {
         // AC4.1 Success: fetch_entries constructs CertificateMessage with correct message_type
         let cert_der = generate_test_cert_der("test.example.com");
-        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+        let leaf_cert = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let parsed = ParsedEntry {
+            update_type: Cow::Borrowed("X509LogEntry"),
+            leaf_cert,
+            chain: vec![],
+        };
 
         let source = Arc::new(Source {
             name: Arc::from("test-log"),
             url: Arc::from("https://ct.example.com"),
         });
 
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: parsed,
-                chain: Some(vec![]),
-                cert_index: 1234,
-                cert_link: "https://ct.example.com/entry".into(),
-                seen: 1234567890.5,
-                source: Arc::clone(&source),
-            },
-        };
+        let msg = super::build_rfc6962_certificate_message(parsed, 1234, &source, "https://ct.example.com", 1234567890.5);
 
         // Verify message_type is correct
         assert_eq!(msg.message_type, "certificate_update");
@@ -508,25 +538,20 @@ mod tests {
     fn test_fetch_entries_constructs_correct_update_type() {
         // AC4.1 Success: fetch_entries constructs CertificateMessage with correct update_type
         let cert_der = generate_test_cert_der("test.example.com");
-        let parsed = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+        let leaf_cert = super::super::parse_certificate(&cert_der, true).expect("Failed to parse cert");
+
+        let parsed = ParsedEntry {
+            update_type: Cow::Borrowed("X509LogEntry"),
+            leaf_cert,
+            chain: vec![],
+        };
 
         let source = Arc::new(Source {
             name: Arc::from("test-log"),
             url: Arc::from("https://ct.example.com"),
         });
 
-        let msg = CertificateMessage {
-            message_type: Cow::Borrowed("certificate_update"),
-            data: CertificateData {
-                update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: parsed,
-                chain: Some(vec![]),
-                cert_index: 1234,
-                cert_link: "https://ct.example.com/entry".into(),
-                seen: 1234567890.5,
-                source: Arc::clone(&source),
-            },
-        };
+        let msg = super::build_rfc6962_certificate_message(parsed, 1234, &source, "https://ct.example.com", 1234567890.5);
 
         // Verify update_type is correct
         assert_eq!(msg.data.update_type, "X509LogEntry");

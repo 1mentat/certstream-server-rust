@@ -11,8 +11,8 @@ use tracing::{debug, error, info, warn};
 
 use super::fetch::{self, FetchError};
 use super::watcher::LogHealth;
-use super::{broadcast_cert, build_cached_cert, parse_certificate, CtLog, WatcherContext};
-use crate::models::{CertificateData, CertificateMessage, ChainCert, Source};
+use super::{broadcast_cert, build_cached_cert, CtLog, WatcherContext};
+use crate::models::Source;
 
 /// A parsed static CT checkpoint.
 #[derive(Debug, Clone)]
