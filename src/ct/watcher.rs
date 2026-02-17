@@ -1,12 +1,12 @@
-use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
 
-use super::{broadcast_cert, build_cached_cert, parse_leaf_input, CtLog, WatcherContext};
-use crate::models::{CertificateData, CertificateMessage, Source};
+use super::fetch::{self, FetchError};
+use super::{broadcast_cert, build_cached_cert, CtLog, WatcherContext};
+use crate::models::Source;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
@@ -163,24 +163,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
         rate_limiter,
     } = ctx;
     use backon::{ExponentialBuilder, Retryable};
-    use serde::Deserialize;
     use tokio::time::sleep;
-
-    #[derive(Debug, Deserialize)]
-    struct SthResponse {
-        tree_size: u64,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct EntriesResponse {
-        entries: Vec<Entry>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct Entry {
-        leaf_input: String,
-        extra_data: String,
-    }
 
     let base_url = log.normalized_url();
     let log_name = log.description.clone();
@@ -204,11 +187,8 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             .with_max_delay(Duration::from_millis(config.retry_max_delay_ms))
             .with_max_times(config.retry_max_attempts as usize);
 
-        let url = format!("{}/ct/v1/get-sth", base_url);
         match (|| async {
-            let response: SthResponse =
-                client.get(&url).timeout(timeout).send().await?.json().await?;
-            Ok::<_, reqwest::Error>(response.tree_size)
+            fetch::get_tree_size(&client, &base_url, timeout).await
         })
         .retry(backoff)
         .sleep(tokio::time::sleep)
@@ -257,34 +237,23 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             }
         }
 
-        let sth_url = format!("{}/ct/v1/get-sth", base_url);
-        let tree_size = match client.get(&sth_url).timeout(timeout).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    if status.as_u16() == 429 {
+        let tree_size = match fetch::get_tree_size(&client, &base_url, timeout).await {
+            Ok(size) => size,
+            Err(e) => {
+                match e {
+                    FetchError::RateLimited(_) => {
                         health.record_rate_limit(config.unhealthy_threshold);
                         warn!(log = %log.description, "rate limited on get-sth, backing off");
-                    } else {
-                        health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, status = %status, "get-sth returned error");
                     }
-                    sleep(health.get_backoff()).await;
-                    continue;
-                }
-                match resp.json::<SthResponse>().await {
-                    Ok(sth) => sth.tree_size,
-                    Err(e) => {
+                    FetchError::NotAvailable(_) => {
                         health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, error = %e, "failed to parse tree size");
-                        sleep(health.get_backoff()).await;
-                        continue;
+                        warn!(log = %log.description, error = %e, "get-sth returned error");
+                    }
+                    _ => {
+                        health.record_failure(config.unhealthy_threshold);
+                        warn!(log = %log.description, error = %e, "failed to get tree size");
                     }
                 }
-            }
-            Err(e) => {
-                health.record_failure(config.unhealthy_threshold);
-                warn!(log = %log.description, error = %e, "failed to get tree size");
                 sleep(health.get_backoff()).await;
                 continue;
             }
@@ -296,108 +265,65 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
         }
 
         let end = (current_index + config.batch_size).min(tree_size - 1);
-        let entries_url = format!(
-            "{}/ct/v1/get-entries?start={}&end={}",
-            base_url, current_index, end
-        );
 
         // Respect per-operator rate limit before making request
         if let Some(ref limiter) = rate_limiter {
             limiter.lock().await.tick().await;
         }
 
-        match client.get(&entries_url).timeout(timeout).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    if status.as_u16() == 429 {
+        match fetch::fetch_entries(&client, &base_url, current_index, end, &source, timeout).await {
+            Ok(messages) => {
+                health.record_success(config.healthy_threshold);
+                let count = messages.len();
+
+                for msg in messages {
+                    let cert_index = msg.data.cert_index;
+
+                    if !dedup.is_new(&msg.data.leaf_cert.sha256) {
+                        continue;
+                    }
+
+                    let cached = build_cached_cert(
+                        &msg.data.leaf_cert,
+                        msg.data.seen,
+                        &log.description,
+                        &base_url,
+                        cert_index,
+                    );
+                    broadcast_cert(msg, &tx, &cache, cached, &stats, &log_name);
+                }
+
+                debug!(log = %log_name, count = count, "fetched entries");
+                current_index = end + 1;
+                state_manager.update_index(&base_url, current_index, tree_size);
+
+                tracker.update(
+                    &base_url,
+                    *health.status.read(),
+                    current_index,
+                    tree_size,
+                    health.total_errors(),
+                );
+            }
+            Err(e) => {
+                match e {
+                    FetchError::RateLimited(_) => {
                         health.record_rate_limit(config.unhealthy_threshold);
                         warn!(log = %log.description, "rate limited by CT log, backing off 30s");
-                    } else if status.as_u16() == 400 {
+                    }
+                    FetchError::NotAvailable(_) => {
                         // Entries not yet available — skip ahead to tree_size
                         debug!(log = %log.description, start = current_index, end = end,
                             "entries not available (400), skipping to tree head");
                         current_index = tree_size;
                         sleep(poll_interval).await;
                         continue;
-                    } else {
-                        health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, status = %status, "CT log returned error");
                     }
-                    sleep(health.get_backoff()).await;
-                    continue;
-                }
-
-                match resp.json::<EntriesResponse>().await {
-                    Ok(entries_resp) => {
-                        health.record_success(config.healthy_threshold);
-                        let count = entries_resp.entries.len();
-
-                        for (i, entry) in entries_resp.entries.into_iter().enumerate() {
-                            let cert_index = current_index + i as u64;
-                            let parsed =
-                                match parse_leaf_input(&entry.leaf_input, &entry.extra_data) {
-                                    Some(p) => p,
-                                    None => {
-                                        debug!(log = %log_name, index = cert_index, "skipped unparseable cert");
-                                        metrics::counter!("certstream_parse_failures", "log" => log_name.clone()).increment(1);
-                                        continue;
-                                    }
-                                };
-
-                            if !dedup.is_new(&parsed.leaf_cert.sha256) {
-                                continue;
-                            }
-
-                            let seen = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-                            let cached = build_cached_cert(
-                                &parsed.leaf_cert,
-                                seen,
-                                &log.description,
-                                &base_url,
-                                cert_index,
-                            );
-                            let cert_link = format!(
-                                "{}/ct/v1/get-entries?start={}&end={}",
-                                base_url, cert_index, cert_index
-                            );
-                            let msg = CertificateMessage {
-                                message_type: Cow::Borrowed("certificate_update"),
-                                data: CertificateData {
-                                    update_type: parsed.update_type,
-                                    leaf_cert: parsed.leaf_cert,
-                                    chain: Some(parsed.chain),
-                                    cert_index,
-                                    cert_link,
-                                    seen,
-                                    source: Arc::clone(&source),
-                                },
-                            };
-                            broadcast_cert(msg, &tx, &cache, cached, &stats, &log_name);
-                        }
-
-                        debug!(log = %log_name, count = count, "fetched entries");
-                        current_index = end + 1;
-                        state_manager.update_index(&base_url, current_index, tree_size);
-
-                        tracker.update(
-                            &base_url,
-                            *health.status.read(),
-                            current_index,
-                            tree_size,
-                            health.total_errors(),
-                        );
-                    }
-                    Err(e) => {
+                    _ => {
                         health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, error = %e, "failed to parse entries");
-                        sleep(health.get_backoff()).await;
+                        warn!(log = %log.description, error = %e, "failed to fetch entries");
                     }
                 }
-            }
-            Err(e) => {
-                health.record_failure(config.unhealthy_threshold);
-                warn!(log = %log.description, error = %e, "failed to fetch entries");
                 sleep(health.get_backoff()).await;
             }
         }
