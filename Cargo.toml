@@ -46,6 +46,7 @@ arc-swap = "1.7"
 tokio-util = { version = "0.7.18", features = ["full"] }
 futures = "0.3.31"
 flate2 = "1.0"
+deltalake = { version = "0.25", features = ["datafusion"] }
 
 [dev-dependencies]
 rcgen = "0.13"

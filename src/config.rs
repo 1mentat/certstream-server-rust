@@ -284,6 +284,41 @@ pub struct HotReloadConfig {
     pub watch_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeltaSinkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_delta_sink_table_path")]
+    pub table_path: String,
+    #[serde(default = "default_delta_sink_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_delta_sink_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+}
+
+impl Default for DeltaSinkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            table_path: default_delta_sink_table_path(),
+            batch_size: default_delta_sink_batch_size(),
+            flush_interval_secs: default_delta_sink_flush_interval_secs(),
+        }
+    }
+}
+
+fn default_delta_sink_table_path() -> String {
+    "./data/certstream".to_string()
+}
+
+fn default_delta_sink_batch_size() -> usize {
+    10000
+}
+
+fn default_delta_sink_flush_interval_secs() -> u64 {
+    30
+}
+
 fn default_true() -> bool {
     true
 }
@@ -306,6 +341,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub auth: AuthConfig,
     pub hot_reload: HotReloadConfig,
+    pub delta_sink: DeltaSinkConfig,
     pub config_path: Option<String>,
 }
 
@@ -336,6 +372,8 @@ struct YamlConfig {
     auth: Option<AuthConfig>,
     #[serde(default)]
     hot_reload: Option<HotReloadConfig>,
+    #[serde(default)]
+    delta_sink: Option<DeltaSinkConfig>,
 }
 
 struct YamlConfigWithPath {
@@ -474,6 +512,20 @@ impl Config {
             hot_reload.enabled = v.parse().unwrap_or(hot_reload.enabled);
         }
 
+        let mut delta_sink = yaml_config.delta_sink.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_ENABLED") {
+            delta_sink.enabled = v.parse().unwrap_or(delta_sink.enabled);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_TABLE_PATH") {
+            delta_sink.table_path = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_BATCH_SIZE") {
+            delta_sink.batch_size = v.parse().unwrap_or(delta_sink.batch_size);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_FLUSH_INTERVAL_SECS") {
+            delta_sink.flush_interval_secs = v.parse().unwrap_or(delta_sink.flush_interval_secs);
+        }
+
         Self {
             host,
             port,
@@ -491,6 +543,7 @@ impl Config {
             api,
             auth,
             hot_reload,
+            delta_sink,
             config_path,
         }
     }
@@ -549,6 +602,19 @@ impl Config {
             errors.push(ConfigValidationError {
                 field: "rate_limit.free_refill_rate".to_string(),
                 message: "Refill rate must be positive".to_string(),
+            });
+        }
+
+        if self.delta_sink.enabled && self.delta_sink.batch_size == 0 {
+            errors.push(ConfigValidationError {
+                field: "delta_sink.batch_size".to_string(),
+                message: "Batch size must be greater than 0 when delta sink is enabled".to_string(),
+            });
+        }
+        if self.delta_sink.enabled && self.delta_sink.flush_interval_secs == 0 {
+            errors.push(ConfigValidationError {
+                field: "delta_sink.flush_interval_secs".to_string(),
+                message: "Flush interval must be greater than 0 when delta sink is enabled".to_string(),
             });
         }
 
@@ -618,6 +684,7 @@ mod tests {
             api: ApiConfig::default(),
             auth: AuthConfig::default(),
             hot_reload: HotReloadConfig::default(),
+            delta_sink: DeltaSinkConfig::default(),
             config_path: None,
         }
     }

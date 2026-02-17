@@ -95,7 +95,7 @@ pub struct Extensions {
     pub subject_alt_name: Option<String>,
     #[serde(rename = "subjectKeyIdentifier", skip_serializing_if = "Option::is_none")]
     pub subject_key_identifier: Option<String>,
-    #[serde(rename = "ctlPoisonByte", skip_serializing_if = "is_false")]
+    #[serde(rename = "ctlPoisonByte", skip_serializing_if = "is_false", default)]
     pub ctl_poison_byte: bool,
 }
 
