@@ -5,7 +5,7 @@ use crate::delta_sink::{delta_schema, DeltaCertRecord, flush_buffer, open_or_cre
 use crate::models::Source;
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
-use deltalake::DeltaTableError;
+use deltalake::{DeltaTable, DeltaTableError};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -323,6 +323,56 @@ pub async fn detect_gaps(
     Ok(work_items)
 }
 
+/// Helper function to handle a flush operation and update writer state.
+///
+/// Updates total_records_written and write_errors based on flush result.
+/// Returns (new_table, should_break) where:
+/// - new_table is Some if flush succeeded, None if table became inaccessible
+/// - should_break is true if loop should terminate (table inaccessible)
+///
+/// # Arguments
+/// * `new_table_opt` - Option containing new DeltaTable after flush
+/// * `flush_result` - Result of the flush operation
+/// * `total_records_written` - Mutable reference to total record count
+/// * `write_errors` - Mutable reference to error count
+/// * `trigger` - String describing what triggered the flush (for logging)
+///
+/// # Returns
+/// * `(Option<DeltaTable>, bool)` - New table and break flag
+fn handle_flush(
+    new_table_opt: Option<DeltaTable>,
+    flush_result: Result<usize, Box<dyn std::error::Error + Send + Sync>>,
+    total_records_written: &mut u64,
+    write_errors: &mut u64,
+    trigger: &str,
+) -> (Option<DeltaTable>, bool) {
+    match new_table_opt {
+        Some(new_table) => {
+            match flush_result {
+                Ok(count) => {
+                    *total_records_written += count as u64;
+                    info!(
+                        records_flushed = count,
+                        total_records = total_records_written,
+                        trigger = trigger,
+                        "flushed records to delta"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, trigger = trigger, "Failed to flush buffer");
+                    *write_errors += 1;
+                }
+            }
+            (Some(new_table), false)
+        }
+        None => {
+            warn!(trigger = trigger, "Table became inaccessible during write");
+            *write_errors += 1;
+            (None, true)
+        }
+    }
+}
+
 /// Writer task that receives DeltaCertRecords from mpsc channel and flushes to delta table.
 ///
 /// Buffers records and flushes on:
@@ -383,30 +433,11 @@ async fn run_writer(
                         // Flush if buffer reaches batch_size threshold
                         if buffer.len() >= batch_size {
                             let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
-                            match new_table_opt {
-                                Some(new_table) => {
-                                    table = new_table;
-                                    match flush_result {
-                                        Ok(count) => {
-                                            total_records_written += count as u64;
-                                            info!(
-                                                records_flushed = count,
-                                                total_records = total_records_written,
-                                                "flushed records to delta (batch size trigger)"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "Failed to flush buffer");
-                                            write_errors += 1;
-                                        }
-                                    }
-                                }
-                                None => {
-                                    warn!("Table became inaccessible during write");
-                                    write_errors += 1;
-                                    break;
-                                }
+                            let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "batch size trigger");
+                            if should_break {
+                                break;
                             }
+                            table = opt_table.expect("handle_flush should always return Some when should_break is false");
                         }
                     }
                     None => {
@@ -417,28 +448,7 @@ async fn run_writer(
                                 "Channel closed, flushing remaining buffer"
                             );
                             let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
-                            match new_table_opt {
-                                Some(_) => {
-                                    match flush_result {
-                                        Ok(count) => {
-                                            total_records_written += count as u64;
-                                            info!(
-                                                records_flushed = count,
-                                                total_records = total_records_written,
-                                                "flushed remaining records to delta (channel close)"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(error = %e, "Failed to flush buffer on channel close");
-                                            write_errors += 1;
-                                        }
-                                    }
-                                }
-                                None => {
-                                    warn!("Table became inaccessible during final flush");
-                                    write_errors += 1;
-                                }
-                            }
+                            let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "channel close");
                         }
                         break;
                     }
@@ -448,30 +458,11 @@ async fn run_writer(
                 // Time-triggered flush
                 if !buffer.is_empty() {
                     let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
-                    match new_table_opt {
-                        Some(new_table) => {
-                            table = new_table;
-                            match flush_result {
-                                Ok(count) => {
-                                    total_records_written += count as u64;
-                                    info!(
-                                        records_flushed = count,
-                                        total_records = total_records_written,
-                                        "flushed records to delta (time trigger)"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to flush buffer");
-                                    write_errors += 1;
-                                }
-                            }
-                        }
-                        None => {
-                            warn!("Table became inaccessible during write");
-                            write_errors += 1;
-                            break;
-                        }
+                    let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "time trigger");
+                    if should_break {
+                        break;
                     }
+                    table = opt_table.expect("handle_flush should always return Some when should_break is false");
                 }
             }
             _ = shutdown.cancelled() => {
@@ -482,28 +473,7 @@ async fn run_writer(
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
                     let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
-                    match new_table_opt {
-                        Some(_) => {
-                            match flush_result {
-                                Ok(count) => {
-                                    total_records_written += count as u64;
-                                    info!(
-                                        records_flushed = count,
-                                        total_records = total_records_written,
-                                        "flushed remaining records to delta (shutdown)"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to flush buffer during shutdown");
-                                    write_errors += 1;
-                                }
-                            }
-                        }
-                        None => {
-                            warn!("Table became inaccessible during shutdown flush");
-                            write_errors += 1;
-                        }
-                    }
+                    let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "shutdown");
                 }
                 break;
             }
@@ -1424,8 +1394,6 @@ mod tests {
         // Wait for writer
         let result = writer_task.await.expect("task join failed");
 
-        eprintln!("Result: total_records_written={}, write_errors={}", result.total_records_written, result.write_errors);
-
         // Should have written 2 records
         assert_eq!(result.total_records_written, 2, "Writer should have written 2 records");
         assert_eq!(result.write_errors, 0, "Writer should have no errors");
@@ -1587,11 +1555,10 @@ mod tests {
         // Create a channel
         let (tx1, rx) = mpsc::channel::<DeltaCertRecord>(10);
         let tx2 = tx1.clone();
+        let tx3 = tx1.clone();
 
-        // Spawn two tasks that simulate fetchers
+        // Spawn three tasks that simulate fetchers
         let shutdown = CancellationToken::new();
-        let shutdown1 = shutdown.clone();
-        let shutdown2 = shutdown.clone();
 
         let fetcher1 = tokio::spawn(async move {
             // Fetcher 1: succeeds and sends records
@@ -1613,6 +1580,12 @@ mod tests {
             }
         });
 
+        let fetcher3 = tokio::spawn(async move {
+            // Fetcher 3: fails with connection refused error (simulating unreachable log)
+            let _: Result<u64, String> = Err("connection refused".to_string());
+            Err::<u64, String>("connection refused".to_string())
+        });
+
         // Spawn writer task
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
@@ -1622,17 +1595,19 @@ mod tests {
         // Wait for fetchers
         let r1 = fetcher1.await.expect("fetcher1 failed").expect("fetcher1 error");
         let r2 = fetcher2.await.expect("fetcher2 failed").expect("fetcher2 error");
+        let r3 = fetcher3.await.expect("fetcher3 failed");
 
-        drop(shutdown1);
-        drop(shutdown2);
+        // Verify fetchers 1 and 2 succeeded while fetcher 3 failed (AC5.3: failure doesn't block others)
+        assert_eq!(r1, 1, "Fetcher 1 should succeed");
+        assert_eq!(r2, 1, "Fetcher 2 should succeed");
+        assert!(r3.is_err(), "Fetcher 3 should fail with connection refused");
 
         // Wait for writer
         let writer_result = writer_handle.await.expect("writer task failed");
 
-        // Verify both fetchers succeeded and wrote records
-        assert_eq!(r1, 1);
-        assert_eq!(r2, 1);
-        assert_eq!(writer_result.total_records_written, 2);
+        // Verify only the successful fetchers' records were written (2 total, not 3)
+        assert_eq!(writer_result.total_records_written, 2, "Should have 2 records from successful fetchers");
+        assert_eq!(writer_result.write_errors, 0, "Writer should have no errors");
 
         let _ = fs::remove_dir_all(&table_path);
     }
