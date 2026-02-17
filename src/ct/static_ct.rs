@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use super::fetch::{self, FetchError};
 use super::watcher::LogHealth;
 use super::{broadcast_cert, build_cached_cert, parse_certificate, CtLog, WatcherContext};
 use crate::models::{CertificateData, CertificateMessage, ChainCert, Source};
@@ -458,31 +459,11 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
             }
         }
 
-        let tree_size = match client.get(&checkpoint_url).timeout(timeout).send().await {
-            Ok(resp) => match resp.text().await {
-                Ok(text) => match parse_checkpoint(&text) {
-                    Some(cp) => {
-                        cp.tree_size
-                    }
-                    None => {
-                        health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, "failed to parse checkpoint");
-                        metrics::counter!("certstream_static_ct_checkpoint_errors").increment(1);
-                        sleep(health.get_backoff()).await;
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    health.record_failure(config.unhealthy_threshold);
-                    warn!(log = %log.description, error = %e, "failed to read checkpoint");
-                    metrics::counter!("certstream_static_ct_checkpoint_errors").increment(1);
-                    sleep(health.get_backoff()).await;
-                    continue;
-                }
-            },
+        let tree_size = match fetch::get_checkpoint_tree_size(&client, &base_url, timeout).await {
+            Ok(size) => size,
             Err(e) => {
                 health.record_failure(config.unhealthy_threshold);
-                warn!(log = %log.description, error = %e, "failed to fetch checkpoint");
+                warn!(log = %log.description, error = %e, "failed to fetch or parse checkpoint");
                 metrics::counter!("certstream_static_ct_checkpoint_errors").increment(1);
                 sleep(health.get_backoff()).await;
                 continue;
@@ -521,148 +502,67 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
             0
         };
 
-        let url = tile_url(&base_url, 0, tile_index, partial_width);
+        let tile_start_index = tile_index * 256;
+        let offset_in_tile = if current_index > tile_start_index {
+            (current_index - tile_start_index) as usize
+        } else {
+            0
+        };
 
         // Respect per-operator rate limit before making request
         if let Some(ref limiter) = rate_limiter {
             limiter.lock().await.tick().await;
         }
 
-        match client.get(&url).timeout(timeout).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    if status.as_u16() == 429 {
-                        health.record_rate_limit(config.unhealthy_threshold);
-                        warn!(log = %log.description, "rate limited by static CT log, backing off 30s");
-                    } else {
-                        health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, url = %url, status = %status, "tile fetch failed");
+        match fetch::fetch_tile_entries(&client, &base_url, tile_index, partial_width, offset_in_tile, &source, timeout, &issuer_cache).await {
+            Ok(messages) => {
+                health.record_success(config.healthy_threshold);
+                metrics::counter!("certstream_static_ct_tiles_fetched", "log" => log_name.clone()).increment(1);
+
+                metrics::counter!("certstream_static_ct_entries_parsed", "log" => log_name.clone()).increment(messages.len() as u64);
+
+                for msg in messages {
+                    let cert_index = msg.data.cert_index;
+
+                    if !dedup.is_new(&msg.data.leaf_cert.sha256) {
+                        continue;
                     }
-                    sleep(health.get_backoff()).await;
-                    continue;
+
+                    let cached = build_cached_cert(
+                        &msg.data.leaf_cert,
+                        msg.data.seen,
+                        &log.description,
+                        &base_url,
+                        cert_index,
+                    );
+                    broadcast_cert(msg, &tx, &cache, cached, &stats, &log_name);
                 }
 
-                match resp.bytes().await {
-                    Ok(raw_data) => {
-                        health.record_success(config.healthy_threshold);
-                        metrics::counter!("certstream_static_ct_tiles_fetched", "log" => log_name.clone()).increment(1);
+                let next_index = ((tile_index + 1) * 256).min(tree_size);
+                current_index = next_index;
+                state_manager.update_index(&base_url, current_index, tree_size);
 
-                        let data = decompress_tile(&raw_data);
-                        let leaves = parse_tile_leaves(&data);
+                tracker.update(
+                    &base_url,
+                    *health.status.read(),
+                    current_index,
+                    tree_size,
+                    health.total_errors(),
+                );
 
-                        let tile_start_index = tile_index * 256;
-                        let offset_in_tile = if current_index > tile_start_index {
-                            (current_index - tile_start_index) as usize
-                        } else {
-                            0
-                        };
-
-                        for (i, leaf) in leaves.iter().enumerate().skip(offset_in_tile) {
-                            let cert_index = tile_start_index + i as u64;
-
-                            let parsed = match parse_certificate(&leaf.cert_der, true) {
-                                Some(p) => p,
-                                None => {
-                                    debug!(log = %log_name, index = cert_index, "skipped unparseable cert (static CT)");
-                                    metrics::counter!("certstream_static_ct_parse_failures", "log" => log_name.clone()).increment(1);
-                                    continue;
-                                }
-                            };
-
-                            metrics::counter!("certstream_static_ct_entries_parsed", "log" => log_name.clone()).increment(1);
-
-                            if !dedup.is_new(&parsed.sha256) {
-                                continue;
-                            }
-
-                            let seen = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-                            let mut chain = Vec::new();
-                            for fp in &leaf.chain_fingerprints {
-                                if let Some(issuer_der) =
-                                    fetch_issuer(&client, &base_url, fp, &issuer_cache, timeout)
-                                        .await
-                                {
-                                if let Some(issuer_cert) = parse_certificate(&issuer_der, false) {
-                                    chain.push(ChainCert {
-                                        subject: issuer_cert.subject,
-                                        issuer: issuer_cert.issuer,
-                                        serial_number: issuer_cert.serial_number,
-                                        not_before: issuer_cert.not_before,
-                                        not_after: issuer_cert.not_after,
-                                        fingerprint: issuer_cert.fingerprint,
-                                        sha1: issuer_cert.sha1,
-                                        sha256: issuer_cert.sha256,
-                                        signature_algorithm: issuer_cert.signature_algorithm,
-                                        is_ca: issuer_cert.is_ca,
-                                        as_der: issuer_cert.as_der,
-                                        extensions: issuer_cert.extensions,
-                                    });
-                                }
-                                }
-                            }
-
-                            let update_type = if leaf.is_precert {
-                                Cow::Borrowed("PrecertLogEntry")
-                            } else {
-                                Cow::Borrowed("X509LogEntry")
-                            };
-
-                            let cached = build_cached_cert(
-                                &parsed,
-                                seen,
-                                &log.description,
-                                &base_url,
-                                cert_index,
-                            );
-                            let cert_link = format!(
-                                "{}/tile/data/{}",
-                                base_url,
-                                encode_tile_path(tile_index)
-                            );
-                            let msg = CertificateMessage {
-                                message_type: Cow::Borrowed("certificate_update"),
-                                data: CertificateData {
-                                    update_type,
-                                    leaf_cert: parsed,
-                                    chain: if chain.is_empty() {
-                                        None
-                                    } else {
-                                        Some(chain)
-                                    },
-                                    cert_index,
-                                    cert_link,
-                                    seen,
-                                    source: Arc::clone(&source),
-                                },
-                            };
-                            broadcast_cert(msg, &tx, &cache, cached, &stats, &log_name);
-                        }
-
-                        let next_index = ((tile_index + 1) * 256).min(tree_size);
-                        current_index = next_index;
-                        state_manager.update_index(&base_url, current_index, tree_size);
-
-                        tracker.update(
-                            &base_url,
-                            *health.status.read(),
-                            current_index,
-                            tree_size,
-                            health.total_errors(),
-                        );
-
-                        debug!(log = %log.description, tile = tile_index, leaves = leaves.len(), "processed static CT tile");
-                    }
-                    Err(e) => {
-                        health.record_failure(config.unhealthy_threshold);
-                        warn!(log = %log.description, error = %e, "failed to read tile response body");
-                        sleep(health.get_backoff()).await;
-                    }
-                }
+                debug!(log = %log.description, tile = tile_index, "processed static CT tile");
             }
             Err(e) => {
-                health.record_failure(config.unhealthy_threshold);
-                warn!(log = %log.description, error = %e, "failed to fetch tile");
+                match e {
+                    FetchError::RateLimited(_) => {
+                        health.record_rate_limit(config.unhealthy_threshold);
+                        warn!(log = %log.description, "rate limited by static CT log, backing off 30s");
+                    }
+                    _ => {
+                        health.record_failure(config.unhealthy_threshold);
+                        warn!(log = %log.description, error = %e, "failed to fetch tile");
+                    }
+                }
                 sleep(health.get_backoff()).await;
             }
         }
