@@ -1,10 +1,12 @@
 use crate::config::Config;
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
+use deltalake::DeltaTableError;
 use std::collections::HashMap;
 use std::error::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use tracing::warn;
 
 /// Represents a contiguous range of certificate indices to backfill.
 pub struct BackfillWorkItem {
@@ -116,11 +118,17 @@ async fn find_internal_gaps(
               FROM filtered_entries) sub
         WHERE next_index - cert_index > 1";
 
-    let gaps_df = ctx.sql(gaps_sql).await?;
-    let gaps_batches = gaps_df.collect().await?;
+    // Wrap query in async block to ensure deregister is always called
+    let result: Result<Vec<_>, Box<dyn Error>> = async {
+        let gaps_df = ctx.sql(gaps_sql).await?;
+        let gaps_batches = gaps_df.collect().await?;
+        Ok(gaps_batches)
+    }
+    .await;
 
-    // Deregister temp table to avoid name collision on repeated calls
+    // Always deregister temp table to avoid name collision on repeated calls
     ctx.deregister_table("filtered_entries")?;
+    let gaps_batches = result?;
 
     let mut gaps = Vec::new();
 
@@ -169,8 +177,8 @@ pub async fn detect_gaps(
     // Try to open the delta table; if it doesn't exist, return based on mode
     let table = match deltalake::open_table(table_path).await {
         Ok(t) => t,
-        Err(_) => {
-            // Table doesn't exist
+        Err(_e @ DeltaTableError::NotATable(_)) | Err(_e @ DeltaTableError::InvalidTableLocation(_)) => {
+            // Table doesn't exist (NotATable or InvalidTableLocation)
             return match backfill_from {
                 None => {
                     // Catch-up mode: no table, no work items
@@ -192,6 +200,7 @@ pub async fn detect_gaps(
                 }
             };
         }
+        Err(e) => return Err(Box::new(e)),
     };
 
     // Create SessionContext and register table
@@ -213,15 +222,20 @@ pub async fn detect_gaps(
                     // Check for internal gaps
                     let expected_count = state.max_index - state.min_index + 1;
                     if state.count < expected_count {
-                        if let Ok(gaps) = find_internal_gaps(&ctx, source_url, lower_bound, state.max_index)
+                        match find_internal_gaps(&ctx, source_url, lower_bound, state.max_index)
                             .await
                         {
-                            for (gap_start, gap_end) in gaps {
-                                work_items.push(BackfillWorkItem {
-                                    source_url: source_url.clone(),
-                                    start: gap_start,
-                                    end: gap_end,
-                                });
+                            Ok(gaps) => {
+                                for (gap_start, gap_end) in gaps {
+                                    work_items.push(BackfillWorkItem {
+                                        source_url: source_url.clone(),
+                                        start: gap_start,
+                                        end: gap_end,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
                             }
                         }
                     }
@@ -252,15 +266,20 @@ pub async fn detect_gaps(
                     // Internal gaps
                     let expected_count = state.max_index - state.min_index + 1;
                     if state.count < expected_count {
-                        if let Ok(gaps) = find_internal_gaps(&ctx, source_url, from.max(state.min_index), state.max_index)
+                        match find_internal_gaps(&ctx, source_url, from.max(state.min_index), state.max_index)
                             .await
                         {
-                            for (gap_start, gap_end) in gaps {
-                                work_items.push(BackfillWorkItem {
-                                    source_url: source_url.clone(),
-                                    start: gap_start,
-                                    end: gap_end,
-                                });
+                            Ok(gaps) => {
+                                for (gap_start, gap_end) in gaps {
+                                    work_items.push(BackfillWorkItem {
+                                        source_url: source_url.clone(),
+                                        start: gap_start,
+                                        end: gap_end,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
                             }
                         }
                     }
@@ -409,16 +428,20 @@ mod tests {
             .filter(|item| item.source_url == "https://log.example.com")
             .collect();
 
-        // Should have multiple work items for gaps and frontier
-        assert!(gaps.len() >= 2, "Should detect internal gaps and frontier gap");
+        // Should have exactly three work items: (13, 14), (17, 19), and frontier (21, 21)
+        assert_eq!(gaps.len(), 3, "Should detect internal gaps (13, 14), (17, 19) and frontier gap (21, 21)");
 
         // Check for gap (13, 14)
         let has_gap_13_14 = gaps.iter().any(|item| item.start == 13 && item.end == 14);
         assert!(has_gap_13_14, "Should detect gap (13, 14)");
 
+        // Check for gap (17, 19)
+        let has_gap_17_19 = gaps.iter().any(|item| item.start == 17 && item.end == 19);
+        assert!(has_gap_17_19, "Should detect gap (17, 19)");
+
         // Check for frontier gap (21, 21)
         let frontier_gaps: Vec<_> = gaps.iter().filter(|item| item.start == 21 && item.end == 21).collect();
-        assert!(!frontier_gaps.is_empty(), "Should detect frontier gap (21, 21)");
+        assert_eq!(frontier_gaps.len(), 1, "Should detect exactly one frontier gap (21, 21)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
