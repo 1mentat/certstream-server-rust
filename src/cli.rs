@@ -9,11 +9,28 @@ pub struct CliArgs {
     pub export_metrics: bool,
     pub show_version: bool,
     pub show_help: bool,
+    pub backfill: bool,
+    pub backfill_from: Option<u64>,
+    pub backfill_logs: Option<String>,
 }
 
 impl CliArgs {
     pub fn parse() -> Self {
         let args: Vec<String> = env::args().collect();
+
+        // Parse value-bearing flags with index-based iteration
+        let mut backfill_from = None;
+        let mut backfill_logs = None;
+
+        for (i, arg) in args.iter().enumerate() {
+            if arg == "--from" && i + 1 < args.len() {
+                if let Ok(val) = args[i + 1].parse::<u64>() {
+                    backfill_from = Some(val);
+                }
+            } else if arg == "--logs" && i + 1 < args.len() {
+                backfill_logs = Some(args[i + 1].clone());
+            }
+        }
 
         Self {
             validate_config: args.iter().any(|a| a == "--validate-config"),
@@ -21,6 +38,9 @@ impl CliArgs {
             export_metrics: args.iter().any(|a| a == "--export-metrics"),
             show_version: args.iter().any(|a| a == "--version" || a == "-V"),
             show_help: args.iter().any(|a| a == "--help" || a == "-h"),
+            backfill: args.iter().any(|a| a == "--backfill"),
+            backfill_from,
+            backfill_logs,
         }
     }
 
@@ -38,6 +58,11 @@ impl CliArgs {
         println!("    --export-metrics     Export current metrics and exit");
         println!("    -V, --version        Print version information");
         println!("    -h, --help           Print help information");
+        println!();
+        println!("BACKFILL OPTIONS:");
+        println!("    --backfill           Activate backfill mode");
+        println!("    --from <INDEX>       Override start index for all logs");
+        println!("    --logs <FILTER>      Filter to specific logs by substring");
         println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
