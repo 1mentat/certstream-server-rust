@@ -51,3 +51,11 @@ static_logs:
     url: "https://mon.willow.ct.letsencrypt.org/2025h2d/"
   - name: "Let's Encrypt 'Sycamore' 2025h2d"
     url: "https://mon.sycamore.ct.letsencrypt.org/2025h2d/"
+
+# Delta Lake storage sink
+# Writes CT entries to a local Delta table for historical analysis
+delta_sink:
+  enabled: false                    # Off by default
+  table_path: "./data/certstream"   # Local filesystem path for Delta table
+  batch_size: 10000                 # Records before size-triggered flush
+  flush_interval_secs: 30           # Max seconds between flushes

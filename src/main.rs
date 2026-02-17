@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod ct;
 mod dedup;
+mod delta_sink;
 mod health;
 mod hot_reload;
 mod middleware;
@@ -126,6 +127,18 @@ async fn main() {
     dedup_filter.clone().start_cleanup_task(shutdown_token.clone());
     info!("cross-log dedup filter enabled");
 
+    let delta_sink_handle = if config.delta_sink.enabled {
+        let delta_rx = tx.subscribe();
+        let delta_config = config.delta_sink.clone();
+        let delta_shutdown = shutdown_token.clone();
+        let handle = tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_rx, delta_shutdown));
+        info!("delta sink enabled, writing to: {}", config.delta_sink.table_path);
+        Some(handle)
+    } else {
+        info!("delta sink disabled");
+        None
+    };
+
     let ct_log_config = Arc::new(config.ct_log.clone());
     let log_tracker = Arc::new(LogTracker::new());
     let server_stats = Arc::new(ServerStats::new());
@@ -204,6 +217,15 @@ async fn main() {
         run_tls_server(addr, app, &tls_cert, &tls_key, shutdown_token.clone()).await;
     } else {
         run_plain_server(addr, app, shutdown_token.clone()).await;
+    }
+
+    // Wait for delta sink to complete its shutdown flush before dropping the runtime
+    if let Some(handle) = delta_sink_handle {
+        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+            Ok(Ok(())) => info!("delta sink shutdown complete"),
+            Ok(Err(e)) => warn!(error = %e, "delta sink task panicked during shutdown"),
+            Err(_) => warn!("delta sink shutdown timed out after 30s"),
+        }
     }
 
     info!("flushing state before exit...");
@@ -573,6 +595,12 @@ fn print_config_validation(config: &Config) {
             println!("Rate limit enabled: {}", config.rate_limit.enabled);
             println!("Auth enabled: {}", config.auth.enabled);
             println!("Hot reload enabled: {}", config.hot_reload.enabled);
+            println!("Delta sink enabled: {}", config.delta_sink.enabled);
+            if config.delta_sink.enabled {
+                println!("  Table path: {}", config.delta_sink.table_path);
+                println!("  Batch size: {}", config.delta_sink.batch_size);
+                println!("  Flush interval: {}s", config.delta_sink.flush_interval_secs);
+            }
         }
         Err(errors) => {
             eprintln!("Configuration validation failed:");
