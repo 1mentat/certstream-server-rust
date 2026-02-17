@@ -1,4 +1,5 @@
 mod api;
+mod backfill;
 mod cli;
 mod config;
 mod ct;
@@ -66,6 +67,28 @@ async fn main() {
             .expect("failed to install prometheus recorder");
         println!("{}", prometheus_handle.render());
         return;
+    }
+
+    if cli_args.backfill {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            )
+            .init();
+
+        let shutdown_token = CancellationToken::new();
+        spawn_signal_handler(shutdown_token.clone());
+
+        let exit_code = backfill::run_backfill(
+            config,
+            cli_args.backfill_from,
+            cli_args.backfill_logs,
+            shutdown_token,
+        )
+        .await;
+
+        std::process::exit(exit_code);
     }
 
     tracing_subscriber::fmt()
