@@ -1582,7 +1582,9 @@ mod tests {
 
         let fetcher3 = tokio::spawn(async move {
             // Fetcher 3: fails with connection refused error (simulating unreachable log)
-            let _: Result<u64, String> = Err("connection refused".to_string());
+            // Must take ownership of tx3 so it's dropped when this task completes,
+            // allowing the channel to close once all senders are gone.
+            drop(tx3);
             Err::<u64, String>("connection refused".to_string())
         });
 
