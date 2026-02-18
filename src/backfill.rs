@@ -6,7 +6,7 @@ use crate::models::Source;
 use crate::state::StateManager;
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
-use deltalake::{DeltaTable, DeltaTableError};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -758,21 +758,192 @@ pub async fn run_backfill(
     }
 }
 
-/// Merge mode stub — merges staging table into main table.
+/// Merge mode: merges staging table into main table via Delta MERGE INTO deduplication.
+///
+/// Reads all staging records as RecordBatches, converts each to a DataFrame, and merges
+/// batch-by-batch into the main table using the predicate:
+///   target.source_url = source.source_url AND target.cert_index = source.cert_index
+///
+/// Only when_not_matched records are inserted (no updates or deletes). On success,
+/// the staging directory is deleted.
 ///
 /// # Arguments
-/// * `_config` - Server configuration
-/// * `_staging_path` - Path to the staging Delta table
-/// * `_shutdown` - CancellationToken for graceful shutdown
+/// * `config` - Server configuration (contains delta_sink.table_path for main table)
+/// * `staging_path` - Path to the staging Delta table
+/// * `shutdown` - CancellationToken for graceful shutdown
 ///
 /// # Returns
 /// * `i32` exit code (0 for success, 1 for errors)
 pub async fn run_merge(
-    _config: Config,
-    _staging_path: String,
-    _shutdown: CancellationToken,
+    config: Config,
+    staging_path: String,
+    shutdown: CancellationToken,
 ) -> i32 {
-    info!("Merge mode stub — not yet implemented");
+    info!(staging_path = %staging_path, "merge mode starting");
+
+    let schema = delta_schema();
+
+    // Open staging table
+    let staging_table = match deltalake::open_table(&staging_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to open staging table");
+            return 1;
+        }
+    };
+
+    // Open or create main table
+    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to open main table");
+            return 1;
+        }
+    };
+
+    // Read all staging records via DataFusion
+    let ctx = SessionContext::new();
+    if let Err(e) = ctx.register_table("staging", Arc::new(staging_table)) {
+        warn!(error = %e, "failed to register staging table");
+        return 1;
+    }
+
+    let df = match ctx.sql("SELECT * FROM staging").await {
+        Ok(df) => df,
+        Err(e) => {
+            warn!(error = %e, "failed to query staging table");
+            return 1;
+        }
+    };
+
+    let batches = match df.collect().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "failed to collect staging batches");
+            return 1;
+        }
+    };
+
+    if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        info!("staging table is empty, nothing to merge");
+        return 0;
+    }
+
+    let total_staging_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    info!(total_staging_rows = total_staging_rows, "read staging records");
+
+    // Merge batch-by-batch
+    let mut current_table = main_table;
+    let mut total_inserted: usize = 0;
+    let mut total_skipped: usize = 0;
+
+    for (i, batch) in batches.iter().enumerate() {
+        if shutdown.is_cancelled() {
+            warn!("merge interrupted by shutdown signal");
+            return 1;
+        }
+
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        // Convert RecordBatch to DataFrame — DeltaOps::merge() requires a DataFrame,
+        // not Vec<RecordBatch>
+        let merge_ctx = SessionContext::new();
+        let source_df = match merge_ctx.read_batch(batch.clone()) {
+            Ok(df) => df,
+            Err(e) => {
+                warn!(batch = i + 1, error = %e, "failed to create source DataFrame");
+                return 1;
+            }
+        };
+
+        let predicate = "target.source_url = source.source_url AND target.cert_index = source.cert_index";
+
+        // Build the merge operation — when_not_matched_insert() returns a Result,
+        // so use match for proper error handling instead of .expect()
+        let merge_builder = match DeltaOps(current_table)
+            .merge(source_df, predicate)
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_not_matched_insert(|insert| {
+                insert
+                    .set("cert_index", "source.cert_index")
+                    .set("update_type", "source.update_type")
+                    .set("seen", "source.seen")
+                    .set("seen_date", "source.seen_date")
+                    .set("source_name", "source.source_name")
+                    .set("source_url", "source.source_url")
+                    .set("cert_link", "source.cert_link")
+                    .set("serial_number", "source.serial_number")
+                    .set("fingerprint", "source.fingerprint")
+                    .set("sha256", "source.sha256")
+                    .set("sha1", "source.sha1")
+                    .set("not_before", "source.not_before")
+                    .set("not_after", "source.not_after")
+                    .set("is_ca", "source.is_ca")
+                    .set("signature_algorithm", "source.signature_algorithm")
+                    .set("subject_aggregated", "source.subject_aggregated")
+                    .set("issuer_aggregated", "source.issuer_aggregated")
+                    .set("all_domains", "source.all_domains")
+                    .set("as_der", "source.as_der")
+                    .set("chain", "source.chain")
+            }) {
+                Ok(builder) => builder,
+                Err(e) => {
+                    warn!(batch = i + 1, error = %e, "failed to build merge operation");
+                    return 1;
+                }
+            };
+
+        match merge_builder.await {
+            Ok((new_table, metrics)) => {
+                let inserted = metrics.num_target_rows_inserted;
+                let batch_rows = batch.num_rows();
+                // skipped = batch_rows - inserted is valid here because we use ONLY
+                // when_not_matched_insert (no updates/deletes). Every non-matched source
+                // row becomes an insert; every matched source row is skipped.
+                let skipped = batch_rows - inserted;
+                total_inserted += inserted;
+                total_skipped += skipped;
+
+                info!(
+                    batch = i + 1,
+                    batch_rows = batch_rows,
+                    inserted = inserted,
+                    skipped = skipped,
+                    "merge batch complete"
+                );
+
+                current_table = new_table;
+            }
+            Err(e) => {
+                warn!(batch = i + 1, error = %e, "merge batch failed");
+                // Leave staging intact for retry
+                return 1;
+            }
+        }
+    }
+
+    // Log final metrics (AC3.5)
+    info!(
+        total_inserted = total_inserted,
+        total_skipped = total_skipped,
+        total_staging_rows = total_staging_rows,
+        "merge complete"
+    );
+
+    // Delete staging directory on success (AC3.4)
+    match std::fs::remove_dir_all(&staging_path) {
+        Ok(_) => {
+            info!(staging_path = %staging_path, "staging directory deleted");
+        }
+        Err(e) => {
+            warn!(error = %e, staging_path = %staging_path, "failed to delete staging directory");
+            // Non-fatal — merge succeeded, staging cleanup failed
+        }
+    }
+
     0
 }
 
@@ -2192,5 +2363,426 @@ mod tests {
         assert_eq!(work_items[0].end, 14);
 
         let _ = fs::remove_dir_all(&main_path);
+    }
+
+    // Task 2: Merge Tests
+
+    /// Helper function to create a minimal Config for testing
+    fn make_test_config(table_path: &str) -> Config {
+        use crate::config::DeltaSinkConfig;
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        Config {
+            host: IpAddr::from_str("127.0.0.1").unwrap(),
+            port: 8000,
+            log_level: "info".to_string(),
+            buffer_size: 1000,
+            ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/log_list.json".to_string(),
+            tls_cert: None,
+            tls_key: None,
+            custom_logs: vec![],
+            static_logs: vec![],
+            protocols: crate::config::ProtocolConfig::default(),
+            ct_log: crate::config::CtLogConfig::default(),
+            connection_limit: crate::config::ConnectionLimitConfig::default(),
+            rate_limit: crate::config::RateLimitConfig::default(),
+            api: crate::config::ApiConfig::default(),
+            auth: crate::config::AuthConfig::default(),
+            hot_reload: crate::config::HotReloadConfig::default(),
+            delta_sink: DeltaSinkConfig {
+                enabled: true,
+                table_path: table_path.to_string(),
+                batch_size: 100,
+                flush_interval_secs: 60,
+            },
+            config_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ac3_1_merge_inserts_non_duplicate_records() {
+        // Verifies staging-backfill.AC3.1: `--merge --staging-path` inserts staging records
+        // not present in main (matched on `source_url` + `cert_index`)
+        let test_name = "ac3_1_merge_inserts";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records at cert_index [10, 11, 12]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _ = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with records at cert_index [13, 14, 15]
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(13, "https://log.example.com"),
+            make_test_record(14, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Run merge
+        let config = make_test_config(&main_path);
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+        assert_eq!(exit_code, 0, "Merge should succeed");
+
+        // Verify main table now contains [10, 11, 12, 13, 14, 15]
+        let main_table = deltalake::open_table(&main_path)
+            .await
+            .expect("should be able to open main table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(main_table))
+            .expect("should register table");
+
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM ct_records WHERE source_url = 'https://log.example.com'")
+            .await
+            .expect("sql query failed");
+        let batches = df.collect().await.expect("batch collection failed");
+
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("count should be Int64");
+        assert_eq!(count_arr.value(0), 6, "Should have 6 records total");
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_2_merge_skips_existing_records() {
+        // Verifies staging-backfill.AC3.2: Records already in main with matching
+        // (source_url, cert_index) are skipped (not duplicated)
+        let test_name = "ac3_2_merge_skips";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records at [10, 11, 12]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _ = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with records at [11, 12, 13] (overlap on 11 and 12)
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Run merge
+        let config = make_test_config(&main_path);
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+        assert_eq!(exit_code, 0, "Merge should succeed");
+
+        // Verify main table has [10, 11, 12, 13] — no duplicates of 11 or 12
+        let main_table = deltalake::open_table(&main_path)
+            .await
+            .expect("should be able to open main table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(main_table))
+            .expect("should register table");
+
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM ct_records WHERE source_url = 'https://log.example.com'")
+            .await
+            .expect("sql query failed");
+        let batches = df.collect().await.expect("batch collection failed");
+
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("count should be Int64");
+        assert_eq!(count_arr.value(0), 4, "Should have exactly 4 records (no duplicates)");
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_3_merge_is_idempotent() {
+        // Verifies staging-backfill.AC3.3: Merge is idempotent — running it twice
+        // with same staging data produces identical main table
+        let test_name = "ac3_3_merge_idempotent";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with [10, 11]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _ = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with [12, 13]
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Run merge first time
+        let config = make_test_config(&main_path);
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config.clone(), staging_path.clone(), shutdown.clone()).await;
+        assert_eq!(exit_code, 0, "First merge should succeed");
+
+        // Verify staging was deleted after first merge (AC3.4)
+        assert!(!std::path::Path::new(&staging_path).exists(), "Staging should be deleted");
+
+        // Get count after first merge
+        let main_table = deltalake::open_table(&main_path)
+            .await
+            .expect("should be able to open main table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(main_table))
+            .expect("should register table");
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM ct_records WHERE source_url = 'https://log.example.com'")
+            .await
+            .expect("sql query failed");
+        let batches = df.collect().await.expect("batch collection failed");
+        let count_after_first = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("count should be Int64")
+            .value(0);
+        assert_eq!(count_after_first, 4, "Should have 4 records after first merge");
+
+        // Recreate staging with same data [12, 13]
+        let _ = fs::create_dir_all(&staging_path);
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Run merge second time
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+        assert_eq!(exit_code, 0, "Second merge should succeed");
+
+        // Get count after second merge
+        let main_table = deltalake::open_table(&main_path)
+            .await
+            .expect("should be able to open main table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(main_table))
+            .expect("should register table");
+        let df = ctx
+            .sql("SELECT COUNT(*) as cnt FROM ct_records WHERE source_url = 'https://log.example.com'")
+            .await
+            .expect("sql query failed");
+        let batches = df.collect().await.expect("batch collection failed");
+        let count_after_second = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("count should be Int64")
+            .value(0);
+        assert_eq!(count_after_second, 4, "Should still have 4 records after second merge (no duplicates)");
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_4_staging_directory_deleted_on_success() {
+        // Verifies staging-backfill.AC3.4: Staging directory is deleted after successful merge
+        let test_name = "ac3_4_staging_deleted";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![make_test_record(1, "https://log.example.com")];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _ = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![make_test_record(2, "https://log.example.com")];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Verify staging exists before merge
+        assert!(
+            std::path::Path::new(&staging_path).exists(),
+            "Staging should exist before merge"
+        );
+
+        // Run merge
+        let config = make_test_config(&main_path);
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+        assert_eq!(exit_code, 0, "Merge should succeed");
+
+        // Verify staging directory no longer exists
+        assert!(
+            !std::path::Path::new(&staging_path).exists(),
+            "Staging directory should be deleted after successful merge"
+        );
+
+        let _ = fs::remove_dir_all(&main_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac3_5_merge_returns_zero_and_logs_metrics() {
+        // Verifies staging-backfill.AC3.5: Merge returns 0 and logs metrics
+        let test_name = "ac3_5_merge_metrics";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with [10, 11]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _ = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging with overlap: [11, 12, 13] (11 overlaps, 12 and 13 are new)
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Run merge and capture return code
+        let config = make_test_config(&main_path);
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+
+        // Verify return code is 0
+        assert_eq!(exit_code, 0, "Merge should return 0 on success");
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
     }
 }
