@@ -9,6 +9,8 @@ use deltalake::datafusion::prelude::*;
 use deltalake::DeltaTableError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::config::QueryApiConfig;
@@ -182,10 +184,14 @@ async fn handle_query_certs(
     State(state): State<Arc<QueryApiState>>,
     Query(params): Query<QueryParams>,
 ) -> impl IntoResponse {
+    let start = Instant::now();
+
     // Validate at least one filter is provided
     if params.domain.is_none() && params.issuer.is_none()
         && params.from.is_none() && params.to.is_none()
     {
+        metrics::counter!("certstream_query_requests", "status" => "400").increment(1);
+        metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse { error: "At least one filter required".to_string() }),
@@ -200,6 +206,8 @@ async fn handle_query_certs(
     // Validate date parameters before embedding in SQL
     if let Some(ref from) = params.from {
         if !is_valid_date(from) {
+            metrics::counter!("certstream_query_requests", "status" => "400").increment(1);
+            metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse { error: "Invalid 'from' date format, expected YYYY-MM-DD".to_string() }),
@@ -208,6 +216,8 @@ async fn handle_query_certs(
     }
     if let Some(ref to) = params.to {
         if !is_valid_date(to) {
+            metrics::counter!("certstream_query_requests", "status" => "400").increment(1);
+            metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse { error: "Invalid 'to' date format, expected YYYY-MM-DD".to_string() }),
@@ -228,6 +238,8 @@ async fn handle_query_certs(
                     Err(e) => {
                         // Vacuumed or missing version → 410 Gone
                         warn!(version = cursor.v, error = %e, "Failed to open table at cursor version");
+                        metrics::counter!("certstream_query_requests", "status" => "410").increment(1);
+                        metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                         return (
                             StatusCode::GONE,
                             Json(ErrorResponse { error: "Cursor expired, please restart query".to_string() }),
@@ -236,6 +248,8 @@ async fn handle_query_certs(
                 }
             }
             Err(_) => {
+                metrics::counter!("certstream_query_requests", "status" => "400").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse { error: "Invalid cursor".to_string() }),
@@ -250,6 +264,8 @@ async fn handle_query_certs(
                 (t, v, None)
             }
             Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
+                metrics::counter!("certstream_query_requests", "status" => "503").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(ErrorResponse { error: "Query service unavailable".to_string() }),
@@ -257,6 +273,8 @@ async fn handle_query_certs(
             }
             Err(e) => {
                 warn!(error = %e, "Failed to open delta table for query");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -269,6 +287,8 @@ async fn handle_query_certs(
     let ctx = SessionContext::new();
     if let Err(e) = ctx.register_table("ct_records", Arc::new(table)) {
         warn!(error = %e, "Failed to register table");
+        metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+        metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -348,25 +368,30 @@ async fn handle_query_certs(
     let fetch_limit = limit + 1;
     sql.push_str(&format!(" ORDER BY cert_index LIMIT {}", fetch_limit));
 
-    // Execute the query
-    let df = match ctx.sql(&sql).await {
-        Ok(df) => df,
-        Err(e) => {
-            warn!(error = %e, "Failed to execute query");
+    // Execute the query with timeout protection
+    let timeout_duration = Duration::from_secs(state.config.query_timeout_secs);
+
+    let batches = match timeout(timeout_duration, async {
+        let df = ctx.sql(&sql).await?;
+        df.collect().await
+    }).await {
+        Ok(Ok(batches)) => batches,
+        Ok(Err(e)) => {
+            warn!(error = %e, "DataFusion query execution error");
+            metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+            metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: "Internal query error".to_string() }),
             ).into_response();
         }
-    };
-
-    let batches = match df.collect().await {
-        Ok(batches) => batches,
-        Err(e) => {
-            warn!(error = %e, "Failed to collect query results");
+        Err(_elapsed) => {
+            warn!("Query timed out after {}s", state.config.query_timeout_secs);
+            metrics::counter!("certstream_query_requests", "status" => "504").increment(1);
+            metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: "Internal query error".to_string() }),
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResponse { error: "Query timed out".to_string() }),
             ).into_response();
         }
     };
@@ -380,6 +405,8 @@ async fn handle_query_certs(
 
         if cert_indices_uint.is_none() && cert_indices_int.is_none() {
             warn!("Failed to downcast cert_index column");
+            metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+            metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -390,6 +417,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast fingerprint column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -401,6 +430,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast sha256 column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -412,6 +443,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast serial_number column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -423,6 +456,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast subject column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -434,6 +469,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast issuer column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -445,6 +482,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast not_before column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -456,6 +495,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast not_after column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -467,6 +508,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast all_domains column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -478,6 +521,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast source_name column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -489,6 +534,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast seen column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -500,6 +547,8 @@ async fn handle_query_certs(
             Some(arr) => arr,
             None => {
                 warn!("Failed to downcast is_ca column");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse { error: "Internal query error".to_string() }),
@@ -561,6 +610,12 @@ async fn handle_query_certs(
     } else {
         None
     };
+
+    // Record metrics for successful response
+    let results_count = results.len() as f64;
+    metrics::counter!("certstream_query_requests", "status" => "200").increment(1);
+    metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
+    metrics::histogram!("certstream_query_results_count").record(results_count);
 
     Json(QueryResponse {
         version,
