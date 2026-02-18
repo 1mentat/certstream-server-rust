@@ -3008,4 +3008,197 @@ mod tests {
             "--merge without --staging-path should be detected"
         );
     }
+
+    #[tokio::test]
+    async fn test_ac1_2_records_in_staging_not_in_main() {
+        // Verifies staging-backfill.AC1.2: Records written to staging table are NOT present in main table.
+        // Creates both main and staging directories, runs writer targeting staging,
+        // verifies: (a) staging has records queryable via DataFusion, (b) main table is empty or has zero rows.
+        let test_name = "ac1_2_staging_not_in_main";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create an empty main table
+        let _ = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+
+        // Now run writer targeting staging_path (not main_path)
+        let (tx, rx) = mpsc::channel::<DeltaCertRecord>(10);
+        let shutdown = CancellationToken::new();
+
+        let staging_path_clone = staging_path.clone();
+        let writer_handle = tokio::spawn(async move {
+            run_writer(staging_path_clone, 3, 60, rx, shutdown).await
+        });
+
+        // Send records to staging
+        let record1 = make_test_record(1, "https://log.example.com");
+        let record2 = make_test_record(2, "https://log.example.com");
+        let record3 = make_test_record(3, "https://log.example.com");
+        let record4 = make_test_record(4, "https://log.example.com");
+
+        tx.send(record1).await.expect("send failed");
+        tx.send(record2).await.expect("send failed");
+        tx.send(record3).await.expect("send failed"); // Triggers batch flush (3 records)
+        tx.send(record4).await.expect("send failed"); // Will be flushed on channel close
+        drop(tx);
+
+        let result = writer_handle.await.expect("writer task failed");
+        assert_eq!(result.total_records_written, 4, "Writer should have written 4 records to staging");
+        assert_eq!(result.write_errors, 0, "Writer should have no errors");
+
+        // Verify: staging table has 4 records queryable via DataFusion
+        let staging_table = deltalake::open_table(&staging_path)
+            .await
+            .expect("staging table should exist after writer finishes");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_staging", Arc::new(staging_table))
+            .expect("staging table registration failed");
+
+        let sql = "SELECT COUNT(*) as cnt FROM ct_staging WHERE source_url = 'https://log.example.com'";
+        let df = ctx.sql(sql).await.expect("sql query failed");
+        let batches = df.collect().await.expect("batch collection failed");
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("count column should be Int64");
+        assert_eq!(
+            count_arr.value(0), 4,
+            "Staging table should have exactly 4 records"
+        );
+
+        // Verify: main table has zero rows (writer did NOT write to main)
+        let main_table = deltalake::open_table(&main_path)
+            .await
+            .expect("main table should exist");
+        let ctx_main = SessionContext::new();
+        ctx_main.register_table("ct_main", Arc::new(main_table))
+            .expect("main table registration failed");
+
+        let sql_main = "SELECT COUNT(*) as cnt FROM ct_main";
+        let df_main = ctx_main.sql(sql_main).await.expect("main sql query failed");
+        let batches_main = df_main.collect().await.expect("main batch collection failed");
+        let count_arr_main = batches_main[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("main count column should be Int64");
+        assert_eq!(
+            count_arr_main.value(0), 0,
+            "Main table should have zero records (writer targeted staging only)"
+        );
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_3_gap_detection_with_staging_catch_up_and_historical() {
+        // Verifies staging-backfill.AC1.3: Gap detection works with both catch-up and historical modes with staging.
+        // Tests detect_gaps() called with staging_path in BOTH catch-up (backfill_from=None)
+        // and historical (backfill_from=Some(0)) modes, asserting correct work items are generated.
+        let test_name = "ac1_3_gap_detection_both_modes";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records [10, 11, 15, 16]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+            make_test_record(16, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _main_table = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with records [12, 13]
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _staging_table = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // TEST 1: Catch-up mode (backfill_from = None) with staging
+        // Gap detection should see union of main [10, 11, 15, 16] and staging [12, 13]
+        // Data combined: [10, 11, 12, 13, 15, 16]
+        // Gap: [14] (index 14 is missing)
+        let logs = vec![("https://log.example.com".to_string(), 20)];
+        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+            .await
+            .expect("detect_gaps catch-up failed");
+
+        assert_eq!(
+            work_items_catchup.len(), 1,
+            "Catch-up mode with staging should detect gap [14, 14]"
+        );
+        assert_eq!(
+            work_items_catchup[0].start, 14,
+            "Catch-up mode gap should start at 14"
+        );
+        assert_eq!(
+            work_items_catchup[0].end, 14,
+            "Catch-up mode gap should end at 14"
+        );
+
+        // TEST 2: Historical mode (backfill_from = Some(0)) with staging
+        // Should start from 0 (--from 0) and fill to ceiling=20
+        // Data union: [10, 11, 12, 13, 15, 16]
+        // Gaps: [0-9] (pre-existing), [14] (internal)
+        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0))
+            .await
+            .expect("detect_gaps historical failed");
+
+        assert_eq!(
+            work_items_historical.len(), 2,
+            "Historical mode with staging should detect both pre-existing gap [0-9] and internal gap [14]"
+        );
+
+        // First work item should be pre-existing gap [0, 9]
+        let pre_existing = work_items_historical.iter().find(|item| item.start == 0);
+        assert!(pre_existing.is_some(), "Should detect pre-existing gap starting at 0");
+        assert_eq!(
+            pre_existing.unwrap().end, 9,
+            "Pre-existing gap should end at 9"
+        );
+
+        // Second work item should be internal gap [14, 14]
+        let internal_gap = work_items_historical.iter().find(|item| item.start == 14);
+        assert!(internal_gap.is_some(), "Should detect internal gap starting at 14");
+        assert_eq!(
+            internal_gap.unwrap().end, 14,
+            "Internal gap should end at 14"
+        );
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
 }
