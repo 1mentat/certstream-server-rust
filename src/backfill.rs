@@ -178,7 +178,7 @@ async fn find_internal_gaps(
 ///
 /// # Arguments
 /// * `table_path` - Path to the delta table
-/// * `logs` - Vec of (source_url, tree_size) pairs for active logs
+/// * `logs` - Vec of (source_url, ceiling) pairs for active logs
 /// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
 ///
 /// # Returns
@@ -201,12 +201,12 @@ pub async fn detect_gaps(
                 Some(from) => {
                     // Historical mode: backfill entire range for all logs
                     let mut work_items = Vec::new();
-                    for (source_url, tree_size) in logs {
-                        if *tree_size > from {
+                    for (source_url, ceiling) in logs {
+                        if *ceiling > from {
                             work_items.push(BackfillWorkItem {
                                 source_url: source_url.clone(),
                                 start: from,
-                                end: tree_size - 1,
+                                end: ceiling - 1,
                             });
                         }
                     }
@@ -226,7 +226,7 @@ pub async fn detect_gaps(
 
     let mut work_items = Vec::new();
 
-    for (source_url, tree_size) in logs {
+    for (source_url, ceiling) in logs {
         match backfill_from {
             None => {
                 // Catch-up mode
@@ -252,15 +252,6 @@ pub async fn detect_gaps(
                                 warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
                             }
                         }
-                    }
-
-                    // Check for frontier gap
-                    if state.max_index + 1 < *tree_size {
-                        work_items.push(BackfillWorkItem {
-                            source_url: source_url.clone(),
-                            start: state.max_index + 1,
-                            end: tree_size - 1,
-                        });
                     }
                 }
                 // If log not in delta, skip (AC2.4)
@@ -297,22 +288,13 @@ pub async fn detect_gaps(
                             }
                         }
                     }
-
-                    // Frontier gap
-                    if state.max_index + 1 < *tree_size {
-                        work_items.push(BackfillWorkItem {
-                            source_url: source_url.clone(),
-                            start: state.max_index + 1,
-                            end: tree_size - 1,
-                        });
-                    }
                 } else {
                     // Log not in delta: backfill entire range
-                    if *tree_size > from {
+                    if *ceiling > from {
                         work_items.push(BackfillWorkItem {
                             source_url: source_url.clone(),
                             start: from,
-                            end: tree_size - 1,
+                            end: ceiling - 1,
                         });
                     }
                 }
