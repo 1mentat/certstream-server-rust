@@ -229,22 +229,7 @@ fn parse_one_leaf(data: &[u8], offset: &mut usize) -> Option<TileLeaf> {
         cert_der = data[*offset..*offset + precert_len].to_vec();
         *offset += precert_len;
 
-        if *offset + 2 > data.len() {
-            return None;
-        }
-        let chain_count = u16::from_be_bytes(data[*offset..*offset + 2].try_into().ok()?) as usize;
-        *offset += 2;
-
-        let mut chain_fingerprints = Vec::with_capacity(chain_count);
-        for _ in 0..chain_count {
-            if *offset + 32 > data.len() {
-                return None;
-            }
-            let mut fp = [0u8; 32];
-            fp.copy_from_slice(&data[*offset..*offset + 32]);
-            chain_fingerprints.push(fp);
-            *offset += 32;
-        }
+        let chain_fingerprints = read_chain_fingerprints(data, offset)?;
 
         return Some(TileLeaf {
             timestamp,
@@ -267,22 +252,7 @@ fn parse_one_leaf(data: &[u8], offset: &mut usize) -> Option<TileLeaf> {
     }
     *offset += ext_len;
 
-    if *offset + 2 > data.len() {
-        return None;
-    }
-    let chain_count = u16::from_be_bytes(data[*offset..*offset + 2].try_into().ok()?) as usize;
-    *offset += 2;
-
-    let mut chain_fingerprints = Vec::with_capacity(chain_count);
-    for _ in 0..chain_count {
-        if *offset + 32 > data.len() {
-            return None;
-        }
-        let mut fp = [0u8; 32];
-        fp.copy_from_slice(&data[*offset..*offset + 32]);
-        chain_fingerprints.push(fp);
-        *offset += 32;
-    }
+    let chain_fingerprints = read_chain_fingerprints(data, offset)?;
 
     Some(TileLeaf {
         timestamp,
@@ -291,6 +261,37 @@ fn parse_one_leaf(data: &[u8], offset: &mut usize) -> Option<TileLeaf> {
         is_precert,
         chain_fingerprints,
     })
+}
+
+/// Read TLS-encoded chain fingerprints: uint16 byte-length prefix followed by 32-byte fingerprints.
+///
+/// Per the Static CT API spec, `Fingerprint certificate_chain<0..2^16-1>` uses TLS vector
+/// encoding where the uint16 prefix is the total byte length, not a count of fingerprints.
+/// See: https://github.com/C2SP/C2SP/blob/main/static-ct-api.md
+fn read_chain_fingerprints(data: &[u8], offset: &mut usize) -> Option<Vec<[u8; 32]>> {
+    if *offset + 2 > data.len() {
+        return None;
+    }
+    let chain_bytes = u16::from_be_bytes(data[*offset..*offset + 2].try_into().ok()?) as usize;
+    *offset += 2;
+
+    if chain_bytes % 32 != 0 {
+        return None;
+    }
+    if *offset + chain_bytes > data.len() {
+        return None;
+    }
+
+    let chain_count = chain_bytes / 32;
+    let mut chain_fingerprints = Vec::with_capacity(chain_count);
+    for _ in 0..chain_count {
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(&data[*offset..*offset + 32]);
+        chain_fingerprints.push(fp);
+        *offset += 32;
+    }
+
+    Some(chain_fingerprints)
 }
 
 fn read_u24(data: &[u8], offset: usize) -> Option<usize> {
@@ -711,8 +712,8 @@ mod tests {
         data.extend_from_slice(cert_der);
         // 2 bytes extensions length = 0
         data.extend_from_slice(&0u16.to_be_bytes());
-        // 2 bytes chain count
-        data.extend_from_slice(&(chain_fps.len() as u16).to_be_bytes());
+        // 2 bytes chain byte-length (TLS vector: uint16 total bytes, not count)
+        data.extend_from_slice(&((chain_fps.len() * 32) as u16).to_be_bytes());
         // chain fingerprints
         for fp in chain_fps {
             data.extend_from_slice(fp);
@@ -751,8 +752,8 @@ mod tests {
         data.push(precert_len as u8);
         // pre-certificate DER
         data.extend_from_slice(precert_der);
-        // 2 bytes chain count
-        data.extend_from_slice(&(chain_fps.len() as u16).to_be_bytes());
+        // 2 bytes chain byte-length (TLS vector: uint16 total bytes, not count)
+        data.extend_from_slice(&((chain_fps.len() * 32) as u16).to_be_bytes());
         // chain fingerprints
         for fp in chain_fps {
             data.extend_from_slice(fp);
@@ -853,6 +854,84 @@ mod tests {
         let leaves = parse_tile_leaves(&data);
         assert_eq!(leaves.len(), 1);
         assert!(leaves[0].chain_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tile_leaves_multiple_with_chains() {
+        // This is the exact scenario that was broken: multiple entries with chain
+        // fingerprints. The old parser treated the uint16 chain field as a count
+        // instead of byte-length, so the second entry's chain_bytes=32 was
+        // misinterpreted as count=32, trying to read 32*32=1024 bytes and failing.
+        let mut data = Vec::new();
+        data.extend_from_slice(&build_x509_entry(1000, b"cert1", &[[0xaa; 32]]));
+        data.extend_from_slice(&build_x509_entry(2000, b"cert2", &[[0xbb; 32], [0xcc; 32]]));
+        data.extend_from_slice(&build_precert_entry(3000, &[0x11; 32], b"tbs", b"precert", &[[0xdd; 32]]));
+
+        let leaves = parse_tile_leaves(&data);
+        assert_eq!(leaves.len(), 3, "all three entries should parse successfully");
+
+        assert_eq!(leaves[0].timestamp, 1000);
+        assert_eq!(leaves[0].chain_fingerprints.len(), 1);
+        assert_eq!(leaves[0].chain_fingerprints[0], [0xaa; 32]);
+
+        assert_eq!(leaves[1].timestamp, 2000);
+        assert_eq!(leaves[1].chain_fingerprints.len(), 2);
+        assert_eq!(leaves[1].chain_fingerprints[0], [0xbb; 32]);
+        assert_eq!(leaves[1].chain_fingerprints[1], [0xcc; 32]);
+
+        assert_eq!(leaves[2].timestamp, 3000);
+        assert!(leaves[2].is_precert);
+        assert_eq!(leaves[2].chain_fingerprints.len(), 1);
+        assert_eq!(leaves[2].chain_fingerprints[0], [0xdd; 32]);
+    }
+
+    #[test]
+    fn test_chain_byte_length_not_count() {
+        // Directly verify the byte-length encoding: manually build an entry where
+        // the uint16 field is the byte-length (64 = 2 fingerprints * 32 bytes),
+        // NOT the count (2). The old buggy parser would read 64 as a count and
+        // try to read 64 * 32 = 2048 bytes.
+        let mut data = Vec::new();
+        // timestamp
+        data.extend_from_slice(&1000u64.to_be_bytes());
+        // entry_type = 0 (x509)
+        data.extend_from_slice(&0u16.to_be_bytes());
+        // cert length (3 bytes) + cert
+        let cert = b"test";
+        data.push(0);
+        data.push(0);
+        data.push(cert.len() as u8);
+        data.extend_from_slice(cert);
+        // extensions length = 0
+        data.extend_from_slice(&0u16.to_be_bytes());
+        // chain byte-length = 64 (2 fingerprints * 32 bytes)
+        data.extend_from_slice(&64u16.to_be_bytes());
+        // 2 fingerprints
+        data.extend_from_slice(&[0xaa; 32]);
+        data.extend_from_slice(&[0xbb; 32]);
+
+        let leaves = parse_tile_leaves(&data);
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].chain_fingerprints.len(), 2);
+    }
+
+    #[test]
+    fn test_chain_invalid_byte_length_not_multiple_of_32() {
+        // A chain byte-length that isn't a multiple of 32 should fail gracefully
+        let mut data = Vec::new();
+        data.extend_from_slice(&1000u64.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        let cert = b"test";
+        data.push(0);
+        data.push(0);
+        data.push(cert.len() as u8);
+        data.extend_from_slice(cert);
+        data.extend_from_slice(&0u16.to_be_bytes()); // extensions
+        data.extend_from_slice(&33u16.to_be_bytes()); // invalid: not multiple of 32
+        data.extend_from_slice(&[0; 33]);
+
+        let leaves = parse_tile_leaves(&data);
+        assert!(leaves.is_empty(), "should reject non-multiple-of-32 chain length");
     }
 
     #[test]
