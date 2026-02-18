@@ -48,37 +48,6 @@ enum DomainSearchMode {
     Exact(String),
 }
 
-/// Result of attempting to decode and open a cursor.
-/// This helper is used for testing cursor validation independently of the full handler.
-#[allow(dead_code)]
-#[derive(Debug)]
-enum CursorDecodeResult {
-    /// Cursor was valid and table was successfully opened
-    Success(i64), // version
-    /// Cursor decode failed (invalid Base64 or JSON)
-    InvalidCursor,
-    /// Table open at cursor version failed (expired cursor)
-    ExpiredCursor,
-}
-
-/// Helper function to decode a cursor string and attempt to open the table at that version.
-/// Returns CursorDecodeResult which maps to the appropriate HTTP status code.
-/// This separates cursor validation logic for better testability.
-#[allow(dead_code)]
-async fn validate_and_open_cursor(
-    cursor_str: &str,
-    table_path: &str,
-) -> CursorDecodeResult {
-    match decode_cursor(cursor_str) {
-        Ok(cursor) => {
-            match deltalake::open_table_with_version(table_path, cursor.v).await {
-                Ok(table) => CursorDecodeResult::Success(table.version()),
-                Err(_) => CursorDecodeResult::ExpiredCursor,
-            }
-        }
-        Err(_) => CursorDecodeResult::InvalidCursor,
-    }
-}
 
 pub struct QueryApiState {
     pub config: QueryApiConfig,
@@ -634,6 +603,36 @@ mod tests {
     use deltalake::DeltaOps;
     use std::fs;
     use tower::ServiceExt;
+
+    /// Result of attempting to decode and open a cursor.
+    /// This helper is used for testing cursor validation independently of the full handler.
+    #[derive(Debug)]
+    enum CursorDecodeResult {
+        /// Cursor was valid and table was successfully opened
+        Success(i64), // version
+        /// Cursor decode failed (invalid Base64 or JSON)
+        InvalidCursor,
+        /// Table open at cursor version failed (expired cursor)
+        ExpiredCursor,
+    }
+
+    /// Helper function to decode a cursor string and attempt to open the table at that version.
+    /// Returns CursorDecodeResult which maps to the appropriate HTTP status code.
+    /// This separates cursor validation logic for better testability.
+    async fn validate_and_open_cursor(
+        cursor_str: &str,
+        table_path: &str,
+    ) -> CursorDecodeResult {
+        match decode_cursor(cursor_str) {
+            Ok(cursor) => {
+                match deltalake::open_table_with_version(table_path, cursor.v).await {
+                    Ok(table) => CursorDecodeResult::Success(table.version()),
+                    Err(_) => CursorDecodeResult::ExpiredCursor,
+                }
+            }
+            Err(_) => CursorDecodeResult::InvalidCursor,
+        }
+    }
 
     fn create_test_cert_record(
         cert_index: u64,
@@ -1873,5 +1872,74 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
 
         let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_cursor_returns_400() {
+        // Verify that an invalid Base64 cursor returns HTTP 400 (Bad Request) through the handler
+        let table_path = "/tmp/delta_query_test_invalid_cursor_handler";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create a valid table with at least one record
+        let records = vec![create_test_cert_record(1, "log1", "2026-02-15", vec!["example.com"])];
+        let schema = delta_schema();
+        let table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("create table");
+        let batch = records_to_batch(&records, &schema).expect("create batch");
+        DeltaOps(table).write(vec![batch]).await.expect("write");
+
+        // Config pointing to the valid table
+        let mut config = crate::config::QueryApiConfig::default();
+        config.enabled = true;
+        config.table_path = table_path.to_string();
+        config.query_timeout_secs = 30;
+
+        let state = Arc::new(QueryApiState { config });
+        let app = query_api_router(state);
+
+        // Request with invalid Base64 cursor
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/query/certs?domain=example.com&cursor=!!!invalid_base64!!!")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_handler_nonexistent_table_returns_503() {
+        // Verify that a nonexistent Delta table returns HTTP 503 (Service Unavailable) through the handler
+        let table_path = "/tmp/delta_query_test_handler_nonexistent/nonexistent";
+
+        // Config pointing to a table that will never exist
+        let mut config = crate::config::QueryApiConfig::default();
+        config.enabled = true;
+        config.table_path = table_path.to_string();
+        config.query_timeout_secs = 30;
+
+        let state = Arc::new(QueryApiState { config });
+        let app = query_api_router(state);
+
+        // Request with any filter to a nonexistent table
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/query/certs?domain=example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
