@@ -60,9 +60,14 @@ impl CliArgs {
         println!("    -h, --help           Print help information");
         println!();
         println!("BACKFILL OPTIONS:");
-        println!("    --backfill           Activate backfill mode");
+        println!("    --backfill           Activate backfill mode (requires state file)");
         println!("    --from <INDEX>       Override start index for all logs");
         println!("    --logs <FILTER>      Filter to specific logs by substring");
+        println!();
+        println!("    Backfill uses the state file (ct_log.state_file, default:");
+        println!("    certstream_state.json) as the per-log upper bound. Logs not");
+        println!("    present in the state file are skipped. Run the live server");
+        println!("    first to populate the state file.");
         println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
