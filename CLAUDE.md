@@ -68,10 +68,11 @@ The binary has two execution modes selected in main.rs:
 ## Backfill Contracts
 - **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring
 - **Entry point**: `backfill::run_backfill(config, backfill_from, backfill_logs, shutdown)` called from main, returns exit code (i32)
-- **Two modes**: catch-up (no `--from`, fills gaps from existing Delta data) and historical (`--from N`, backfills from index N to tree_size)
-- **Gap detection**: `detect_gaps(table_path, logs, backfill_from)` queries Delta table via DataFusion SQL, finds internal gaps (LEAD window function) and frontier gaps
-- **Catch-up rules**: only backfills logs already present in Delta table; logs not in table are skipped
-- **Historical rules**: backfills all logs from `--from` index; logs not in Delta get full range
+- **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
+- **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
+- **Gap detection**: `detect_gaps(table_path, logs, backfill_from)` queries Delta table via DataFusion SQL, finds internal gaps only (LEAD window function). The second element of the `logs` tuple is the ceiling (from state file `current_index`).
+- **Catch-up rules**: only backfills logs already present in Delta table; logs not in table are skipped; only internal gaps are filled (no frontier gaps)
+- **Historical rules**: backfills all logs from `--from` index to ceiling; logs not in Delta get full range from `--from` to ceiling
 - **Architecture**: mpsc channel from N fetcher tasks to 1 writer task; fetchers send `DeltaCertRecord`; writer flushes on batch_size, timer, channel close, or shutdown
 - **Fetcher retry**: rate-limit errors get exponential backoff (up to 10 retries, max 60s); HTTP/parse errors get up to 3 retries
 - **Writer reuses**: `delta_sink::flush_buffer()` and `delta_sink::open_or_create_table()` from the live sink
