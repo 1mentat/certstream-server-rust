@@ -786,6 +786,10 @@ pub async fn run_merge(
     // Open staging table
     let staging_table = match deltalake::open_table(&staging_path).await {
         Ok(t) => t,
+        Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
+            info!(staging_path = %staging_path, "staging table does not exist, nothing to merge");
+            return 0;
+        }
         Err(e) => {
             warn!(error = %e, "failed to open staging table");
             return 1;
