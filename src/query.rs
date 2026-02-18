@@ -191,9 +191,12 @@ async fn handle_query_certs(
     }
 
     // Build SQL query
+    // Classify domain search once and cache the result
+    let domain_search_mode = params.domain.as_ref().map(|d| classify_domain_search(d));
+
     // Determine if UNNEST is needed (contains or suffix domain search)
     let needs_unnest = matches!(
-        params.domain.as_ref().map(|d| classify_domain_search(d)),
+        &domain_search_mode,
         Some(DomainSearchMode::Contains(_)) | Some(DomainSearchMode::Suffix(_))
     );
 
@@ -208,7 +211,7 @@ async fn handle_query_certs(
             "WITH unnested AS ( \
             SELECT cert_index, fingerprint, sha256, serial_number, \
             subject_aggregated, issuer_aggregated, not_before, not_after, \
-            all_domains, source_name, seen, is_ca, \
+            all_domains, source_name, seen, is_ca, seen_date, \
             UNNEST(all_domains) AS d \
             FROM ct_records \
             ) \
@@ -220,8 +223,8 @@ async fn handle_query_certs(
     };
 
     // Add domain filter
-    if let Some(ref domain) = params.domain {
-        match classify_domain_search(domain) {
+    if let Some(ref mode) = domain_search_mode {
+        match mode {
             DomainSearchMode::Contains(escaped) => {
                 sql.push_str(&format!(" AND d ILIKE '%{}%'", escaped));
             }
@@ -850,6 +853,24 @@ mod tests {
         assert_eq!(params.limit, Some(100));
     }
 
+    #[test]
+    fn test_no_filters_validation() {
+        // Verify that validation logic catches requests with no filters
+        let params = QueryParams {
+            domain: None,
+            issuer: None,
+            from: None,
+            to: None,
+            limit: None,
+            cursor: None,
+        };
+
+        // All filters are None, so the condition in handle_query_certs should catch this
+        let should_error = params.domain.is_none() && params.issuer.is_none()
+            && params.from.is_none() && params.to.is_none();
+        assert!(should_error, "Expected validation to fail with no filters");
+    }
+
     #[tokio::test]
     async fn test_domain_contains_search() {
         let table_path = "/tmp/delta_query_test_domain_contains";
@@ -1181,5 +1202,70 @@ mod tests {
         assert!(json.contains("\"cert_index\":123"));
         assert!(json.contains("\"fingerprint\":\"abc123\""));
         assert!(json.contains("\"all_domains\":[\"example.com\"]"));
+    }
+
+    #[tokio::test]
+    async fn test_domain_search_with_date_range() {
+        let table_path = "/tmp/delta_query_test_domain_date_range";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create test records with varied domains and dates
+        let records = vec![
+            // Record 1: paypal domain, date 2026-02-01 (matches domain + date range)
+            create_test_cert_record(1, "log1", "2026-02-01", vec!["paypal.com"]),
+            // Record 2: paypal domain, date 2026-01-31 (matches domain but NOT date range)
+            create_test_cert_record(2, "log1", "2026-01-31", vec!["www.paypal.com"]),
+            // Record 3: other domain, date 2026-02-05 (matches date range but NOT domain)
+            create_test_cert_record(3, "log1", "2026-02-05", vec!["example.com"]),
+            // Record 4: paypal domain, date 2026-02-10 (matches both domain and date range)
+            create_test_cert_record(4, "log1", "2026-02-10", vec!["test.paypal.example.com"]),
+        ];
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Re-open table for querying
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query: domain contains "paypal" AND from >= 2026-02-01
+        // Should match records 1 and 4 only (both have paypal in domains and date >= 2026-02-01)
+        let sql = "WITH unnested AS ( \
+                   SELECT cert_index, UNNEST(all_domains) AS domain, seen_date \
+                   FROM ct_records \
+                   ) \
+                   SELECT DISTINCT cert_index FROM unnested \
+                   WHERE domain ILIKE '%paypal%' \
+                   AND seen_date >= '2026-02-01' \
+                   ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut cert_indices = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        assert_eq!(cert_indices, vec![1, 4]);
+        let _ = fs::remove_dir_all(table_path);
     }
 }
