@@ -3,6 +3,7 @@ use crate::ct::fetch;
 use crate::ct::{fetch_log_list, CtLog, LogType};
 use crate::delta_sink::{delta_schema, DeltaCertRecord, flush_buffer, open_or_create_table};
 use crate::models::Source;
+use crate::state::StateManager;
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
 use deltalake::{DeltaTable, DeltaTableError};
@@ -530,45 +531,32 @@ pub async fn run_backfill(
 
     info!(count = logs.len(), "backfilling logs");
 
-    // Step 2: Tree size discovery
-    let request_timeout = Duration::from_secs(config.ct_log.request_timeout_secs);
-    let mut log_tree_sizes = Vec::new();
+    // Step 2: State file ceiling lookup
+    let state_manager = StateManager::new(config.ct_log.state_file.clone());
+    let mut log_ceilings = Vec::new();
 
     for log in &logs {
-        let tree_size = match log.log_type {
-            LogType::Rfc6962 => match fetch::get_tree_size(&client, &log.normalized_url(), request_timeout).await {
-                Ok(size) => size,
-                Err(e) => {
-                    warn!(
-                        log = %log.description,
-                        error = %e,
-                        "failed to get tree size"
-                    );
-                    continue;
-                }
-            },
-            LogType::StaticCt => match fetch::get_checkpoint_tree_size(&client, &log.normalized_url(), request_timeout).await {
-                Ok(size) => size,
-                Err(e) => {
-                    warn!(
-                        log = %log.description,
-                        error = %e,
-                        "failed to get checkpoint tree size"
-                    );
-                    continue;
-                }
-            },
-        };
-        log_tree_sizes.push((log.normalized_url(), tree_size));
+        match state_manager.get_index(&log.normalized_url()) {
+            Some(ceiling) => {
+                log_ceilings.push((log.normalized_url(), ceiling));
+            }
+            None => {
+                warn!(
+                    log = %log.description,
+                    url = %log.normalized_url(),
+                    "log not in state file, skipping (no ceiling reference)"
+                );
+            }
+        }
     }
 
-    if log_tree_sizes.is_empty() {
-        warn!("no logs have valid tree sizes");
-        return 1;
+    if log_ceilings.is_empty() {
+        warn!("no logs have ceiling values from state file");
+        return 0;
     }
 
     // Step 3: Gap detection
-    let work_items = match detect_gaps(&config.delta_sink.table_path, &log_tree_sizes, backfill_from).await {
+    let work_items = match detect_gaps(&config.delta_sink.table_path, &log_ceilings, backfill_from).await {
         Ok(items) => items,
         Err(e) => {
             warn!("gap detection failed: {}", e);
