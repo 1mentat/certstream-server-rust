@@ -1958,4 +1958,239 @@ mod tests {
         // Clean up
         let _ = fs::remove_dir_all(&staging_path);
     }
+
+    #[tokio::test]
+    async fn test_ac2_1_union_all_excludes_entries_in_either_table() {
+        // Verifies staging-backfill.AC2.1: When staging table exists,
+        // gap detection queries both main and staging — entries present in
+        // either table are excluded from gap list
+        let test_name = "ac2_1_union_excludes";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records at indices [10, 11, 15, 16]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+            make_test_record(16, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _main_table = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with records at indices [12, 13]
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _staging_table = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Call detect_gaps with ceiling=20 and staging_path
+        let logs = vec![("https://log.example.com".to_string(), 20)];
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // Should detect only gap [14, 14] (index 14 is missing from both tables)
+        assert_eq!(work_items.len(), 1, "Should detect only gap [14, 14]");
+        assert_eq!(work_items[0].start, 14, "Gap should start at 14");
+        assert_eq!(work_items[0].end, 14, "Gap should end at 14");
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_2_second_staging_run_produces_fewer_work_items() {
+        // Verifies staging-backfill.AC2.2: Running backfill with staging a
+        // second time produces fewer work items (previously staged entries not re-fetched)
+        let test_name = "ac2_2_second_run_fewer";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records at indices [10, 15]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _main_table = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // First call with empty staging: should detect gap [11, 14]
+        let logs = vec![("https://log.example.com".to_string(), 20)];
+        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // First run: staging doesn't exist, so gap is [11, 14]
+        assert_eq!(work_items_first.len(), 1, "First run should detect gap [11, 14]");
+        assert_eq!(work_items_first[0].start, 11);
+        assert_eq!(work_items_first[0].end, 14);
+
+        // Now create staging with records at [11, 12]
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _staging_table = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Second call with staging populated: should detect smaller gap [13, 14]
+        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        assert_eq!(work_items_second.len(), 1, "Second run should detect smaller gap [13, 14]");
+        assert_eq!(work_items_second[0].start, 13);
+        assert_eq!(work_items_second[0].end, 14);
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_3_ceiling_caps_union_max_cert_index() {
+        // Verifies staging-backfill.AC2.3: Per-log MAX(cert_index) from the
+        // union is capped at the state file ceiling
+        let test_name = "ac2_3_ceiling_cap";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records at [10, 11, 12]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _main_table = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with records at [13, 14, 25] (25 is beyond ceiling)
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let staging_records = vec![
+            make_test_record(13, "https://log.example.com"),
+            make_test_record(14, "https://log.example.com"),
+            make_test_record(25, "https://log.example.com"),
+        ];
+        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _staging_table = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Call with ceiling=20: verify no work items generated beyond index 19
+        let logs = vec![("https://log.example.com".to_string(), 20)];
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // effective_max = min(max_index_in_union, ceiling) = min(25, 20) = 20
+        // Data in union: [10, 11, 12, 13, 14, 25]
+        // After ceiling cap: [10, 11, 12, 13, 14] (25 is beyond ceiling)
+        // No gaps within [10, 14], so no work items
+        assert_eq!(work_items.len(), 0, "Ceiling should prevent gaps beyond index 19");
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_4_missing_staging_falls_back_to_main_only() {
+        // Verifies staging-backfill.AC2.4: When staging table doesn't exist
+        // yet (first run), gap detection falls back to querying main table only
+        let test_name = "ac2_4_missing_staging";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let nonexistent_staging = "/tmp/nonexistent_staging_path_12345";
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(nonexistent_staging);
+        let _ = fs::create_dir_all(&main_path);
+
+        let schema = delta_schema();
+
+        // Create main table with records at [10, 11, 15]
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let main_records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+        ];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _main_table = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Call with nonexistent staging path
+        let logs = vec![("https://log.example.com".to_string(), 20)];
+        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // Should get same results as calling without staging (gap [12, 14])
+        assert_eq!(work_items.len(), 1, "Should detect gap [12, 14]");
+        assert_eq!(work_items[0].start, 12);
+        assert_eq!(work_items[0].end, 14);
+
+        let _ = fs::remove_dir_all(&main_path);
+    }
 }
