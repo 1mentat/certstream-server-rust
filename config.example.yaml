@@ -59,3 +59,12 @@ delta_sink:
   table_path: "./data/certstream"   # Local filesystem path for Delta table
   batch_size: 10000                 # Records before size-triggered flush
   flush_interval_secs: 30           # Max seconds between flushes
+
+# Query API for searching certificates in Delta table
+# Provides REST API for querying historical CT records stored in Delta Lake
+query_api:
+  enabled: false                    # Off by default
+  table_path: "./data/certstream"   # Same Delta table as delta_sink
+  max_results_per_page: 500         # Hard cap on results per page
+  default_results_per_page: 50      # Default when limit not specified
+  query_timeout_secs: 30            # DataFusion query timeout
