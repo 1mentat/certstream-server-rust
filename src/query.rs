@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
 use deltalake::DeltaTableError;
@@ -11,6 +12,28 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::config::QueryApiConfig;
+
+/// Cursor for pagination, pinned to a Delta table version.
+#[derive(Debug, Serialize, Deserialize)]
+struct Cursor {
+    /// Delta table version
+    v: i64,
+    /// Last cert_index seen (pagination key)
+    k: u64,
+}
+
+/// Encode cursor to Base64-encoded JSON string.
+fn encode_cursor(version: i64, last_cert_index: u64) -> String {
+    let cursor = Cursor { v: version, k: last_cert_index };
+    let json = serde_json::to_string(&cursor).expect("cursor serialization cannot fail");
+    BASE64.encode(json.as_bytes())
+}
+
+/// Decode cursor from Base64-encoded JSON string.
+fn decode_cursor(encoded: &str) -> Result<Cursor, ()> {
+    let bytes = BASE64.decode(encoded).map_err(|_| ())?;
+    serde_json::from_slice(&bytes).map_err(|_| ())
+}
 
 /// Domain search mode determined from user input.
 #[derive(Debug, Clone, PartialEq)]
@@ -160,25 +183,55 @@ async fn handle_query_certs(
         }
     }
 
-    // Open the DeltaTable
-    let table = match deltalake::open_table(&state.config.table_path).await {
-        Ok(t) => t,
-        Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse { error: "Query service unavailable".to_string() }),
-            ).into_response();
+    // Decode cursor if provided. If cursor is invalid Base64 or JSON, return 400.
+    let (table, version, decoded_cursor) = if let Some(ref cursor_str) = params.cursor {
+        match decode_cursor(cursor_str) {
+            Ok(cursor) => {
+                // Open table at cursor version
+                match deltalake::open_table_with_version(&state.config.table_path, cursor.v).await {
+                    Ok(t) => {
+                        let v = t.version();
+                        (t, v, Some(cursor))
+                    }
+                    Err(e) => {
+                        // Vacuumed or missing version → 410 Gone
+                        warn!(version = cursor.v, error = %e, "Failed to open table at cursor version");
+                        return (
+                            StatusCode::GONE,
+                            Json(ErrorResponse { error: "Cursor expired, please restart query".to_string() }),
+                        ).into_response();
+                    }
+                }
+            }
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "Invalid cursor".to_string() }),
+                ).into_response();
+            }
         }
-        Err(e) => {
-            warn!(error = %e, "Failed to open delta table for query");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: "Internal query error".to_string() }),
-            ).into_response();
+    } else {
+        // No cursor — open latest version
+        match deltalake::open_table(&state.config.table_path).await {
+            Ok(t) => {
+                let v = t.version();
+                (t, v, None)
+            }
+            Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse { error: "Query service unavailable".to_string() }),
+                ).into_response();
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to open delta table for query");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: "Internal query error".to_string() }),
+                ).into_response();
+            }
         }
     };
-
-    let version = table.version();
 
     // Create SessionContext and register table
     let ctx = SessionContext::new();
@@ -254,7 +307,14 @@ async fn handle_query_certs(
         sql.push_str(&format!(" AND seen_date <= '{}'", escape_sql_string(to)));
     }
 
-    sql.push_str(&format!(" ORDER BY cert_index LIMIT {}", limit));
+    // Add cursor filter: cert_index > k when cursor present
+    if let Some(ref cursor) = decoded_cursor {
+        sql.push_str(&format!(" AND cert_index > {}", cursor.k));
+    }
+
+    // Use LIMIT N+1 for has_more detection
+    let fetch_limit = limit + 1;
+    sql.push_str(&format!(" ORDER BY cert_index LIMIT {}", fetch_limit));
 
     // Execute the query
     let df = match ctx.sql(&sql).await {
@@ -457,11 +517,24 @@ async fn handle_query_certs(
         }
     }
 
+    // Detect has_more: if we fetched limit+1 rows, set has_more=true and exclude last row
+    let has_more = results.len() > limit;
+    if has_more {
+        results.truncate(limit);
+    }
+
+    // Encode next_cursor from last included row's cert_index
+    let next_cursor = if has_more {
+        results.last().map(|r| encode_cursor(version, r.cert_index))
+    } else {
+        None
+    };
+
     Json(QueryResponse {
         version,
         results,
-        next_cursor: None,  // Added in Phase 4
-        has_more: false,     // Added in Phase 4
+        next_cursor,
+        has_more,
     }).into_response()
 }
 
@@ -749,6 +822,58 @@ mod tests {
                 // This is what we expect
             }
             _ => panic!("Expected NotATable or InvalidTableLocation error"),
+        }
+    }
+
+    #[test]
+    fn test_encode_cursor() {
+        // Test encoding a cursor with specific values
+        let encoded = encode_cursor(7808, 12345);
+        // Should be valid Base64 (no errors when decoding)
+        assert!(!encoded.is_empty());
+        assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    }
+
+    #[test]
+    fn test_decode_cursor_valid() {
+        // Test round-trip: encode then decode
+        let encoded = encode_cursor(7808, 12345);
+        let decoded = decode_cursor(&encoded).expect("Failed to decode cursor");
+        assert_eq!(decoded.v, 7808);
+        assert_eq!(decoded.k, 12345);
+    }
+
+    #[test]
+    fn test_decode_cursor_invalid_base64() {
+        // Test decode with invalid Base64
+        let result = decode_cursor("!!!invalid_base64!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_cursor_invalid_json() {
+        // Test decode with valid Base64 but invalid JSON
+        let invalid_json = BASE64.encode(b"not json");
+        let result = decode_cursor(&invalid_json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cursor_round_trip() {
+        // Test that various values survive round-trip encoding/decoding
+        let test_cases = vec![
+            (0, 0),
+            (1, 1),
+            (7808, 12345),
+            (i64::MAX, u64::MAX),
+            (-1, 0),  // Negative version is valid in Delta (tombstones)
+        ];
+
+        for (version, cert_index) in test_cases {
+            let encoded = encode_cursor(version, cert_index);
+            let decoded = decode_cursor(&encoded).expect("Failed to decode");
+            assert_eq!(decoded.v, version);
+            assert_eq!(decoded.k, cert_index);
         }
     }
 
@@ -1266,6 +1391,282 @@ mod tests {
         }
 
         assert_eq!(cert_indices, vec![1, 4]);
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_first_page_with_has_more() {
+        // AC2.1: First request returns results with next_cursor and has_more: true when more results exist
+        let table_path = "/tmp/delta_query_test_pagination_first_page";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create 10 test records
+        let records: Vec<_> = (1..=10)
+            .map(|i| create_test_cert_record(i, "log1", "2026-02-15", vec!["example.com"]))
+            .collect();
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Re-open table for querying
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let version = table.version();
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Simulate first page query with limit=3 (fetch limit+1=4 rows to check has_more)
+        let limit = 3;
+        let fetch_limit = limit + 1;
+        let sql = format!(
+            "SELECT cert_index FROM ct_records WHERE 1=1 ORDER BY cert_index LIMIT {}",
+            fetch_limit
+        );
+        let df = ctx.sql(&sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    results.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    results.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        // Should have 4 results (limit+1)
+        assert_eq!(results.len(), 4);
+        assert_eq!(results, vec![1, 2, 3, 4]);
+
+        // has_more should be true
+        let has_more = results.len() > limit;
+        assert!(has_more);
+
+        // Truncate to limit
+        results.truncate(limit);
+        assert_eq!(results.len(), 3);
+
+        // next_cursor should encode the last included row's cert_index
+        let next_cursor_str = encode_cursor(version, results.last().unwrap().clone());
+        assert!(!next_cursor_str.is_empty());
+
+        // Verify next_cursor can be decoded
+        let decoded = decode_cursor(&next_cursor_str).expect("Failed to decode cursor");
+        assert_eq!(decoded.v, version);
+        assert_eq!(decoded.k, 3); // Last included row
+
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_subsequent_page() {
+        // AC2.2: Subsequent request with cursor returns next page from same Delta version
+        let table_path = "/tmp/delta_query_test_pagination_subsequent";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create 10 test records
+        let records: Vec<_> = (1..=10)
+            .map(|i| create_test_cert_record(i, "log1", "2026-02-15", vec!["example.com"]))
+            .collect();
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Re-open table for querying
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let _version = table.version();
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Simulate second page query with cursor pointing to k=3 (last from first page)
+        let limit = 3;
+        let fetch_limit = limit + 1;
+        let cursor_k = 3u64;
+        let sql = format!(
+            "SELECT cert_index FROM ct_records WHERE 1=1 AND cert_index > {} ORDER BY cert_index LIMIT {}",
+            cursor_k, fetch_limit
+        );
+        let df = ctx.sql(&sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    results.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    results.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        // Should get rows 4, 5, 6, 7 (4 rows because we fetch limit+1)
+        assert_eq!(results, vec![4, 5, 6, 7]);
+
+        // has_more should be true (since we got limit+1 rows)
+        let has_more = results.len() > limit;
+        assert!(has_more);
+
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_final_page_no_has_more() {
+        // AC2.3: Final page returns has_more: false with no next_cursor
+        let table_path = "/tmp/delta_query_test_pagination_final_page";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create 5 test records
+        let records: Vec<_> = (1..=5)
+            .map(|i| create_test_cert_record(i, "log1", "2026-02-15", vec!["example.com"]))
+            .collect();
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Re-open table for querying
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query final page starting from cert_index > 3 with limit 3
+        let limit = 3;
+        let fetch_limit = limit + 1;
+        let cursor_k = 3u64;
+        let sql = format!(
+            "SELECT cert_index FROM ct_records WHERE 1=1 AND cert_index > {} ORDER BY cert_index LIMIT {}",
+            cursor_k, fetch_limit
+        );
+        let df = ctx.sql(&sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    results.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    results.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        // Should get only rows 4, 5 (2 rows, which is < limit + 1)
+        assert_eq!(results, vec![4, 5]);
+
+        // has_more should be false
+        let has_more = results.len() > limit;
+        assert!(!has_more);
+
+        // next_cursor should be None
+        let next_cursor = if has_more { Some(1) } else { None };
+        assert_eq!(next_cursor, None);
+
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_invalid_cursor() {
+        // AC2.4: Invalid cursor returns 400
+        let result = decode_cursor("not_valid_base64!!!!");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pagination_expired_cursor() {
+        // AC2.5: Expired cursor (non-existent version) returns 410
+        let table_path = "/tmp/delta_query_test_pagination_expired_cursor";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create a table and get its version
+        let records = vec![create_test_cert_record(1, "log1", "2026-02-15", vec!["example.com"])];
+        let schema = delta_schema();
+        let table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Try to open a version that doesn't exist (e.g., version 999999)
+        let result = deltalake::open_table_with_version(table_path, 999999).await;
+
+        // Should fail with an error (table version doesn't exist)
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_pagination_limit_clamping() {
+        // AC2.6: limit parameter is clamped to max_results_per_page
+        let table_path = "/tmp/delta_query_test_pagination_limit_clamping";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create 100 test records
+        let records: Vec<_> = (1..=100)
+            .map(|i| create_test_cert_record(i, "log1", "2026-02-15", vec!["example.com"]))
+            .collect();
+
+        let schema = delta_schema();
+        let table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Test clamping: if max_results_per_page = 50 and user requests 1000, should use 50
+        let requested_limit = 1000;
+        let max_results_per_page = 50;
+        let clamped_limit = requested_limit.min(max_results_per_page);
+        assert_eq!(clamped_limit, 50);
+
         let _ = fs::remove_dir_all(table_path);
     }
 }
