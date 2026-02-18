@@ -609,6 +609,7 @@ mod tests {
     #[derive(Debug)]
     enum CursorDecodeResult {
         /// Cursor was valid and table was successfully opened
+        #[allow(dead_code)]
         Success(i64), // version
         /// Cursor decode failed (invalid Base64 or JSON)
         InvalidCursor,
