@@ -108,6 +108,7 @@ async fn main() {
 
         let exit_code = backfill::run_backfill(
             config,
+            cli_args.staging_path,
             cli_args.backfill_from,
             cli_args.backfill_logs,
             shutdown_token,

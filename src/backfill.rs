@@ -486,11 +486,16 @@ async fn run_writer(
 
 pub async fn run_backfill(
     config: Config,
+    staging_path: Option<String>,
     backfill_from: Option<u64>,
     backfill_logs: Option<String>,
     shutdown: CancellationToken,
 ) -> i32 {
     info!("backfill mode starting");
+
+    if let Some(ref path) = staging_path {
+        info!(staging_path = %path, "writing to staging table");
+    }
 
     if let Some(from) = backfill_from {
         info!(from = from, "backfill_from parameter");
@@ -621,7 +626,8 @@ pub async fn run_backfill(
     }
 
     // Step 6b: Spawn writer task before dropping sender
-    let table_path = config.delta_sink.table_path.clone();
+    let table_path = staging_path
+        .unwrap_or_else(|| config.delta_sink.table_path.clone());
     let batch_size = config.delta_sink.batch_size;
     let flush_interval_secs = config.delta_sink.flush_interval_secs;
     let shutdown_clone = shutdown.clone();
@@ -1802,5 +1808,95 @@ mod tests {
         assert_eq!(work_items[0].end, 99);
 
         let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_staging_write_creates_table_at_staging_path() {
+        // Test that writer creates a Delta table at the staging path with correct schema
+        // Verifies staging-backfill.AC1.1: staging table is created at correct path
+        // Verifies staging-backfill.AC1.2: records are written to staging table
+        let test_name = "staging_write_table";
+        let staging_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        // Create a channel and spawn writer with the staging path
+        let (tx, rx) = mpsc::channel::<DeltaCertRecord>(10);
+        let shutdown = CancellationToken::new();
+
+        let staging_path_clone = staging_path.clone();
+        let writer_handle = tokio::spawn(async move {
+            run_writer(staging_path_clone, 3, 60, rx, shutdown).await
+        });
+
+        // Send a few records
+        let record1 = make_test_record(1, "https://log.example.com");
+        let record2 = make_test_record(2, "https://log.example.com");
+        let record3 = make_test_record(3, "https://log.example.com");
+        let record4 = make_test_record(4, "https://log.example.com");
+
+        tx.send(record1).await.expect("send failed");
+        tx.send(record2).await.expect("send failed");
+        tx.send(record3).await.expect("send failed"); // Should trigger batch flush (3 records)
+        tx.send(record4).await.expect("send failed"); // Will be flushed on channel close
+        drop(tx); // Close sender to trigger final flush
+
+        // Wait for writer to finish
+        let result = writer_handle.await.expect("writer task failed");
+
+        // Verify writer completed successfully
+        assert_eq!(result.total_records_written, 4, "Writer should have written 4 records");
+        assert_eq!(result.write_errors, 0, "Writer should have no errors");
+
+        // Verify Delta table exists at staging path
+        let table = deltalake::open_table(&staging_path)
+            .await
+            .expect("staging table should exist after writer finishes");
+
+        // Verify table has the correct schema (20 columns)
+        let schema = table.get_schema().expect("get schema failed");
+        let field_count = schema.fields().count();
+        assert_eq!(
+            field_count,
+            20,
+            "Staging table should have 20 columns matching delta_schema"
+        );
+
+        // Verify table is partitioned by seen_date
+        let metadata = table.metadata().expect("get metadata failed");
+        let partition_columns: Vec<String> = metadata
+            .partition_columns
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            partition_columns,
+            vec!["seen_date"],
+            "Staging table should be partitioned by seen_date"
+        );
+
+        // Verify records exist in the staging table using DataFusion
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("table registration failed");
+
+        let sql = "SELECT COUNT(*) as cnt FROM ct_records";
+        let df = ctx.sql(sql).await.expect("sql query failed");
+        let batches = df.collect().await.expect("batch collection failed");
+
+        assert_eq!(batches.len(), 1);
+        let count_arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<deltalake::arrow::array::Int64Array>()
+            .expect("count column should be Int64");
+        assert_eq!(
+            count_arr.value(0),
+            4,
+            "Staging table should have exactly 4 records"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&staging_path);
     }
 }
