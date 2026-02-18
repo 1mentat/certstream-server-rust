@@ -269,11 +269,14 @@ async fn detect_gaps_from_context(
 
 /// Orchestrate gap detection across all logs.
 ///
-/// Opens delta table once, queries state for all logs, detects gaps per log,
+/// Opens delta table(s) once, queries state for all logs, detects gaps per log,
 /// and generates work items for catch-up or historical backfill modes.
+/// When staging_path is provided and the staging table exists, both main and staging
+/// tables are registered and a UNION ALL view is created.
 ///
 /// # Arguments
-/// * `table_path` - Path to the delta table
+/// * `table_path` - Path to the main delta table
+/// * `staging_path` - Optional path to the staging delta table; if provided and exists, will be unioned with main
 /// * `logs` - Vec of (source_url, ceiling) pairs for active logs
 /// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
 ///
@@ -281,14 +284,26 @@ async fn detect_gaps_from_context(
 /// * Vec of BackfillWorkItem ranges to fetch
 pub async fn detect_gaps(
     table_path: &str,
+    staging_path: Option<&str>,
     logs: &[(String, u64)],
     backfill_from: Option<u64>,
 ) -> Result<Vec<BackfillWorkItem>, Box<dyn Error>> {
-    // Try to open the delta table; if it doesn't exist, return based on mode
+    // Try to open the main delta table; if it doesn't exist, try staging if provided
     let table = match deltalake::open_table(table_path).await {
         Ok(t) => t,
         Err(_e @ DeltaTableError::NotATable(_)) | Err(_e @ DeltaTableError::InvalidTableLocation(_)) => {
-            // Table doesn't exist (NotATable or InvalidTableLocation)
+            // Main table doesn't exist — try staging if provided
+            if let Some(staging) = staging_path {
+                if let Ok(staging_table) = deltalake::open_table(staging).await {
+                    let ctx = SessionContext::new();
+                    ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
+                    ctx.sql(
+                        "CREATE VIEW ct_records AS SELECT cert_index, source_url FROM ct_staging"
+                    ).await?;
+                    return detect_gaps_from_context(&ctx, logs, backfill_from).await;
+                }
+            }
+            // Neither main nor staging exists — use original fallback logic
             return match backfill_from {
                 None => {
                     // Catch-up mode: no table, no work items
@@ -313,9 +328,37 @@ pub async fn detect_gaps(
         Err(e) => return Err(Box::new(e)),
     };
 
-    // Create SessionContext and register table
+    // Create SessionContext and register main table
     let ctx = SessionContext::new();
-    ctx.register_table("ct_records", std::sync::Arc::new(table))?;
+    ctx.register_table("ct_main", std::sync::Arc::new(table))?;
+
+    // Register UNION ALL view if staging table exists
+    let _has_staging = if let Some(staging) = staging_path {
+        match deltalake::open_table(staging).await {
+            Ok(staging_table) => {
+                ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
+                ctx.sql(
+                    "CREATE VIEW ct_records AS \
+                     SELECT cert_index, source_url FROM ct_main \
+                     UNION ALL \
+                     SELECT cert_index, source_url FROM ct_staging"
+                ).await?;
+                true
+            }
+            Err(_) => {
+                // Staging table doesn't exist yet (first run) — fall back to main only
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if !_has_staging {
+        ctx.sql(
+            "CREATE VIEW ct_records AS SELECT cert_index, source_url FROM ct_main"
+        ).await?;
+    }
 
     // Use the helper to process all logs
     detect_gaps_from_context(&ctx, logs, backfill_from).await
@@ -576,7 +619,8 @@ pub async fn run_backfill(
     }
 
     // Step 3: Gap detection
-    let work_items = match detect_gaps(&config.delta_sink.table_path, &log_ceilings, backfill_from).await {
+    let staging_path_ref = staging_path.as_deref();
+    let work_items = match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from).await {
         Ok(items) => items,
         Err(e) => {
             warn!("gap detection failed: {}", e);
@@ -992,7 +1036,7 @@ mod tests {
         // Call detect_gaps in catch-up mode (no --from)
         // Second tuple element is ceiling (was tree_size)
         let logs = vec![("https://log.example.com".to_string(), 200)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1034,7 +1078,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=22 (no frontier gap generated)
         let logs = vec![("https://log.example.com".to_string(), 22)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1083,7 +1127,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=10
         let logs = vec![("https://log.example.com".to_string(), 10)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1123,7 +1167,7 @@ mod tests {
             ("https://log-a.example.com".to_string(), 10),
             ("https://log-b.example.com".to_string(), 10),
         ];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1172,7 +1216,7 @@ mod tests {
 
         // Call detect_gaps with --from 0, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
             .await
             .expect("detect_gaps failed");
 
@@ -1213,7 +1257,7 @@ mod tests {
 
         // Call detect_gaps with --from 40, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, &logs, Some(40))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(40))
             .await
             .expect("detect_gaps failed");
 
@@ -1236,7 +1280,7 @@ mod tests {
 
         // Call detect_gaps in historical mode with --from 0
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
             .await
             .expect("detect_gaps failed");
 
@@ -1259,7 +1303,7 @@ mod tests {
 
         // Call detect_gaps in catch-up mode
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1289,7 +1333,7 @@ mod tests {
 
         // Simulate gap detection in catch-up mode with an empty table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1752,7 +1796,7 @@ mod tests {
         // ceiling=50 is below min_index=100; irrelevant in catch-up mode
         // but verifies AC3.3 is satisfied
         let logs = vec![("https://log.example.com".to_string(), 50)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1792,7 +1836,7 @@ mod tests {
 
         // ceiling=1000 (well above max_index=16)
         let logs = vec![("https://log.example.com".to_string(), 1000)];
-        let work_items = detect_gaps(&table_path, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None)
             .await
             .expect("detect_gaps failed");
 
@@ -1813,7 +1857,7 @@ mod tests {
 
         // No table — historical mode with no delta table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
             .await
             .expect("detect_gaps failed");
 
