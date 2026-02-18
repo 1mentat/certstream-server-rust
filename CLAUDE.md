@@ -66,8 +66,8 @@ The binary has two execution modes selected in main.rs:
 - **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer()`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring
-- **Entry point**: `backfill::run_backfill(config, backfill_from, backfill_logs, shutdown)` called from main, returns exit code (i32)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table
+- **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, shutdown)` called from main, returns exit code (i32)
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
 - **Gap detection**: `detect_gaps(table_path, logs, backfill_from)` queries Delta table via DataFusion SQL, finds internal gaps only (LEAD window function). The second element of the `logs` tuple is the ceiling (from state file `current_index`).
