@@ -30,6 +30,7 @@ Last verified: 2026-02-18
 - `src/sse.rs` - SSE stream handler
 - `src/delta_sink.rs` - Delta Lake storage sink (optional, disabled by default)
 - `src/dedup.rs` - Cross-log certificate deduplication filter
+- `src/query.rs` - Query API: search certificates in Delta Lake (optional, disabled by default)
 - `src/api.rs` - REST API endpoints
 - `src/middleware.rs` - Auth and rate limiting middleware
 - `src/rate_limit.rs` - Rate limiter implementation
@@ -64,6 +65,27 @@ The binary has two execution modes selected in main.rs:
 - **Non-fatal startup**: if table creation fails, task exits without crashing server
 - **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
 - **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer()`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+
+## Query API Contracts
+- **Disabled by default** (`query_api.enabled = false`)
+- **Config**: `QueryApiConfig { enabled, table_path, max_results_per_page, default_results_per_page, query_timeout_secs }`
+- **Defaults**: table_path `./data/certstream`, max 500, default 50, timeout 30s
+- **Env vars**: `CERTSTREAM_QUERY_API_ENABLED`, `CERTSTREAM_QUERY_API_TABLE_PATH`, `CERTSTREAM_QUERY_API_MAX_RESULTS_PER_PAGE`, `CERTSTREAM_QUERY_API_DEFAULT_RESULTS_PER_PAGE`, `CERTSTREAM_QUERY_API_QUERY_TIMEOUT_SECS`
+- **Endpoint**: `GET /api/query/certs` merged into main Axum router when enabled
+- **Query params**: `domain`, `issuer`, `from` (YYYY-MM-DD), `to` (YYYY-MM-DD), `limit`, `cursor`
+- **At least one filter required**: returns 400 if no domain/issuer/from/to provided
+- **Domain search modes**: exact (contains `.`), contains (no `.` or `*`), suffix (`*.` prefix) -- auto-classified from input
+- **SQL injection prevention**: `escape_like_pattern()` for LIKE contexts, `escape_sql_string()` for non-LIKE contexts
+- **Cursor-based pagination**: Base64-encoded JSON `{v: delta_version, k: last_cert_index}`; pinned to Delta table version for consistency
+- **Pagination detection**: fetches `limit+1` rows; if extra row exists, `has_more=true` and `next_cursor` returned
+- **Cursor errors**: invalid cursor returns 400; expired/vacuumed version returns 410 Gone
+- **Table errors**: missing table returns 503; other errors return 500
+- **Query timeout**: DataFusion execution wrapped in `tokio::time::timeout`; exceeded returns 504
+- **Response fields**: `version`, `results[]` (cert_index, fingerprint, sha256, serial_number, subject, issuer, not_before, not_after, all_domains, source_name, seen, is_ca), `next_cursor`, `has_more`
+- **Heavy fields excluded**: as_der, chain, cert_link, source_url, update_type, signature_algorithm not returned
+- **Startup validation**: warns if table_path does not exist (non-fatal; queries return 503 until data written)
+- **Metrics**: `certstream_query_requests` (counter, labeled by status), `certstream_query_duration_seconds` (histogram), `certstream_query_results_count` (histogram)
+- **Reads from**: same Delta table written by delta_sink and backfill
 
 ## Backfill Contracts
 - **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring
