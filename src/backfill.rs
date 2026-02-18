@@ -3,6 +3,7 @@ use crate::ct::fetch;
 use crate::ct::{fetch_log_list, CtLog, LogType};
 use crate::delta_sink::{delta_schema, DeltaCertRecord, flush_buffer, open_or_create_table};
 use crate::models::Source;
+use crate::state::StateManager;
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
 use deltalake::{DeltaTable, DeltaTableError};
@@ -178,7 +179,7 @@ async fn find_internal_gaps(
 ///
 /// # Arguments
 /// * `table_path` - Path to the delta table
-/// * `logs` - Vec of (source_url, tree_size) pairs for active logs
+/// * `logs` - Vec of (source_url, ceiling) pairs for active logs
 /// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
 ///
 /// # Returns
@@ -201,12 +202,12 @@ pub async fn detect_gaps(
                 Some(from) => {
                     // Historical mode: backfill entire range for all logs
                     let mut work_items = Vec::new();
-                    for (source_url, tree_size) in logs {
-                        if *tree_size > from {
+                    for (source_url, ceiling) in logs {
+                        if *ceiling > from {
                             work_items.push(BackfillWorkItem {
                                 source_url: source_url.clone(),
                                 start: from,
-                                end: tree_size - 1,
+                                end: ceiling - 1,
                             });
                         }
                     }
@@ -226,7 +227,7 @@ pub async fn detect_gaps(
 
     let mut work_items = Vec::new();
 
-    for (source_url, tree_size) in logs {
+    for (source_url, ceiling) in logs {
         match backfill_from {
             None => {
                 // Catch-up mode
@@ -252,15 +253,6 @@ pub async fn detect_gaps(
                                 warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
                             }
                         }
-                    }
-
-                    // Check for frontier gap
-                    if state.max_index + 1 < *tree_size {
-                        work_items.push(BackfillWorkItem {
-                            source_url: source_url.clone(),
-                            start: state.max_index + 1,
-                            end: tree_size - 1,
-                        });
                     }
                 }
                 // If log not in delta, skip (AC2.4)
@@ -297,22 +289,13 @@ pub async fn detect_gaps(
                             }
                         }
                     }
-
-                    // Frontier gap
-                    if state.max_index + 1 < *tree_size {
-                        work_items.push(BackfillWorkItem {
-                            source_url: source_url.clone(),
-                            start: state.max_index + 1,
-                            end: tree_size - 1,
-                        });
-                    }
                 } else {
                     // Log not in delta: backfill entire range
-                    if *tree_size > from {
+                    if *ceiling > from {
                         work_items.push(BackfillWorkItem {
                             source_url: source_url.clone(),
                             start: from,
-                            end: tree_size - 1,
+                            end: ceiling - 1,
                         });
                     }
                 }
@@ -548,45 +531,32 @@ pub async fn run_backfill(
 
     info!(count = logs.len(), "backfilling logs");
 
-    // Step 2: Tree size discovery
-    let request_timeout = Duration::from_secs(config.ct_log.request_timeout_secs);
-    let mut log_tree_sizes = Vec::new();
+    // Step 2: State file ceiling lookup
+    let state_manager = StateManager::new(config.ct_log.state_file.clone());
+    let mut log_ceilings = Vec::new();
 
     for log in &logs {
-        let tree_size = match log.log_type {
-            LogType::Rfc6962 => match fetch::get_tree_size(&client, &log.normalized_url(), request_timeout).await {
-                Ok(size) => size,
-                Err(e) => {
-                    warn!(
-                        log = %log.description,
-                        error = %e,
-                        "failed to get tree size"
-                    );
-                    continue;
-                }
-            },
-            LogType::StaticCt => match fetch::get_checkpoint_tree_size(&client, &log.normalized_url(), request_timeout).await {
-                Ok(size) => size,
-                Err(e) => {
-                    warn!(
-                        log = %log.description,
-                        error = %e,
-                        "failed to get checkpoint tree size"
-                    );
-                    continue;
-                }
-            },
-        };
-        log_tree_sizes.push((log.normalized_url(), tree_size));
+        match state_manager.get_index(&log.normalized_url()) {
+            Some(ceiling) => {
+                log_ceilings.push((log.normalized_url(), ceiling));
+            }
+            None => {
+                warn!(
+                    log = %log.description,
+                    url = %log.normalized_url(),
+                    "log not in state file, skipping (no ceiling reference)"
+                );
+            }
+        }
     }
 
-    if log_tree_sizes.is_empty() {
-        warn!("no logs have valid tree sizes");
-        return 1;
+    if log_ceilings.is_empty() {
+        warn!("no logs have ceiling values from state file");
+        return 0;
     }
 
     // Step 3: Gap detection
-    let work_items = match detect_gaps(&config.delta_sink.table_path, &log_tree_sizes, backfill_from).await {
+    let work_items = match detect_gaps(&config.delta_sink.table_path, &log_ceilings, backfill_from).await {
         Ok(items) => items,
         Err(e) => {
             warn!("gap detection failed: {}", e);
@@ -981,16 +951,15 @@ mod tests {
             .expect("write failed");
 
         // Call detect_gaps in catch-up mode (no --from)
+        // Second tuple element is ceiling (was tree_size)
         let logs = vec![("https://log.example.com".to_string(), 200)];
         let work_items = detect_gaps(&table_path, &logs, None)
             .await
             .expect("detect_gaps failed");
 
-        // Should have frontier gap (103, 199)
-        assert_eq!(work_items.len(), 1);
-        assert_eq!(work_items[0].source_url, "https://log.example.com");
-        assert_eq!(work_items[0].start, 103);
-        assert_eq!(work_items[0].end, 199);
+        // With ceiling replacing tree_size and no frontier gap logic,
+        // contiguous data produces no work items
+        assert_eq!(work_items.len(), 0, "Contiguous data with ceiling > max_index should produce no work items");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1024,39 +993,32 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with tree_size=22 (creates a frontier gap)
+        // Call detect_gaps with ceiling=22 (no frontier gap generated)
         let logs = vec![("https://log.example.com".to_string(), 22)];
         let work_items = detect_gaps(&table_path, &logs, None)
             .await
             .expect("detect_gaps failed");
 
-        // Should detect gaps: (13, 14), (17, 19), and frontier gap (21, 21)
+        // Should detect only internal gaps: (13, 14), (17, 19) — no frontier gap
         let gaps: Vec<_> = work_items
             .iter()
             .filter(|item| item.source_url == "https://log.example.com")
             .collect();
 
-        // Should have exactly three work items: (13, 14), (17, 19), and frontier (21, 21)
-        assert_eq!(gaps.len(), 3, "Should detect internal gaps (13, 14), (17, 19) and frontier gap (21, 21)");
+        assert_eq!(gaps.len(), 2, "Should detect internal gaps (13, 14) and (17, 19) only");
 
-        // Check for gap (13, 14)
         let has_gap_13_14 = gaps.iter().any(|item| item.start == 13 && item.end == 14);
         assert!(has_gap_13_14, "Should detect gap (13, 14)");
 
-        // Check for gap (17, 19)
         let has_gap_17_19 = gaps.iter().any(|item| item.start == 17 && item.end == 19);
         assert!(has_gap_17_19, "Should detect gap (17, 19)");
-
-        // Check for frontier gap (21, 21)
-        let frontier_gaps: Vec<_> = gaps.iter().filter(|item| item.start == 21 && item.end == 21).collect();
-        assert_eq!(frontier_gaps.len(), 1, "Should detect exactly one frontier gap (21, 21)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
 
     #[tokio::test]
-    async fn test_ac2_3_catch_up_frontier_gap() {
-        let test_name = "ac2_3_frontier_gap";
+    async fn test_ac2_3_catch_up_no_frontier_gap() {
+        let test_name = "ac2_3_no_frontier_gap";
         let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
         let _ = fs::remove_dir_all(&table_path);
         let _ = fs::create_dir_all(&table_path);
@@ -1080,16 +1042,14 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with tree_size=10
+        // Call detect_gaps with ceiling=10
         let logs = vec![("https://log.example.com".to_string(), 10)];
         let work_items = detect_gaps(&table_path, &logs, None)
             .await
             .expect("detect_gaps failed");
 
-        // Should have frontier gap (3, 9)
-        assert_eq!(work_items.len(), 1);
-        assert_eq!(work_items[0].start, 3);
-        assert_eq!(work_items[0].end, 9);
+        // Should have NO work items (no frontier gap generated)
+        assert_eq!(work_items.len(), 0, "Contiguous data should produce no work items (no frontier gap)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1135,12 +1095,12 @@ mod tests {
             .collect();
         assert_eq!(log_b_items.len(), 0, "log-b should be skipped in catch-up mode");
 
-        // log-a should have work items
+        // log-a has contiguous data [0, 1] — no internal gaps, no frontier gap
         let log_a_items: Vec<_> = work_items
             .iter()
             .filter(|item| item.source_url == "https://log-a.example.com")
             .collect();
-        assert!(!log_a_items.is_empty(), "log-a should have work items");
+        assert_eq!(log_a_items.len(), 0, "log-a with contiguous data should have no work items (no frontier gap)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1171,20 +1131,17 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with --from 0, tree_size=55
+        // Call detect_gaps with --from 0, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
         let work_items = detect_gaps(&table_path, &logs, Some(0))
             .await
             .expect("detect_gaps failed");
 
-        // Should have pre-existing gap (0, 49) and frontier gap (53, 54)
-        assert!(work_items.len() >= 2, "Should have pre-existing and frontier gaps");
+        // Should have only pre-existing gap (0, 49) — no frontier gap
+        assert_eq!(work_items.len(), 1, "Should have only pre-existing gap");
 
         let has_pre_existing = work_items.iter().any(|item| item.start == 0 && item.end == 49);
         assert!(has_pre_existing, "Should have pre-existing gap (0, 49)");
-
-        let has_frontier = work_items.iter().any(|item| item.start == 53 && item.end == 54);
-        assert!(has_frontier, "Should have frontier gap (53, 54)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1215,14 +1172,14 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with --from 40, tree_size=55
+        // Call detect_gaps with --from 40, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
         let work_items = detect_gaps(&table_path, &logs, Some(40))
             .await
             .expect("detect_gaps failed");
 
-        // Should have gap (40, 49) and frontier gap (53, 54)
-        assert!(work_items.len() >= 2, "Should have multiple gaps");
+        // Should have only the pre-existing gap (40, 49) — no frontier gap
+        assert_eq!(work_items.len(), 1, "Should have only pre-existing gap from overridden lower bound");
 
         let has_pre_gap = work_items.iter().any(|item| item.start == 40 && item.end == 49);
         assert!(has_pre_gap, "Should have gap (40, 49) from overridden lower bound");
@@ -1718,6 +1675,113 @@ mod tests {
 
         let result = writer_handle.await.expect("writer task failed");
         assert_eq!(result.total_records_written, batch_size as u64 + 1);
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    // Task 2 Tests: Ceiling behavior
+
+    #[tokio::test]
+    async fn test_ceiling_below_data_no_work_items() {
+        // backfill-state-ceiling.AC3.3: ceiling < min_index produces no work items.
+        // After removing frontier gaps, ceiling is not consulted in catch-up mode.
+        // This test confirms: contiguous data + any ceiling value = 0 work items.
+        let test_name = "ceiling_below_data";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Create records [100, 101, 102]
+        let records = vec![
+            make_test_record(100, "https://log.example.com"),
+            make_test_record(101, "https://log.example.com"),
+            make_test_record(102, "https://log.example.com"),
+        ];
+
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+        let _new_table = DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write failed");
+
+        // ceiling=50 is below min_index=100; irrelevant in catch-up mode
+        // but verifies AC3.3 is satisfied
+        let logs = vec![("https://log.example.com".to_string(), 50)];
+        let work_items = detect_gaps(&table_path, &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // No work items: no internal gaps in contiguous data, ceiling not consulted
+        assert_eq!(work_items.len(), 0, "Contiguous data with any ceiling should produce no work items in catch-up mode");
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_catch_up_ceiling_only_internal_gaps() {
+        // backfill-state-ceiling.AC1.1: catch-up fills only internal gaps, no frontier
+        let test_name = "ceiling_only_internal";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Records with gap: [10, 11, 15, 16] — missing 12, 13, 14
+        let records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+            make_test_record(16, "https://log.example.com"),
+        ];
+
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+        let _new_table = DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write failed");
+
+        // ceiling=1000 (well above max_index=16)
+        let logs = vec![("https://log.example.com".to_string(), 1000)];
+        let work_items = detect_gaps(&table_path, &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // Should have exactly 1 internal gap (12, 14) — no frontier gap despite ceiling=1000
+        assert_eq!(work_items.len(), 1, "Should have only internal gap, no frontier");
+        assert_eq!(work_items[0].start, 12);
+        assert_eq!(work_items[0].end, 14);
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_ceiling_used_as_upper_bound() {
+        // backfill-state-ceiling.AC2.1: historical mode uses ceiling from state file
+        let test_name = "historical_ceiling_upper";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+
+        // No table — historical mode with no delta table
+        let logs = vec![("https://log.example.com".to_string(), 100)];
+        let work_items = detect_gaps(&table_path, &logs, Some(0))
+            .await
+            .expect("detect_gaps failed");
+
+        // Should use ceiling=100 as upper bound: work item (0, 99)
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].start, 0);
+        assert_eq!(work_items[0].end, 99);
 
         let _ = fs::remove_dir_all(&table_path);
     }
