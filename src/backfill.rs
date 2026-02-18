@@ -172,6 +172,101 @@ async fn find_internal_gaps(
     Ok(gaps)
 }
 
+/// Given a DataFusion context with a "ct_records" view already registered,
+/// query log states and find gaps for each log in the provided list.
+///
+/// # Arguments
+/// * `ctx` - Already-registered DataFusion SessionContext with "ct_records" view
+/// * `logs` - Vec of (source_url, ceiling) pairs for active logs
+/// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
+///
+/// # Returns
+/// * Vec of BackfillWorkItem ranges to fetch
+async fn detect_gaps_from_context(
+    ctx: &SessionContext,
+    logs: &[(String, u64)],
+    backfill_from: Option<u64>,
+) -> Result<Vec<BackfillWorkItem>, Box<dyn Error>> {
+    let log_states = query_log_states(ctx).await?;
+    let mut work_items = Vec::new();
+
+    for (source_url, ceiling) in logs {
+        match backfill_from {
+            None => {
+                // Catch-up mode
+                if let Some(state) = log_states.get(source_url) {
+                    let lower_bound = state.min_index;
+
+                    // Check for internal gaps
+                    let expected_count = state.max_index - state.min_index + 1;
+                    if state.count < expected_count {
+                        let effective_max = state.max_index.min(*ceiling);
+                        match find_internal_gaps(ctx, source_url, lower_bound, effective_max).await {
+                            Ok(gaps) => {
+                                for (gap_start, gap_end) in gaps {
+                                    work_items.push(BackfillWorkItem {
+                                        source_url: source_url.clone(),
+                                        start: gap_start,
+                                        end: gap_end,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
+                            }
+                        }
+                    }
+                }
+                // If log not in delta, skip (AC2.4)
+            }
+            Some(from) => {
+                // Historical mode
+                if let Some(state) = log_states.get(source_url) {
+                    // Pre-existing gap (before MIN in delta)
+                    if from < state.min_index {
+                        work_items.push(BackfillWorkItem {
+                            source_url: source_url.clone(),
+                            start: from,
+                            end: state.min_index - 1,
+                        });
+                    }
+
+                    // Internal gaps
+                    let expected_count = state.max_index - state.min_index + 1;
+                    if state.count < expected_count {
+                        let effective_max = state.max_index.min(*ceiling);
+                        match find_internal_gaps(ctx, source_url, from.max(state.min_index), effective_max).await {
+                            Ok(gaps) => {
+                                for (gap_start, gap_end) in gaps {
+                                    work_items.push(BackfillWorkItem {
+                                        source_url: source_url.clone(),
+                                        start: gap_start,
+                                        end: gap_end,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
+                            }
+                        }
+                    }
+                } else {
+                    // Log not in delta: backfill entire range
+                    if *ceiling > from {
+                        work_items.push(BackfillWorkItem {
+                            source_url: source_url.clone(),
+                            start: from,
+                            end: ceiling - 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(work_items)
+}
+
 /// Orchestrate gap detection across all logs.
 ///
 /// Opens delta table once, queries state for all logs, detects gaps per log,
@@ -222,88 +317,8 @@ pub async fn detect_gaps(
     let ctx = SessionContext::new();
     ctx.register_table("ct_records", std::sync::Arc::new(table))?;
 
-    // Query delta table state
-    let log_states = query_log_states(&ctx).await?;
-
-    let mut work_items = Vec::new();
-
-    for (source_url, ceiling) in logs {
-        match backfill_from {
-            None => {
-                // Catch-up mode
-                if let Some(state) = log_states.get(source_url) {
-                    let lower_bound = state.min_index;
-
-                    // Check for internal gaps
-                    let expected_count = state.max_index - state.min_index + 1;
-                    if state.count < expected_count {
-                        match find_internal_gaps(&ctx, source_url, lower_bound, state.max_index)
-                            .await
-                        {
-                            Ok(gaps) => {
-                                for (gap_start, gap_end) in gaps {
-                                    work_items.push(BackfillWorkItem {
-                                        source_url: source_url.clone(),
-                                        start: gap_start,
-                                        end: gap_end,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
-                            }
-                        }
-                    }
-                }
-                // If log not in delta, skip (AC2.4)
-            }
-            Some(from) => {
-                // Historical mode
-                if let Some(state) = log_states.get(source_url) {
-                    // Pre-existing gap (before MIN in delta)
-                    if from < state.min_index {
-                        work_items.push(BackfillWorkItem {
-                            source_url: source_url.clone(),
-                            start: from,
-                            end: state.min_index - 1,
-                        });
-                    }
-
-                    // Internal gaps
-                    let expected_count = state.max_index - state.min_index + 1;
-                    if state.count < expected_count {
-                        match find_internal_gaps(&ctx, source_url, from.max(state.min_index), state.max_index)
-                            .await
-                        {
-                            Ok(gaps) => {
-                                for (gap_start, gap_end) in gaps {
-                                    work_items.push(BackfillWorkItem {
-                                        source_url: source_url.clone(),
-                                        start: gap_start,
-                                        end: gap_end,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                warn!(source_url = %source_url, error = %e, "Failed to detect internal gaps");
-                            }
-                        }
-                    }
-                } else {
-                    // Log not in delta: backfill entire range
-                    if *ceiling > from {
-                        work_items.push(BackfillWorkItem {
-                            source_url: source_url.clone(),
-                            start: from,
-                            end: ceiling - 1,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(work_items)
+    // Use the helper to process all logs
+    detect_gaps_from_context(&ctx, logs, backfill_from).await
 }
 
 /// Helper function to handle a flush operation and update writer state.
