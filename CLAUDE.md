@@ -1,6 +1,7 @@
 # certstream-server-rust
 
 Last verified: 2026-02-18
+Last context update: 2026-02-18
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -18,13 +19,15 @@ Last verified: 2026-02-18
 - `cargo run -- --backfill` - Run delta backfill mode (catch-up gaps)
 - `cargo run -- --backfill --from 0` - Run historical backfill from index 0
 - `cargo run -- --backfill --logs "google"` - Backfill only logs matching filter
+- `cargo run -- --backfill --staging-path /tmp/staging` - Backfill into staging table
+- `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
 - `src/config.rs` - All configuration structs, YAML + env var loading, validation
 - `src/ct/` - Certificate Transparency log fetching and watching
 - `src/ct/fetch.rs` - Shared fetch functions for RFC 6962 and Static CT logs
-- `src/backfill.rs` - Delta backfill mode: gap detection, fetcher tasks, writer task
+- `src/backfill.rs` - Delta backfill mode: gap detection, fetcher tasks, writer task, staging merge
 - `src/models/` - Data models (CertificateMessage, PreSerializedMessage)
 - `src/websocket/` - WebSocket stream handlers
 - `src/sse.rs` - SSE stream handler
@@ -43,9 +46,10 @@ All CT log entries flow through a single `broadcast::channel<Arc<PreSerializedMe
 Consumers (WebSocket, SSE, delta_sink) each subscribe independently via `tx.subscribe()`.
 The delta_sink is spawned as an optional tokio task and does not affect other consumers.
 
-The binary has two execution modes selected in main.rs:
+The binary has three execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
-2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors)
+2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
+3. **Merge mode** (`--merge --staging-path <PATH>`): merges a staging Delta table into the main table using Delta MERGE INTO with deduplication, then deletes the staging directory on success
 
 ## Key Conventions
 - Config structs use serde Deserialize with defaults; env vars override YAML
@@ -70,7 +74,9 @@ The binary has two execution modes selected in main.rs:
 - **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, shutdown)` called from main, returns exit code (i32)
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
-- **Gap detection**: `detect_gaps(table_path, staging_path, logs, backfill_from)` queries Delta table(s) via DataFusion SQL, finds internal gaps only (LEAD window function). When staging_path is provided and the staging table exists, both tables are queried via a UNION ALL view. The second element of the `logs` tuple is the ceiling (from state file `current_index`).
+- **Gap detection**: `detect_gaps(table_path, staging_path, logs, backfill_from)` queries Delta table(s) via DataFusion SQL, finds internal gaps only (LEAD window function). When staging_path is provided and the staging table exists, both tables are queried via a UNION ALL view using `COUNT(DISTINCT cert_index)` to avoid double-counting duplicates. The second element of the `logs` tuple is the ceiling (from state file `current_index`).
+- **Gap detection fallback**: if main table does not exist but staging table does, gap detection uses staging alone; if neither exists, falls back to original mode-based logic (empty work items for catch-up, full range for historical)
+- **Staging write path**: when `--staging-path` is provided, the writer task writes to the staging table path instead of `config.delta_sink.table_path`; gap detection still reads both tables to avoid re-fetching already-staged records
 - **Catch-up rules**: only backfills logs already present in Delta table; logs not in table are skipped; only internal gaps are filled (no frontier gaps)
 - **Historical rules**: backfills all logs from `--from` index to ceiling; logs not in Delta get full range from `--from` to ceiling
 - **Architecture**: mpsc channel from N fetcher tasks to 1 writer task; fetchers send `DeltaCertRecord`; writer flushes on batch_size, timer, channel close, or shutdown
@@ -78,6 +84,18 @@ The binary has two execution modes selected in main.rs:
 - **Writer reuses**: `delta_sink::flush_buffer()` and `delta_sink::open_or_create_table()` from the live sink
 - **Exit code**: 0 if all fetchers and writer succeed, 1 if any errors occurred
 - **Graceful shutdown**: CancellationToken checked per batch in fetchers; writer flushes remaining buffer on cancellation
+
+## Merge Contracts
+- **CLI flags**: `--merge --staging-path <PATH>` activates merge mode; `--merge` without `--staging-path` exits with error
+- **Entry point**: `backfill::run_merge(config, staging_path, shutdown)` called from main, returns exit code (i32)
+- **Merge predicate**: `target.source_url = source.source_url AND target.cert_index = source.cert_index` (deduplication key)
+- **Merge behavior**: uses `DeltaOps::merge()` with `when_not_matched_insert` only (no updates, no deletes); matched source rows are silently skipped
+- **Batch-by-batch**: staging records are read via DataFusion SQL, then each RecordBatch is merged individually into the main table
+- **Missing staging table**: if staging table does not exist (NotATable or InvalidTableLocation), exits with code 0 (not an error)
+- **Empty staging table**: if all batches have zero rows, exits with code 0
+- **Staging cleanup**: on successful merge, the staging directory is deleted via `remove_dir_all`; cleanup failure is non-fatal (logged as warning)
+- **Error handling**: any failure during merge leaves staging intact for retry and exits with code 1
+- **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (staging left intact)
 
 ## CT Fetch Contracts
 - **Module**: `ct::fetch` (public module)
