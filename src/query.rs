@@ -629,8 +629,11 @@ async fn handle_query_certs(
 mod tests {
     use super::*;
     use crate::delta_sink::{delta_schema, open_or_create_table, records_to_batch, DeltaCertRecord};
+    use axum::body::Body;
+    use axum::http::Request;
     use deltalake::DeltaOps;
     use std::fs;
+    use tower::ServiceExt;
 
     fn create_test_cert_record(
         cert_index: u64,
@@ -1828,6 +1831,46 @@ mod tests {
         // Verify the results are the expected cert indices
         assert_eq!(actual_results[0], 1);
         assert_eq!(actual_results[49], 50);
+
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_query_timeout_returns_504() {
+        // AC5.4: Query timeout returns 504 GATEWAY_TIMEOUT when DataFusion execution exceeds query_timeout_secs
+        let table_path = "/tmp/delta_query_test_timeout";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create a table with at least one record so execution reaches the timeout path
+        let records = vec![create_test_cert_record(1, "log1", "2026-02-15", vec!["example.com"])];
+        let schema = delta_schema();
+        let table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("create table");
+        let batch = records_to_batch(&records, &schema).expect("create batch");
+        DeltaOps(table).write(vec![batch]).await.expect("write");
+
+        // Config with 0-second timeout triggers immediate Elapsed
+        let mut config = crate::config::QueryApiConfig::default();
+        config.enabled = true;
+        config.table_path = table_path.to_string();
+        config.query_timeout_secs = 0;
+
+        let state = Arc::new(QueryApiState { config });
+        let app = query_api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/query/certs?domain=example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
 
         let _ = fs::remove_dir_all(table_path);
     }
