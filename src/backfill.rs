@@ -1678,4 +1678,111 @@ mod tests {
 
         let _ = fs::remove_dir_all(&table_path);
     }
+
+    // Task 2 Tests: Ceiling behavior
+
+    #[tokio::test]
+    async fn test_ceiling_below_data_no_work_items() {
+        // backfill-state-ceiling.AC3.3: ceiling < min_index produces no work items.
+        // After removing frontier gaps, ceiling is not consulted in catch-up mode.
+        // This test confirms: contiguous data + any ceiling value = 0 work items.
+        let test_name = "ceiling_below_data";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Create records [100, 101, 102]
+        let records = vec![
+            make_test_record(100, "https://log.example.com"),
+            make_test_record(101, "https://log.example.com"),
+            make_test_record(102, "https://log.example.com"),
+        ];
+
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+        let _new_table = DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write failed");
+
+        // ceiling=50 is below min_index=100; irrelevant in catch-up mode
+        // but verifies AC3.3 is satisfied
+        let logs = vec![("https://log.example.com".to_string(), 50)];
+        let work_items = detect_gaps(&table_path, &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // No work items: no internal gaps in contiguous data, ceiling not consulted
+        assert_eq!(work_items.len(), 0, "Contiguous data with any ceiling should produce no work items in catch-up mode");
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_catch_up_ceiling_only_internal_gaps() {
+        // backfill-state-ceiling.AC1.1: catch-up fills only internal gaps, no frontier
+        let test_name = "ceiling_only_internal";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Records with gap: [10, 11, 15, 16] — missing 12, 13, 14
+        let records = vec![
+            make_test_record(10, "https://log.example.com"),
+            make_test_record(11, "https://log.example.com"),
+            make_test_record(15, "https://log.example.com"),
+            make_test_record(16, "https://log.example.com"),
+        ];
+
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+        let _new_table = DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write failed");
+
+        // ceiling=1000 (well above max_index=16)
+        let logs = vec![("https://log.example.com".to_string(), 1000)];
+        let work_items = detect_gaps(&table_path, &logs, None)
+            .await
+            .expect("detect_gaps failed");
+
+        // Should have exactly 1 internal gap (12, 14) — no frontier gap despite ceiling=1000
+        assert_eq!(work_items.len(), 1, "Should have only internal gap, no frontier");
+        assert_eq!(work_items[0].start, 12);
+        assert_eq!(work_items[0].end, 14);
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_historical_ceiling_used_as_upper_bound() {
+        // backfill-state-ceiling.AC2.1: historical mode uses ceiling from state file
+        let test_name = "historical_ceiling_upper";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+
+        // No table — historical mode with no delta table
+        let logs = vec![("https://log.example.com".to_string(), 100)];
+        let work_items = detect_gaps(&table_path, &logs, Some(0))
+            .await
+            .expect("detect_gaps failed");
+
+        // Should use ceiling=100 as upper bound: work item (0, 99)
+        assert_eq!(work_items.len(), 1);
+        assert_eq!(work_items[0].start, 0);
+        assert_eq!(work_items[0].end, 99);
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
 }
