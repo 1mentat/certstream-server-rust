@@ -951,16 +951,15 @@ mod tests {
             .expect("write failed");
 
         // Call detect_gaps in catch-up mode (no --from)
+        // Second tuple element is ceiling (was tree_size)
         let logs = vec![("https://log.example.com".to_string(), 200)];
         let work_items = detect_gaps(&table_path, &logs, None)
             .await
             .expect("detect_gaps failed");
 
-        // Should have frontier gap (103, 199)
-        assert_eq!(work_items.len(), 1);
-        assert_eq!(work_items[0].source_url, "https://log.example.com");
-        assert_eq!(work_items[0].start, 103);
-        assert_eq!(work_items[0].end, 199);
+        // With ceiling replacing tree_size and no frontier gap logic,
+        // contiguous data produces no work items
+        assert_eq!(work_items.len(), 0, "Contiguous data with ceiling > max_index should produce no work items");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -994,39 +993,32 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with tree_size=22 (creates a frontier gap)
+        // Call detect_gaps with ceiling=22 (no frontier gap generated)
         let logs = vec![("https://log.example.com".to_string(), 22)];
         let work_items = detect_gaps(&table_path, &logs, None)
             .await
             .expect("detect_gaps failed");
 
-        // Should detect gaps: (13, 14), (17, 19), and frontier gap (21, 21)
+        // Should detect only internal gaps: (13, 14), (17, 19) — no frontier gap
         let gaps: Vec<_> = work_items
             .iter()
             .filter(|item| item.source_url == "https://log.example.com")
             .collect();
 
-        // Should have exactly three work items: (13, 14), (17, 19), and frontier (21, 21)
-        assert_eq!(gaps.len(), 3, "Should detect internal gaps (13, 14), (17, 19) and frontier gap (21, 21)");
+        assert_eq!(gaps.len(), 2, "Should detect internal gaps (13, 14) and (17, 19) only");
 
-        // Check for gap (13, 14)
         let has_gap_13_14 = gaps.iter().any(|item| item.start == 13 && item.end == 14);
         assert!(has_gap_13_14, "Should detect gap (13, 14)");
 
-        // Check for gap (17, 19)
         let has_gap_17_19 = gaps.iter().any(|item| item.start == 17 && item.end == 19);
         assert!(has_gap_17_19, "Should detect gap (17, 19)");
-
-        // Check for frontier gap (21, 21)
-        let frontier_gaps: Vec<_> = gaps.iter().filter(|item| item.start == 21 && item.end == 21).collect();
-        assert_eq!(frontier_gaps.len(), 1, "Should detect exactly one frontier gap (21, 21)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
 
     #[tokio::test]
-    async fn test_ac2_3_catch_up_frontier_gap() {
-        let test_name = "ac2_3_frontier_gap";
+    async fn test_ac2_3_catch_up_no_frontier_gap() {
+        let test_name = "ac2_3_no_frontier_gap";
         let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
         let _ = fs::remove_dir_all(&table_path);
         let _ = fs::create_dir_all(&table_path);
@@ -1050,16 +1042,14 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with tree_size=10
+        // Call detect_gaps with ceiling=10
         let logs = vec![("https://log.example.com".to_string(), 10)];
         let work_items = detect_gaps(&table_path, &logs, None)
             .await
             .expect("detect_gaps failed");
 
-        // Should have frontier gap (3, 9)
-        assert_eq!(work_items.len(), 1);
-        assert_eq!(work_items[0].start, 3);
-        assert_eq!(work_items[0].end, 9);
+        // Should have NO work items (no frontier gap generated)
+        assert_eq!(work_items.len(), 0, "Contiguous data should produce no work items (no frontier gap)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1105,12 +1095,12 @@ mod tests {
             .collect();
         assert_eq!(log_b_items.len(), 0, "log-b should be skipped in catch-up mode");
 
-        // log-a should have work items
+        // log-a has contiguous data [0, 1] — no internal gaps, no frontier gap
         let log_a_items: Vec<_> = work_items
             .iter()
             .filter(|item| item.source_url == "https://log-a.example.com")
             .collect();
-        assert!(!log_a_items.is_empty(), "log-a should have work items");
+        assert_eq!(log_a_items.len(), 0, "log-a with contiguous data should have no work items (no frontier gap)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1141,20 +1131,17 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with --from 0, tree_size=55
+        // Call detect_gaps with --from 0, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
         let work_items = detect_gaps(&table_path, &logs, Some(0))
             .await
             .expect("detect_gaps failed");
 
-        // Should have pre-existing gap (0, 49) and frontier gap (53, 54)
-        assert!(work_items.len() >= 2, "Should have pre-existing and frontier gaps");
+        // Should have only pre-existing gap (0, 49) — no frontier gap
+        assert_eq!(work_items.len(), 1, "Should have only pre-existing gap");
 
         let has_pre_existing = work_items.iter().any(|item| item.start == 0 && item.end == 49);
         assert!(has_pre_existing, "Should have pre-existing gap (0, 49)");
-
-        let has_frontier = work_items.iter().any(|item| item.start == 53 && item.end == 54);
-        assert!(has_frontier, "Should have frontier gap (53, 54)");
 
         let _ = fs::remove_dir_all(&table_path);
     }
@@ -1185,14 +1172,14 @@ mod tests {
             .await
             .expect("write failed");
 
-        // Call detect_gaps with --from 40, tree_size=55
+        // Call detect_gaps with --from 40, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
         let work_items = detect_gaps(&table_path, &logs, Some(40))
             .await
             .expect("detect_gaps failed");
 
-        // Should have gap (40, 49) and frontier gap (53, 54)
-        assert!(work_items.len() >= 2, "Should have multiple gaps");
+        // Should have only the pre-existing gap (40, 49) — no frontier gap
+        assert_eq!(work_items.len(), 1, "Should have only pre-existing gap from overridden lower bound");
 
         let has_pre_gap = work_items.iter().any(|item| item.start == 40 && item.end == 49);
         assert!(has_pre_gap, "Should have gap (40, 49) from overridden lower bound");
