@@ -12,6 +12,17 @@ use tracing::warn;
 
 use crate::config::QueryApiConfig;
 
+/// Domain search mode determined from user input.
+#[derive(Debug, Clone, PartialEq)]
+enum DomainSearchMode {
+    /// No `.` or `*` in input → substring match via UNNEST + ILIKE '%term%'
+    Contains(String),
+    /// Input starts with `*.` → suffix match via UNNEST + ILIKE '%.suffix'
+    Suffix(String),
+    /// Input contains `.` but no `*` → exact match via array_has()
+    Exact(String),
+}
+
 pub struct QueryApiState {
     pub config: QueryApiConfig,
 }
@@ -65,6 +76,45 @@ fn is_valid_date(s: &str) -> bool {
     }
     // Parse with chrono to ensure it's a real date, not just a pattern match
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
+/// Escape special SQL LIKE characters (\, %, _, ') in user input.
+/// This prevents SQL injection and LIKE pattern confusion.
+/// Backslash must be escaped first since it's the LIKE escape character in DataFusion.
+fn escape_like_pattern(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('\'', "''")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Escape single quotes for embedding in SQL string literals (non-LIKE contexts).
+/// Use this for array_has() and other functions where %, _, \ are literal characters.
+fn escape_sql_string(input: &str) -> String {
+    input.replace('\'', "''")
+}
+
+/// Classify a domain search input into its search mode.
+/// Note: Only `*.` prefix triggers suffix mode. Malformed wildcards like `*example.com`
+/// (asterisk without following dot) contain `.` so they fall through to exact mode,
+/// where the `*` becomes a literal character. This is intentional — only the `*.` prefix
+/// is a recognized wildcard pattern.
+fn classify_domain_search(input: &str) -> DomainSearchMode {
+    if input.starts_with("*.") {
+        // Suffix mode: *.example.com → match domains ending with .example.com
+        let suffix = &input[1..]; // Keep the leading dot
+        DomainSearchMode::Suffix(escape_like_pattern(suffix))
+    } else if input.contains('.') {
+        // Exact mode: example.com → exact match in all_domains array
+        // Also handles edge cases like *example.com where * is treated literally
+        // Apply escape_sql_string at classification time for consistency with
+        // Contains/Suffix variants which store pre-escaped values
+        DomainSearchMode::Exact(escape_sql_string(&input.to_lowercase()))
+    } else {
+        // Contains mode: paypal → substring match
+        DomainSearchMode::Contains(escape_like_pattern(input))
+    }
 }
 
 pub fn query_api_router(state: Arc<QueryApiState>) -> Router {
@@ -141,19 +191,64 @@ async fn handle_query_certs(
     }
 
     // Build SQL query
-    let mut sql = String::from(
-        "SELECT cert_index, fingerprint, sha256, serial_number, \
-         subject_aggregated, issuer_aggregated, not_before, not_after, \
-         all_domains, source_name, seen, is_ca \
-         FROM ct_records WHERE 1=1"
+    // Determine if UNNEST is needed (contains or suffix domain search)
+    let needs_unnest = matches!(
+        params.domain.as_ref().map(|d| classify_domain_search(d)),
+        Some(DomainSearchMode::Contains(_)) | Some(DomainSearchMode::Suffix(_))
     );
 
-    // Date params are validated above — safe to embed directly
+    let select_cols = "cert_index, fingerprint, sha256, serial_number, \
+        subject_aggregated, issuer_aggregated, not_before, not_after, \
+        all_domains, source_name, seen, is_ca";
+
+    // Build SQL dynamically, using CTE for UNNEST operations
+    let mut sql = if needs_unnest {
+        // Use CTE for UNNEST to avoid outer reference issues
+        format!(
+            "WITH unnested AS ( \
+            SELECT cert_index, fingerprint, sha256, serial_number, \
+            subject_aggregated, issuer_aggregated, not_before, not_after, \
+            all_domains, source_name, seen, is_ca, \
+            UNNEST(all_domains) AS d \
+            FROM ct_records \
+            ) \
+            SELECT DISTINCT {} FROM unnested WHERE 1=1",
+            select_cols
+        )
+    } else {
+        format!("SELECT {} FROM ct_records WHERE 1=1", select_cols)
+    };
+
+    // Add domain filter
+    if let Some(ref domain) = params.domain {
+        match classify_domain_search(domain) {
+            DomainSearchMode::Contains(escaped) => {
+                sql.push_str(&format!(" AND d ILIKE '%{}%'", escaped));
+            }
+            DomainSearchMode::Suffix(escaped) => {
+                sql.push_str(&format!(" AND d ILIKE '%{}'", escaped));
+            }
+            DomainSearchMode::Exact(escaped) => {
+                // Value already escaped by escape_sql_string at classification time
+                sql.push_str(&format!(" AND array_has(all_domains, '{}')", escaped));
+            }
+        }
+    }
+
+    // Add issuer filter
+    if let Some(ref issuer) = params.issuer {
+        let escaped = escape_like_pattern(issuer);
+        sql.push_str(&format!(" AND issuer_aggregated ILIKE '%{}%'", escaped));
+    }
+
+    // Add date range filters (partition pruning)
+    // Date params are validated by is_valid_date() above; use escape_sql_string
+    // since these are string literals, not LIKE patterns
     if let Some(ref from) = params.from {
-        sql.push_str(&format!(" AND seen_date >= '{}'", from));
+        sql.push_str(&format!(" AND seen_date >= '{}'", escape_sql_string(from)));
     }
     if let Some(ref to) = params.to {
-        sql.push_str(&format!(" AND seen_date <= '{}'", to));
+        sql.push_str(&format!(" AND seen_date <= '{}'", escape_sql_string(to)));
     }
 
     sql.push_str(&format!(" ORDER BY cert_index LIMIT {}", limit));
@@ -670,6 +765,75 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_like_pattern() {
+        // Test % escaping
+        assert_eq!(escape_like_pattern("test%value"), "test\\%value");
+        // Test _ escaping
+        assert_eq!(escape_like_pattern("user_name"), "user\\_name");
+        // Test ' escaping
+        assert_eq!(escape_like_pattern("it's"), "it''s");
+        // Test backslash escaping (must be first)
+        assert_eq!(escape_like_pattern("back\\slash"), "back\\\\slash");
+        // Test combined
+        assert_eq!(
+            escape_like_pattern("user_name%it's\\test"),
+            "user\\_name\\%it''s\\\\test"
+        );
+    }
+
+    #[test]
+    fn test_escape_sql_string() {
+        // Test ' escaping
+        assert_eq!(escape_sql_string("it's"), "it''s");
+        // Test % NOT escaping (intentional for non-LIKE contexts)
+        assert_eq!(escape_sql_string("100%"), "100%");
+        // Test backslash NOT escaping (intentional for non-LIKE contexts)
+        assert_eq!(escape_sql_string("back\\slash"), "back\\slash");
+        // Test combined (only ' is escaped)
+        assert_eq!(escape_sql_string("it's%back\\test"), "it''s%back\\test");
+    }
+
+    #[test]
+    fn test_classify_domain_search_contains() {
+        let result = classify_domain_search("paypal");
+        assert_eq!(result, DomainSearchMode::Contains("paypal".to_string()));
+    }
+
+    #[test]
+    fn test_classify_domain_search_suffix() {
+        let result = classify_domain_search("*.example.com");
+        assert_eq!(result, DomainSearchMode::Suffix(".example.com".to_string()));
+    }
+
+    #[test]
+    fn test_classify_domain_search_exact() {
+        let result = classify_domain_search("example.com");
+        assert_eq!(result, DomainSearchMode::Exact("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_classify_domain_search_exact_with_malformed_wildcard() {
+        // *example.com (asterisk without dot) should be treated as exact
+        // because it contains . but doesn't start with *.
+        let result = classify_domain_search("*example.com");
+        assert_eq!(result, DomainSearchMode::Exact("*example.com".to_string()));
+    }
+
+    #[test]
+    fn test_classify_domain_search_contains_with_special_chars() {
+        let result = classify_domain_search("pay%pal");
+        // Contains mode, and the % is already escaped by classify_domain_search
+        assert_eq!(result, DomainSearchMode::Contains("pay\\%pal".to_string()));
+    }
+
+    #[test]
+    fn test_classify_domain_search_suffix_with_escaping() {
+        let result = classify_domain_search("*.example%com");
+        // Suffix mode, the % in the suffix is escaped
+        assert_eq!(result, DomainSearchMode::Suffix(".example\\%com".to_string()));
+    }
+
+    #[test]
     fn test_query_params_deserialization() {
         let params = QueryParams {
             domain: Some("example.com".to_string()),
@@ -684,6 +848,316 @@ mod tests {
         assert_eq!(params.from, Some("2026-02-10".to_string()));
         assert_eq!(params.to, Some("2026-02-20".to_string()));
         assert_eq!(params.limit, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_domain_contains_search() {
+        let table_path = "/tmp/delta_query_test_domain_contains";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create test records with varied domains
+        let records = vec![
+            // Record 1: contains example.com
+            {
+                let mut rec = create_test_cert_record(1, "log1", "2026-02-17", vec!["example.com", "www.example.com"]);
+                rec.issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
+                rec
+            },
+            // Record 2: contains paypal.com
+            {
+                let mut rec = create_test_cert_record(2, "log1", "2026-02-18", vec!["paypal.com", "www.paypal.com"]);
+                rec.issuer_aggregated = "/CN=DigiCert".to_string();
+                rec
+            },
+            // Record 3: contains test.paypal.example.com
+            {
+                let mut rec = create_test_cert_record(3, "log1", "2026-02-19", vec!["test.paypal.example.com"]);
+                rec.issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
+                rec
+            },
+        ];
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Re-open table for querying
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query: domain contains "paypal" should match records 2 and 3
+        // Using subquery approach since DataFusion CROSS JOIN UNNEST has limitations
+        let sql = "WITH unnested AS ( \
+                   SELECT cert_index, UNNEST(all_domains) AS domain \
+                   FROM ct_records \
+                   ) \
+                   SELECT DISTINCT cert_index FROM unnested \
+                   WHERE domain ILIKE '%paypal%' \
+                   ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut cert_indices = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        assert_eq!(cert_indices, vec![2, 3]);
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_domain_suffix_search() {
+        let table_path = "/tmp/delta_query_test_domain_suffix";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        let records = vec![
+            // Record 1: example.com and www.example.com (matches *.example.com)
+            create_test_cert_record(1, "log1", "2026-02-17", vec!["example.com", "www.example.com"]),
+            // Record 2: paypal.com, www.paypal.com (doesn't match *.example.com)
+            create_test_cert_record(2, "log1", "2026-02-18", vec!["paypal.com", "www.paypal.com"]),
+            // Record 3: test.paypal.example.com (matches *.example.com)
+            create_test_cert_record(3, "log1", "2026-02-19", vec!["test.paypal.example.com"]),
+        ];
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query: domain suffix "*.example.com" should match records 1 and 3
+        // Using CTE with UNNEST
+        let sql = "WITH unnested AS ( \
+                   SELECT cert_index, UNNEST(all_domains) AS domain \
+                   FROM ct_records \
+                   ) \
+                   SELECT DISTINCT cert_index FROM unnested \
+                   WHERE domain ILIKE '%.example.com' \
+                   ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut cert_indices = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        assert_eq!(cert_indices, vec![1, 3]);
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_domain_exact_search() {
+        let table_path = "/tmp/delta_query_test_domain_exact";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        let records = vec![
+            // Record 1: contains example.com exactly
+            create_test_cert_record(1, "log1", "2026-02-17", vec!["example.com", "www.example.com"]),
+            // Record 2: doesn't have example.com
+            create_test_cert_record(2, "log1", "2026-02-18", vec!["paypal.com", "www.paypal.com"]),
+            // Record 3: has test.paypal.example.com, not exact example.com
+            create_test_cert_record(3, "log1", "2026-02-19", vec!["test.paypal.example.com"]),
+        ];
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query: domain exact "example.com" should match only record 1
+        let sql = "SELECT cert_index FROM ct_records \
+                   WHERE array_has(all_domains, 'example.com') \
+                   ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut cert_indices = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        assert_eq!(cert_indices, vec![1]);
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_issuer_search() {
+        let table_path = "/tmp/delta_query_test_issuer_search";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        let mut records = vec![
+            create_test_cert_record(1, "log1", "2026-02-17", vec!["example.com"]),
+            create_test_cert_record(2, "log1", "2026-02-18", vec!["paypal.com"]),
+            create_test_cert_record(3, "log1", "2026-02-19", vec!["test.com"]),
+        ];
+
+        // Set different issuers
+        records[0].issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
+        records[1].issuer_aggregated = "/CN=DigiCert".to_string();
+        records[2].issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query: issuer contains "Let's Encrypt" should match records 1 and 3
+        let sql = "SELECT cert_index FROM ct_records \
+                   WHERE issuer_aggregated ILIKE '%Let''s Encrypt%' \
+                   ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut cert_indices = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        assert_eq!(cert_indices, vec![1, 3]);
+        let _ = fs::remove_dir_all(table_path);
+    }
+
+    #[tokio::test]
+    async fn test_combined_domain_issuer_search() {
+        let table_path = "/tmp/delta_query_test_combined_filter";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        let mut records = vec![
+            create_test_cert_record(1, "log1", "2026-02-17", vec!["example.com", "www.example.com"]),
+            create_test_cert_record(2, "log1", "2026-02-18", vec!["paypal.com", "www.paypal.com"]),
+            create_test_cert_record(3, "log1", "2026-02-19", vec!["test.paypal.example.com"]),
+        ];
+
+        // Set different issuers
+        records[0].issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
+        records[1].issuer_aggregated = "/CN=DigiCert".to_string();
+        records[2].issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Query: domain contains "paypal" AND issuer contains "Let's Encrypt"
+        // Should match only record 3 (paypal in domain AND Let's Encrypt in issuer)
+        // Using CTE with UNNEST
+        let sql = "WITH unnested AS ( \
+                   SELECT cert_index, issuer_aggregated, UNNEST(all_domains) AS domain \
+                   FROM ct_records \
+                   ) \
+                   SELECT DISTINCT cert_index FROM unnested \
+                   WHERE domain ILIKE '%paypal%' \
+                   AND issuer_aggregated ILIKE '%Let''s Encrypt%' \
+                   ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let mut cert_indices = Vec::new();
+        for batch in &batches {
+            if let Some(indices) = batch.column(0).as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i));
+                }
+            } else if let Some(indices) = batch.column(0).as_any().downcast_ref::<Int64Array>() {
+                for i in 0..batch.num_rows() {
+                    cert_indices.push(indices.value(i) as u64);
+                }
+            }
+        }
+
+        assert_eq!(cert_indices, vec![3]);
+        let _ = fs::remove_dir_all(table_path);
     }
 
     #[test]
