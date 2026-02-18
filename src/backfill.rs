@@ -693,6 +693,24 @@ pub async fn run_backfill(
     }
 }
 
+/// Merge mode stub — merges staging table into main table.
+///
+/// # Arguments
+/// * `_config` - Server configuration
+/// * `_staging_path` - Path to the staging Delta table
+/// * `_shutdown` - CancellationToken for graceful shutdown
+///
+/// # Returns
+/// * `i32` exit code (0 for success, 1 for errors)
+pub async fn run_merge(
+    _config: Config,
+    _staging_path: String,
+    _shutdown: CancellationToken,
+) -> i32 {
+    info!("Merge mode stub — not yet implemented");
+    0
+}
+
 /// Per-log fetcher task that processes work items sequentially.
 ///
 /// This task:
