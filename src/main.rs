@@ -491,6 +491,15 @@ fn build_router(protocols: &config::ProtocolConfig, config: &Config, deps: Route
     }
 
     if config.query_api.enabled {
+        // Check table path accessibility (non-fatal warning)
+        let table_path = std::path::Path::new(&config.query_api.table_path);
+        if !table_path.exists() {
+            warn!(
+                table_path = %config.query_api.table_path,
+                "Query API table path does not exist yet; queries will return 503 until data is written"
+            );
+        }
+
         let query_api_state = Arc::new(query::QueryApiState {
             config: config.query_api.clone(),
         });
