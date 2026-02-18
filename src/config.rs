@@ -319,6 +319,48 @@ fn default_delta_sink_flush_interval_secs() -> u64 {
     30
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueryApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_query_api_table_path")]
+    pub table_path: String,
+    #[serde(default = "default_query_api_max_results_per_page")]
+    pub max_results_per_page: usize,
+    #[serde(default = "default_query_api_default_results_per_page")]
+    pub default_results_per_page: usize,
+    #[serde(default = "default_query_api_timeout_secs")]
+    pub query_timeout_secs: u64,
+}
+
+impl Default for QueryApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            table_path: default_query_api_table_path(),
+            max_results_per_page: default_query_api_max_results_per_page(),
+            default_results_per_page: default_query_api_default_results_per_page(),
+            query_timeout_secs: default_query_api_timeout_secs(),
+        }
+    }
+}
+
+fn default_query_api_table_path() -> String {
+    "./data/certstream".to_string()
+}
+
+fn default_query_api_max_results_per_page() -> usize {
+    500
+}
+
+fn default_query_api_default_results_per_page() -> usize {
+    50
+}
+
+fn default_query_api_timeout_secs() -> u64 {
+    30
+}
+
 fn default_true() -> bool {
     true
 }
@@ -342,6 +384,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub hot_reload: HotReloadConfig,
     pub delta_sink: DeltaSinkConfig,
+    pub query_api: QueryApiConfig,
     pub config_path: Option<String>,
 }
 
@@ -374,6 +417,8 @@ struct YamlConfig {
     hot_reload: Option<HotReloadConfig>,
     #[serde(default)]
     delta_sink: Option<DeltaSinkConfig>,
+    #[serde(default)]
+    query_api: Option<QueryApiConfig>,
 }
 
 struct YamlConfigWithPath {
@@ -526,6 +571,23 @@ impl Config {
             delta_sink.flush_interval_secs = v.parse().unwrap_or(delta_sink.flush_interval_secs);
         }
 
+        let mut query_api = yaml_config.query_api.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_QUERY_API_ENABLED") {
+            query_api.enabled = v.parse().unwrap_or(query_api.enabled);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_QUERY_API_TABLE_PATH") {
+            query_api.table_path = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_QUERY_API_MAX_RESULTS_PER_PAGE") {
+            query_api.max_results_per_page = v.parse().unwrap_or(query_api.max_results_per_page);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_QUERY_API_DEFAULT_RESULTS_PER_PAGE") {
+            query_api.default_results_per_page = v.parse().unwrap_or(query_api.default_results_per_page);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_QUERY_API_QUERY_TIMEOUT_SECS") {
+            query_api.query_timeout_secs = v.parse().unwrap_or(query_api.query_timeout_secs);
+        }
+
         Self {
             host,
             port,
@@ -544,6 +606,7 @@ impl Config {
             auth,
             hot_reload,
             delta_sink,
+            query_api,
             config_path,
         }
     }
@@ -685,6 +748,7 @@ mod tests {
             auth: AuthConfig::default(),
             hot_reload: HotReloadConfig::default(),
             delta_sink: DeltaSinkConfig::default(),
+            query_api: QueryApiConfig::default(),
             config_path: None,
         }
     }
@@ -866,5 +930,32 @@ batch_size: 512
         assert_eq!(config.state_file, Some("my_state.json".to_string()));
         assert_eq!(config.batch_size, 512);
         assert_eq!(config.retry_initial_delay_ms, 1000);
+    }
+
+    #[test]
+    fn test_query_api_config_defaults() {
+        let config = QueryApiConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.table_path, "./data/certstream");
+        assert_eq!(config.max_results_per_page, 500);
+        assert_eq!(config.default_results_per_page, 50);
+        assert_eq!(config.query_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_query_api_config_deserialize() {
+        let yaml = r#"
+enabled: true
+table_path: "/custom/path"
+max_results_per_page: 100
+default_results_per_page: 25
+query_timeout_secs: 60
+"#;
+        let config: QueryApiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.table_path, "/custom/path");
+        assert_eq!(config.max_results_per_page, 100);
+        assert_eq!(config.default_results_per_page, 25);
+        assert_eq!(config.query_timeout_secs, 60);
     }
 }
