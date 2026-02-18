@@ -76,6 +76,10 @@ impl CliArgs {
         println!("    present in the state file are skipped. Run the live server");
         println!("    first to populate the state file.");
         println!();
+        println!("STAGING/MERGE OPTIONS:");
+        println!("    --staging-path <PATH>  Write backfill to staging Delta table at PATH");
+        println!("    --merge                Merge staging table into main table");
+        println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
         println!("    CERTSTREAM_HOST                Server host (default: 0.0.0.0)");
