@@ -46,7 +46,7 @@ struct DeltaLogState {
 /// # Returns
 /// * HashMap mapping source_url to DeltaLogState (min_index, max_index, count)
 async fn query_log_states(ctx: &SessionContext) -> Result<HashMap<String, DeltaLogState>, Box<dyn Error>> {
-    let sql = "SELECT source_url, MIN(cert_index) as min_idx, MAX(cert_index) as max_idx, COUNT(cert_index) as cnt FROM ct_records GROUP BY source_url";
+    let sql = "SELECT source_url, MIN(cert_index) as min_idx, MAX(cert_index) as max_idx, COUNT(DISTINCT cert_index) as cnt FROM ct_records GROUP BY source_url";
 
     let df = ctx.sql(sql).await?;
     let batches = df.collect().await?;
@@ -333,7 +333,7 @@ pub async fn detect_gaps(
     ctx.register_table("ct_main", std::sync::Arc::new(table))?;
 
     // Register UNION ALL view if staging table exists
-    let _has_staging = if let Some(staging) = staging_path {
+    let has_staging = if let Some(staging) = staging_path {
         match deltalake::open_table(staging).await {
             Ok(staging_table) => {
                 ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
@@ -354,7 +354,7 @@ pub async fn detect_gaps(
         false
     };
 
-    if !_has_staging {
+    if !has_staging {
         ctx.sql(
             "CREATE VIEW ct_records AS SELECT cert_index, source_url FROM ct_main"
         ).await?;

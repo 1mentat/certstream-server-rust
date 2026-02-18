@@ -70,7 +70,7 @@ The binary has two execution modes selected in main.rs:
 - **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, shutdown)` called from main, returns exit code (i32)
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
-- **Gap detection**: `detect_gaps(table_path, logs, backfill_from)` queries Delta table via DataFusion SQL, finds internal gaps only (LEAD window function). The second element of the `logs` tuple is the ceiling (from state file `current_index`).
+- **Gap detection**: `detect_gaps(table_path, staging_path, logs, backfill_from)` queries Delta table(s) via DataFusion SQL, finds internal gaps only (LEAD window function). When staging_path is provided and the staging table exists, both tables are queried via a UNION ALL view. The second element of the `logs` tuple is the ceiling (from state file `current_index`).
 - **Catch-up rules**: only backfills logs already present in Delta table; logs not in table are skipped; only internal gaps are filled (no frontier gaps)
 - **Historical rules**: backfills all logs from `--from` index to ceiling; logs not in Delta get full range from `--from` to ceiling
 - **Architecture**: mpsc channel from N fetcher tasks to 1 writer task; fetchers send `DeltaCertRecord`; writer flushes on batch_size, timer, channel close, or shutdown
