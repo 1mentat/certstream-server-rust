@@ -9,6 +9,7 @@ mod health;
 mod hot_reload;
 mod middleware;
 mod models;
+mod query;
 mod rate_limit;
 mod sse;
 mod state;
@@ -514,6 +515,24 @@ fn build_router(protocols: &config::ProtocolConfig, config: &Config, deps: Route
             .with_state(api_state);
         app = app.merge(api_router);
         info!("REST API enabled");
+    }
+
+    if config.query_api.enabled {
+        // Check table path accessibility (non-fatal warning)
+        let table_path = std::path::Path::new(&config.query_api.table_path);
+        if !table_path.exists() {
+            warn!(
+                table_path = %config.query_api.table_path,
+                "Query API table path does not exist yet; queries will return 503 until data is written"
+            );
+        }
+
+        let query_api_state = Arc::new(query::QueryApiState {
+            config: config.query_api.clone(),
+        });
+        let query_router = query::query_api_router(query_api_state);
+        app = app.merge(query_router);
+        info!("Query API enabled");
     }
 
     if protocols.websocket {
