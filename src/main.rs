@@ -69,6 +69,32 @@ async fn main() {
         return;
     }
 
+    if cli_args.merge {
+        if cli_args.staging_path.is_none() {
+            eprintln!("Error: --merge requires --staging-path <PATH>");
+            std::process::exit(1);
+        }
+
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            )
+            .init();
+
+        let shutdown_token = CancellationToken::new();
+        spawn_signal_handler(shutdown_token.clone());
+
+        let exit_code = backfill::run_merge(
+            config,
+            cli_args.staging_path.unwrap(),
+            shutdown_token,
+        )
+        .await;
+
+        std::process::exit(exit_code);
+    }
+
     if cli_args.backfill {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -82,6 +108,7 @@ async fn main() {
 
         let exit_code = backfill::run_backfill(
             config,
+            cli_args.staging_path,
             cli_args.backfill_from,
             cli_args.backfill_logs,
             shutdown_token,

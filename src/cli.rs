@@ -12,6 +12,8 @@ pub struct CliArgs {
     pub backfill: bool,
     pub backfill_from: Option<u64>,
     pub backfill_logs: Option<String>,
+    pub staging_path: Option<String>,
+    pub merge: bool,
 }
 
 impl CliArgs {
@@ -21,6 +23,7 @@ impl CliArgs {
         // Parse value-bearing flags with index-based iteration
         let mut backfill_from = None;
         let mut backfill_logs = None;
+        let mut staging_path = None;
 
         for (i, arg) in args.iter().enumerate() {
             if arg == "--from" && i + 1 < args.len() {
@@ -29,6 +32,8 @@ impl CliArgs {
                 }
             } else if arg == "--logs" && i + 1 < args.len() {
                 backfill_logs = Some(args[i + 1].clone());
+            } else if arg == "--staging-path" && i + 1 < args.len() {
+                staging_path = Some(args[i + 1].clone());
             }
         }
 
@@ -41,6 +46,8 @@ impl CliArgs {
             backfill: args.iter().any(|a| a == "--backfill"),
             backfill_from,
             backfill_logs,
+            staging_path,
+            merge: args.iter().any(|a| a == "--merge"),
         }
     }
 
@@ -68,6 +75,10 @@ impl CliArgs {
         println!("    certstream_state.json) as the per-log upper bound. Logs not");
         println!("    present in the state file are skipped. Run the live server");
         println!("    first to populate the state file.");
+        println!();
+        println!("STAGING/MERGE OPTIONS:");
+        println!("    --staging-path <PATH>  Write backfill to staging Delta table at PATH");
+        println!("    --merge                Merge staging table into main table");
         println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
