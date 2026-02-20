@@ -587,3 +587,94 @@ mod tests {
         assert_eq!(cert_record.chain.len(), 1);
     }
 }
+
+#[cfg(all(test, feature = "integration"))]
+mod integration_tests {
+    use super::*;
+    use crate::delta_sink::DeltaCertRecord;
+    use databricks_zerobus_ingest_sdk::{
+        StreamConfigurationOptions, TableProperties, ZerobusSdk,
+    };
+    use prost::Message;
+
+    fn test_record() -> DeltaCertRecord {
+        DeltaCertRecord {
+            cert_index: 999999,
+            update_type: "X509LogEntry".to_string(),
+            seen: 1700000000.0,
+            seen_date: "2023-11-14".to_string(),
+            source_name: "integration-test".to_string(),
+            source_url: "https://test.example.com".to_string(),
+            cert_link: "".to_string(),
+            serial_number: "AA:BB:CC".to_string(),
+            fingerprint: "test-fingerprint".to_string(),
+            sha256: "test-sha256".to_string(),
+            sha1: "test-sha1".to_string(),
+            not_before: 1700000000,
+            not_after: 1731536000,
+            is_ca: false,
+            signature_algorithm: "SHA256withRSA".to_string(),
+            subject_aggregated: "CN=test.example.com".to_string(),
+            issuer_aggregated: "CN=Test CA".to_string(),
+            all_domains: vec!["test.example.com".to_string()],
+            as_der: "".to_string(),
+            chain: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zerobus_ingest_record() {
+        let endpoint = match std::env::var("ZEROBUS_TEST_ENDPOINT") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Skipping integration test: ZEROBUS_TEST_ENDPOINT not set");
+                return;
+            }
+        };
+        let uc_url = std::env::var("ZEROBUS_TEST_UC_URL")
+            .expect("ZEROBUS_TEST_UC_URL required");
+        let table_name = std::env::var("ZEROBUS_TEST_TABLE_NAME")
+            .expect("ZEROBUS_TEST_TABLE_NAME required");
+        let client_id = std::env::var("ZEROBUS_TEST_CLIENT_ID")
+            .expect("ZEROBUS_TEST_CLIENT_ID required");
+        let client_secret = std::env::var("ZEROBUS_TEST_CLIENT_SECRET")
+            .expect("ZEROBUS_TEST_CLIENT_SECRET required");
+
+        let sdk = ZerobusSdk::new(
+            endpoint.clone(),
+            uc_url.clone(),
+        )
+        .expect("Failed to create ZeroBus SDK");
+
+        let table_properties = TableProperties {
+            table_name: table_name.clone(),
+            descriptor_proto: cert_record_descriptor_proto(),
+        };
+
+        let mut stream = sdk
+            .create_stream(
+                table_properties,
+                client_id,
+                client_secret,
+                Some(StreamConfigurationOptions::default()),
+            )
+            .await
+            .expect("Failed to create stream");
+
+        let record = test_record();
+        let cert_record = proto::CertRecord::from_delta_cert(&record);
+        let encoded = cert_record.encode_to_vec();
+
+        // ingest_record returns ack future on success; await it to confirm ingestion
+        let ack_future = stream
+            .ingest_record(encoded)
+            .await
+            .expect("Failed to queue record for ingestion");
+        ack_future.await.expect("Failed to get ingestion acknowledgement");
+
+        stream.flush().await.expect("Failed to flush");
+        stream.close().await.expect("Failed to close");
+
+        println!("Integration test passed: record ingested into {}", table_name);
+    }
+}
