@@ -191,6 +191,22 @@ async fn main() {
         None
     };
 
+    let zerobus_sink_handle = if config.zerobus_sink.enabled {
+        let zerobus_rx = tx.subscribe();
+        let zerobus_config = config.zerobus_sink.clone();
+        let zerobus_shutdown = shutdown_token.clone();
+        let handle = tokio::spawn(zerobus_sink::run_zerobus_sink(
+            zerobus_config,
+            zerobus_rx,
+            zerobus_shutdown,
+        ));
+        info!("zerobus sink enabled, streaming to: {}", config.zerobus_sink.table_name);
+        Some(handle)
+    } else {
+        info!("zerobus sink disabled");
+        None
+    };
+
     let ct_log_config = Arc::new(config.ct_log.clone());
     let log_tracker = Arc::new(LogTracker::new());
     let server_stats = Arc::new(ServerStats::new());
@@ -277,6 +293,14 @@ async fn main() {
             Ok(Ok(())) => info!("delta sink shutdown complete"),
             Ok(Err(e)) => warn!(error = %e, "delta sink task panicked during shutdown"),
             Err(_) => warn!("delta sink shutdown timed out after 30s"),
+        }
+    }
+
+    if let Some(handle) = zerobus_sink_handle {
+        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+            Ok(Ok(())) => info!("zerobus sink shutdown complete"),
+            Ok(Err(e)) => warn!(error = %e, "zerobus sink task panicked during shutdown"),
+            Err(_) => warn!("zerobus sink shutdown timed out after 30s"),
         }
     }
 
