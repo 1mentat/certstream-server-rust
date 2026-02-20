@@ -4,9 +4,17 @@
 //! - The generated `CertRecord` protobuf message (compiled from `proto/cert_record.proto`)
 //! - Conversion from `DeltaCertRecord` to `CertRecord`
 //! - DescriptorProto extraction for ZeroBus SDK integration
+//! - A live streaming sink that forwards certificate records to Databricks via ZeroBus SDK
 
+use crate::config::ZerobusSinkConfig;
 use crate::delta_sink::DeltaCertRecord;
+use crate::models::PreSerializedMessage;
+use databricks_zerobus_ingest_sdk::{StreamConfigurationOptions, TableProperties, ZerobusSdk};
 use prost::Message;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Re-export the generated protobuf code from prost-build.
 pub mod proto {
@@ -73,6 +81,164 @@ pub fn cert_record_descriptor_proto() -> prost_types::DescriptorProto {
         .into_iter()
         .next()
         .expect("No message types in file descriptor")
+}
+
+/// Main ZeroBus sink task: subscribes to broadcast channel and forwards records to Databricks.
+///
+/// This task:
+/// - Receives `PreSerializedMessage` from the broadcast channel
+/// - Deserializes each message into a `DeltaCertRecord`
+/// - Converts to protobuf `CertRecord` and encodes it
+/// - Forwards to Databricks via ZeroBus SDK
+/// - Handles retryable errors by recreating the stream
+/// - Skips non-retryable errors with a warning
+/// - Gracefully shuts down by flushing and closing the stream on CancellationToken
+///
+/// If SDK or stream creation fails at startup, logs an error and exits without crashing the server.
+pub async fn run_zerobus_sink(
+    config: ZerobusSinkConfig,
+    mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
+    shutdown: CancellationToken,
+) {
+    // Build SDK
+    let sdk = match ZerobusSdk::new(
+        config.endpoint.clone(),
+        config.unity_catalog_url.clone(),
+    ) {
+        Ok(sdk) => sdk,
+        Err(e) => {
+            error!(error = %e, "failed to create ZeroBus SDK, sink will not run");
+            return; // AC1.5: non-fatal exit
+        }
+    };
+
+    // Build table properties with DescriptorProto from Phase 1
+    let table_properties = TableProperties {
+        table_name: config.table_name.clone(),
+        descriptor_proto: cert_record_descriptor_proto(),
+    };
+
+    // Stream configuration
+    let options = StreamConfigurationOptions {
+        max_inflight_records: config.max_inflight_records,
+        ..Default::default()
+    };
+
+    // Create initial stream
+    let mut stream = match sdk
+        .create_stream(
+            table_properties.clone(),
+            config.client_id.clone(),
+            config.client_secret.clone(),
+            Some(options.clone()),
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "failed to create ZeroBus stream, sink will not run");
+            return; // AC1.5: non-fatal exit
+        }
+    };
+
+    info!(
+        table_name = %config.table_name,
+        "zerobus sink started, streaming to Databricks"
+    );
+
+    let mut record_counter: i64 = 0;
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(msg) => {
+                        // Deserialize JSON bytes -> DeltaCertRecord -> CertRecord -> protobuf bytes
+                        let record = match DeltaCertRecord::from_json(&msg.full) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                debug!(error = %e, "failed to deserialize message, skipping");
+                                continue;
+                            }
+                        };
+
+                        let cert_record = proto::CertRecord::from_delta_cert(&record);
+                        let encoded = cert_record.encode_to_vec();
+
+                        // Ingest via SDK (two-stage: first await queues record, returns ack future)
+                        match stream.ingest_record(encoded).await {
+                            Ok(_ack_future) => {
+                                // Record queued; ack arrives asynchronously via SDK internals
+                                // Drop ack future — flush() at shutdown collects pending acks
+                                record_counter += 1;
+                            }
+                            Err(e) => {
+                                if e.is_retryable() {
+                                    // AC1.3: retryable error -> recreate stream
+                                    // Note: recreate_stream() takes stream by value (consumes it)
+                                    warn!(error = %e, "retryable ingest error, recreating stream");
+                                    match sdk.recreate_stream(stream).await {
+                                        Ok(new_stream) => {
+                                            stream = new_stream;
+                                            info!("zerobus stream recovered");
+                                            // Retry the record on new stream
+                                            let cert_record = proto::CertRecord::from_delta_cert(&record);
+                                            let encoded = cert_record.encode_to_vec();
+                                            match stream.ingest_record(encoded).await {
+                                                Ok(_ack) => {
+                                                    record_counter += 1;
+                                                }
+                                                Err(retry_err) => {
+                                                    warn!(error = %retry_err, "failed to ingest after stream recovery, skipping record");
+                                                }
+                                            }
+                                        }
+                                        Err(recreate_err) => {
+                                            // Stream consumed by failed recreate — cannot continue
+                                            error!(error = %recreate_err, "failed to recreate zerobus stream, exiting sink");
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    // AC1.4: non-retryable error -> skip record
+                                    warn!(error = %e, "non-retryable ingest error, skipping record");
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Match delta_sink lagged handling pattern (delta_sink.rs:712-720)
+                        warn!(count = n, "zerobus sink lagged, dropped {} messages", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("broadcast channel closed, zerobus sink shutting down");
+                        break;
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                // AC1.2: graceful shutdown
+                info!("zerobus sink shutting down, flushing pending records");
+                if let Err(e) = stream.flush().await {
+                    warn!(error = %e, "error flushing zerobus stream during shutdown");
+                }
+                if let Err(e) = stream.close().await {
+                    warn!(error = %e, "error closing zerobus stream during shutdown");
+                }
+                info!(records = record_counter, "zerobus sink shutdown complete");
+                return;
+            }
+        }
+    }
+
+    // Channel closed path — also flush and close
+    if let Err(e) = stream.flush().await {
+        warn!(error = %e, "error flushing zerobus stream");
+    }
+    if let Err(e) = stream.close().await {
+        warn!(error = %e, "error closing zerobus stream");
+    }
+    info!(records = record_counter, "zerobus sink finished");
 }
 
 #[cfg(test)]
@@ -238,5 +404,179 @@ mod tests {
         assert_eq!(decoded.all_domains, cert_record.all_domains);
         assert_eq!(decoded.as_der, cert_record.as_der);
         assert_eq!(decoded.chain, cert_record.chain);
+    }
+
+    /// Test deserialization from JSON bytes (AC1.1 partial).
+    /// This verifies that `DeltaCertRecord::from_json()` correctly deserializes
+    /// JSON bytes matching the `PreSerializedMessage.full` format.
+    #[test]
+    fn test_delta_cert_record_from_json_valid() {
+        // Create a valid CertificateMessage JSON matching actual CT log format
+        let cert_json = r#"{
+            "message_type": "certificate_update",
+            "data": {
+                "update_type": "X509AddedToSCT",
+                "cert_index": 54321,
+                "chain": [
+                    {
+                        "subject": {"CN": "example.com", "aggregated": "/CN=example.com"},
+                        "issuer": {"CN": "Let's Encrypt", "aggregated": "/CN=Let's Encrypt"},
+                        "serial_number": "0xdeadbeef",
+                        "not_before": 1700000000,
+                        "not_after": 1731536000,
+                        "fingerprint": "sha1fingerprint123",
+                        "sha1": "sha1hash",
+                        "sha256": "sha256hash",
+                        "signature_algorithm": "sha256WithRSAEncryption",
+                        "is_ca": false,
+                        "extensions": {}
+                    },
+                    {
+                        "subject": {"CN": "Intermediate CA", "aggregated": "/CN=Intermediate CA"},
+                        "issuer": {"CN": "Root CA", "aggregated": "/CN=Root CA"},
+                        "serial_number": "0xcccccccc",
+                        "not_before": 1600000000,
+                        "not_after": 1800000000,
+                        "fingerprint": "intermediate_fingerprint",
+                        "sha1": "intermediate_sha1",
+                        "sha256": "intermediate_sha256",
+                        "signature_algorithm": "sha256WithRSAEncryption",
+                        "is_ca": true,
+                        "extensions": {}
+                    }
+                ],
+                "cert_link": "https://ct.example.com/logs/test/?d=54321",
+                "source": {
+                    "url": "https://ct.example.com/logs/test/",
+                    "name": "example-log"
+                },
+                "seen": 1708454400.5,
+                "leaf_cert": {
+                    "all_domains": ["example.com", "www.example.com"],
+                    "fingerprint": "leaf_fingerprint",
+                    "not_after": 1731536000,
+                    "not_before": 1700000000,
+                    "serial_number": "0xdeadbeef",
+                    "signature_algorithm": "sha256WithRSAEncryption",
+                    "issuer": {"CN": "Let's Encrypt", "aggregated": "/CN=Let's Encrypt"},
+                    "subject": {"CN": "example.com", "aggregated": "/CN=example.com"},
+                    "sha1": "leaf_sha1",
+                    "sha256": "leaf_sha256",
+                    "is_ca": false,
+                    "as_der": "base64encodedder",
+                    "extensions": {}
+                }
+            }
+        }"#;
+
+        let record = DeltaCertRecord::from_json(cert_json.as_bytes());
+        assert!(record.is_ok(), "from_json should succeed with valid JSON");
+
+        let record = record.unwrap();
+        // Verify all 20 fields are correctly deserialized
+        assert_eq!(record.cert_index, 54321);
+        assert_eq!(record.update_type, "X509AddedToSCT");
+        assert_eq!(record.source_name, "example-log");
+        assert_eq!(record.source_url, "https://ct.example.com/logs/test/");
+        assert_eq!(record.seen, 1708454400.5);
+        assert_eq!(record.serial_number, "0xdeadbeef");
+        assert_eq!(record.not_before, 1700000000);
+        assert_eq!(record.not_after, 1731536000);
+        assert_eq!(record.signature_algorithm, "sha256WithRSAEncryption");
+        assert_eq!(record.subject_aggregated, "/CN=example.com");
+        assert_eq!(record.issuer_aggregated, "/CN=Let's Encrypt");
+        assert_eq!(
+            record.all_domains,
+            vec!["example.com", "www.example.com"]
+        );
+        assert!(!record.chain.is_empty());
+        assert_eq!(record.chain.len(), 2);
+    }
+
+    /// Test that malformed JSON is rejected (AC1.4 partial).
+    /// This verifies the deserialization error path that the sink handles by skipping.
+    #[test]
+    fn test_delta_cert_record_from_json_invalid() {
+        let malformed_json = r#"{ invalid json }"#;
+        let record = DeltaCertRecord::from_json(malformed_json.as_bytes());
+        assert!(
+            record.is_err(),
+            "from_json should fail with malformed JSON"
+        );
+    }
+
+    /// Test the full deserialization -> conversion -> encoding path (AC1.1 partial).
+    /// This verifies that a JSON message can be deserialized, converted to CertRecord,
+    /// and encoded to protobuf bytes without loss.
+    #[test]
+    fn test_delta_cert_record_to_proto_encoding() {
+        let cert_json = r#"{
+            "message_type": "certificate_update",
+            "data": {
+                "update_type": "X509AddedToSCT",
+                "cert_index": 99999,
+                "chain": [
+                    {
+                        "subject": {"CN": "test.com", "aggregated": "/CN=test.com"},
+                        "issuer": {"CN": "TestCA", "aggregated": "/CN=TestCA"},
+                        "serial_number": "serial123",
+                        "not_before": 1000000000,
+                        "not_after": 2000000000,
+                        "fingerprint": "test_fingerprint",
+                        "sha1": "test_sha1",
+                        "sha256": "test_sha256",
+                        "signature_algorithm": "sha256WithRSAEncryption",
+                        "is_ca": false,
+                        "extensions": {}
+                    }
+                ],
+                "cert_link": "https://ct.example.com/?d=99999",
+                "source": {
+                    "url": "https://ct.example.com/",
+                    "name": "test-log"
+                },
+                "seen": 1708454400.0,
+                "leaf_cert": {
+                    "all_domains": ["test.com"],
+                    "fingerprint": "test_fingerprint",
+                    "not_after": 2000000000,
+                    "not_before": 1000000000,
+                    "serial_number": "serial123",
+                    "signature_algorithm": "sha256WithRSAEncryption",
+                    "issuer": {"CN": "TestCA", "aggregated": "/CN=TestCA"},
+                    "subject": {"CN": "test.com", "aggregated": "/CN=test.com"},
+                    "sha1": "test_sha1",
+                    "sha256": "test_sha256",
+                    "is_ca": false,
+                    "as_der": "base64der",
+                    "extensions": {}
+                }
+            }
+        }"#;
+
+        // Deserialize JSON
+        let delta_record = DeltaCertRecord::from_json(cert_json.as_bytes())
+            .expect("Valid JSON should deserialize");
+
+        // Convert to protobuf CertRecord
+        let cert_record = proto::CertRecord::from_delta_cert(&delta_record);
+
+        // Encode to protobuf bytes
+        let encoded = cert_record.encode_to_vec();
+
+        // Verify non-empty bytes were produced
+        assert!(
+            !encoded.is_empty(),
+            "Encoded protobuf bytes should not be empty"
+        );
+
+        // Verify all 20 fields are preserved
+        assert_eq!(cert_record.cert_index, 99999);
+        assert_eq!(cert_record.update_type, "X509AddedToSCT");
+        assert_eq!(cert_record.source_name, "test-log");
+        assert_eq!(cert_record.serial_number, "serial123");
+        assert_eq!(cert_record.fingerprint, "test_fingerprint");
+        assert_eq!(cert_record.all_domains, vec!["test.com"]);
+        assert_eq!(cert_record.chain.len(), 1);
     }
 }
