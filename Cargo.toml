@@ -47,9 +47,14 @@ tokio-util = { version = "0.7.18", features = ["full"] }
 futures = "0.3.31"
 flate2 = "1.0"
 deltalake = { version = "0.25", features = ["datafusion"] }
+prost = "0.13"
+prost-types = "0.13"
 
 [dev-dependencies]
 rcgen = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
 
 [profile.release]
 lto = true
