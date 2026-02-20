@@ -20,7 +20,11 @@ pub struct CliArgs {
 impl CliArgs {
     pub fn parse() -> Self {
         let args: Vec<String> = env::args().collect();
+        Self::parse_args(&args)
+    }
 
+    /// Parse CLI arguments from a provided vector (testable).
+    pub fn parse_args(args: &[String]) -> Self {
         // Parse value-bearing flags with index-based iteration
         let mut backfill_from = None;
         let mut backfill_logs = None;
@@ -98,5 +102,111 @@ impl CliArgs {
 
     pub fn print_version() {
         println!("certstream-server-rust {}", VERSION);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ac3_2_backfill_sink_none_when_not_provided() {
+        // AC3.2: Test that backfill_sink is None when --sink is not provided (backwards-compatible)
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, None, "backfill_sink should be None when --sink not provided");
+        assert!(parsed.backfill, "backfill should be true");
+    }
+
+    #[test]
+    fn test_ac3_5_parse_sink_zerobus() {
+        // AC3.5: Test that --sink zerobus is correctly parsed
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+            "--sink".to_string(),
+            "zerobus".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()), "backfill_sink should be zerobus");
+        assert!(parsed.backfill, "backfill should be true");
+    }
+
+    #[test]
+    fn test_ac3_5_parse_sink_delta() {
+        // AC3.5: Test that --sink delta is correctly parsed
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+            "--sink".to_string(),
+            "delta".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, Some("delta".to_string()), "backfill_sink should be delta");
+    }
+
+    #[test]
+    fn test_ac3_5_parse_sink_invalid() {
+        // AC3.5: Test that invalid sink name is parsed (validation happens in main.rs)
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+            "--sink".to_string(),
+            "invalid_sink".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, Some("invalid_sink".to_string()), "backfill_sink should be parsed even if invalid");
+    }
+
+    #[test]
+    fn test_sink_with_from_parameter() {
+        // Test that --sink and --from are both parsed correctly together
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+            "--sink".to_string(),
+            "zerobus".to_string(),
+            "--from".to_string(),
+            "12345".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()), "backfill_sink should be zerobus");
+        assert_eq!(parsed.backfill_from, Some(12345), "backfill_from should be 12345");
+    }
+
+    #[test]
+    fn test_sink_without_from_parameter() {
+        // Test parsing --sink zerobus without --from (validation happens in main.rs)
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+            "--sink".to_string(),
+            "zerobus".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()), "backfill_sink should be parsed");
+        assert_eq!(parsed.backfill_from, None, "backfill_from should be None (validation in main.rs will catch this)");
+    }
+
+    #[test]
+    fn test_sink_with_staging_path() {
+        // Test that --sink, --from, and --staging-path are all parsed correctly
+        let args = vec![
+            "certstream".to_string(),
+            "--backfill".to_string(),
+            "--sink".to_string(),
+            "zerobus".to_string(),
+            "--from".to_string(),
+            "100".to_string(),
+            "--staging-path".to_string(),
+            "/tmp/staging".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()));
+        assert_eq!(parsed.backfill_from, Some(100));
+        assert_eq!(parsed.staging_path, Some("/tmp/staging".to_string()));
     }
 }
