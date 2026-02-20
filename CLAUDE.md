@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-18
-Last context update: 2026-02-18
+Last verified: 2026-02-20
+Last context update: 2026-02-20
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -9,6 +9,8 @@ Last context update: 2026-02-18
 - Web framework: Axum 0.8 (WebSocket + SSE)
 - Metrics: metrics + prometheus exporter
 - Storage: Delta Lake (via deltalake 0.25) for optional CT record archival
+- Streaming: ZeroBus SDK (via databricks-zerobus-ingest-sdk) for optional Databricks ingestion
+- Serialization: Protobuf (via prost + prost-build) for ZeroBus wire format
 - Testing: cargo test (unit + integration)
 
 ## Commands
@@ -20,6 +22,7 @@ Last context update: 2026-02-18
 - `cargo run -- --backfill --from 0` - Run historical backfill from index 0
 - `cargo run -- --backfill --logs "google"` - Backfill only logs matching filter
 - `cargo run -- --backfill --staging-path /tmp/staging` - Backfill into staging table
+- `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
 - `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
 
 ## Project Structure
@@ -27,7 +30,7 @@ Last context update: 2026-02-18
 - `src/config.rs` - All configuration structs, YAML + env var loading, validation
 - `src/ct/` - Certificate Transparency log fetching and watching
 - `src/ct/fetch.rs` - Shared fetch functions for RFC 6962 and Static CT logs
-- `src/backfill.rs` - Delta backfill mode: gap detection, fetcher tasks, writer task, staging merge
+- `src/backfill.rs` - Backfill mode: gap detection, fetcher tasks, writer task (delta or zerobus), staging merge
 - `src/models/` - Data models (CertificateMessage, PreSerializedMessage)
 - `src/websocket/` - WebSocket stream handlers
 - `src/sse.rs` - SSE stream handler
@@ -40,12 +43,15 @@ Last context update: 2026-02-18
 - `src/health.rs` - Health check endpoints
 - `src/hot_reload.rs` - Config hot-reload via file watcher
 - `src/state.rs` - Shared server state management
+- `src/zerobus_sink.rs` - ZeroBus streaming sink (optional, disabled by default)
 - `src/cli.rs` - CLI argument parsing
+- `proto/cert_record.proto` - Protobuf schema for ZeroBus wire format (20 fields mirroring DeltaCertRecord)
+- `build.rs` - prost-build: compiles proto to Rust + file descriptor set
 
 ## Architecture
 All CT log entries flow through a single `broadcast::channel<Arc<PreSerializedMessage>>`.
-Consumers (WebSocket, SSE, delta_sink) each subscribe independently via `tx.subscribe()`.
-The delta_sink is spawned as an optional tokio task and does not affect other consumers.
+Consumers (WebSocket, SSE, delta_sink, zerobus_sink) each subscribe independently via `tx.subscribe()`.
+The delta_sink and zerobus_sink are spawned as optional tokio tasks and do not affect other consumers.
 
 The binary has three execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
@@ -70,6 +76,24 @@ The binary has three execution modes selected in main.rs:
 - **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
 - **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer()`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
 
+## ZeroBus Sink Contracts
+- **Disabled by default** (`zerobus_sink.enabled = false`)
+- **Config**: `ZerobusSinkConfig { enabled, endpoint, unity_catalog_url, table_name, client_id, client_secret, max_inflight_records }`
+- **Defaults**: max_inflight_records `10000`, all strings empty
+- **Env vars**: `CERTSTREAM_ZEROBUS_ENABLED`, `CERTSTREAM_ZEROBUS_ENDPOINT`, `CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL`, `CERTSTREAM_ZEROBUS_TABLE_NAME`, `CERTSTREAM_ZEROBUS_CLIENT_ID`, `CERTSTREAM_ZEROBUS_CLIENT_SECRET`, `CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS`
+- **Validation (when enabled)**: endpoint, unity_catalog_url, table_name, client_id, client_secret must be non-empty; table_name must be Unity Catalog format (`catalog.schema.table`, exactly 2 dots)
+- **Entry point**: `zerobus_sink::run_zerobus_sink(config, rx, shutdown)` spawned in main
+- **Wire format**: Protobuf `CertRecord` (20 fields mirroring `DeltaCertRecord`), compiled from `proto/cert_record.proto` via `build.rs`
+- **Conversion**: `proto::CertRecord::from_delta_cert(&DeltaCertRecord)` maps all 20 fields
+- **Descriptor**: `cert_record_descriptor_proto()` returns `DescriptorProto` from compiled file descriptor set for SDK `TableProperties`
+- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` -> encodes to protobuf bytes -> ingests via ZeroBus SDK
+- **Error handling**: retryable errors recreate the stream and retry the record once; non-retryable errors skip the record; failed stream recreation exits the sink
+- **Non-fatal startup**: if SDK or stream creation fails, task exits without crashing server
+- **Graceful shutdown**: flushes and closes the stream on CancellationToken
+- **Lagged handling**: logs warning and increments counter (matches delta_sink pattern)
+- **Metrics**: `certstream_zerobus_records_ingested` (counter), `certstream_zerobus_ingest_errors` (counter), `certstream_zerobus_stream_recoveries` (counter), `certstream_zerobus_records_skipped` (counter), `certstream_zerobus_messages_lagged` (counter)
+- **Integration test**: gated behind `feature = "integration"`, requires env vars `ZEROBUS_TEST_ENDPOINT`, `ZEROBUS_TEST_UC_URL`, `ZEROBUS_TEST_TABLE_NAME`, `ZEROBUS_TEST_CLIENT_ID`, `ZEROBUS_TEST_CLIENT_SECRET`
+
 ## Query API Contracts
 - **Disabled by default** (`query_api.enabled = false`)
 - **Config**: `QueryApiConfig { enabled, table_path, max_results_per_page, default_results_per_page, query_timeout_secs }`
@@ -92,8 +116,8 @@ The binary has three execution modes selected in main.rs:
 - **Reads from**: same Delta table written by delta_sink and backfill
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table
-- **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, shutdown)` called from main, returns exit code (i32)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
 - **Gap detection**: `detect_gaps(table_path, staging_path, logs, backfill_from)` queries Delta table(s) via DataFusion SQL, finds internal gaps only (LEAD window function). When staging_path is provided and the staging table exists, both tables are queried via a UNION ALL view using `COUNT(DISTINCT cert_index)` to avoid double-counting duplicates. The second element of the `logs` tuple is the ceiling (from state file `current_index`).
@@ -101,9 +125,12 @@ The binary has three execution modes selected in main.rs:
 - **Staging write path**: when `--staging-path` is provided, the writer task writes to the staging table path instead of `config.delta_sink.table_path`; gap detection still reads both tables to avoid re-fetching already-staged records
 - **Catch-up rules**: only backfills logs already present in Delta table; logs not in table are skipped; only internal gaps are filled (no frontier gaps)
 - **Historical rules**: backfills all logs from `--from` index to ceiling; logs not in Delta get full range from `--from` to ceiling
-- **Architecture**: mpsc channel from N fetcher tasks to 1 writer task; fetchers send `DeltaCertRecord`; writer flushes on batch_size, timer, channel close, or shutdown
+- **Sink selection**: `--sink zerobus` requires `zerobus_sink.enabled = true` in config and `--from` (historical mode only; gap detection not supported for remote tables); `--sink delta` or omitted defaults to Delta writer; unknown sink names exit with error
+- **ZeroBus backfill writer**: `run_zerobus_writer(config, rx, shutdown)` streams records via ZeroBus SDK; same retry/recovery logic as live sink (retryable errors recreate stream, non-retryable skip record); flushes and closes stream on completion
+- **ZeroBus work items**: when `--sink zerobus`, gap detection is skipped; work items built directly from `--from` to ceiling for each log
+- **Architecture**: mpsc channel from N fetcher tasks to 1 writer task; fetchers send `DeltaCertRecord`; writer (delta or zerobus) flushes on batch_size/timer/channel close/shutdown
 - **Fetcher retry**: rate-limit errors get exponential backoff (up to 10 retries, max 60s); HTTP/parse errors get up to 3 retries
-- **Writer reuses**: `delta_sink::flush_buffer()` and `delta_sink::open_or_create_table()` from the live sink
+- **Delta writer reuses**: `delta_sink::flush_buffer()` and `delta_sink::open_or_create_table()` from the live sink
 - **Exit code**: 0 if all fetchers and writer succeed, 1 if any errors occurred
 - **Graceful shutdown**: CancellationToken checked per batch in fetchers; writer flushes remaining buffer on cancellation
 
