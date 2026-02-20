@@ -13,6 +13,7 @@ pub struct CliArgs {
     pub backfill_from: Option<u64>,
     pub backfill_logs: Option<String>,
     pub staging_path: Option<String>,
+    pub backfill_sink: Option<String>,
     pub merge: bool,
 }
 
@@ -24,6 +25,7 @@ impl CliArgs {
         let mut backfill_from = None;
         let mut backfill_logs = None;
         let mut staging_path = None;
+        let mut backfill_sink = None;
 
         for (i, arg) in args.iter().enumerate() {
             if arg == "--from" && i + 1 < args.len() {
@@ -34,6 +36,8 @@ impl CliArgs {
                 backfill_logs = Some(args[i + 1].clone());
             } else if arg == "--staging-path" && i + 1 < args.len() {
                 staging_path = Some(args[i + 1].clone());
+            } else if arg == "--sink" && i + 1 < args.len() {
+                backfill_sink = Some(args[i + 1].clone());
             }
         }
 
@@ -47,6 +51,7 @@ impl CliArgs {
             backfill_from,
             backfill_logs,
             staging_path,
+            backfill_sink,
             merge: args.iter().any(|a| a == "--merge"),
         }
     }
@@ -70,6 +75,7 @@ impl CliArgs {
         println!("    --backfill           Activate backfill mode (requires state file)");
         println!("    --from <INDEX>       Override start index for all logs");
         println!("    --logs <FILTER>      Filter to specific logs by substring");
+        println!("    --sink <NAME>        Writer backend: delta (default), zerobus");
         println!();
         println!("    Backfill uses the state file (ct_log.state_file, default:");
         println!("    certstream_state.json) as the per-log upper bound. Logs not");
