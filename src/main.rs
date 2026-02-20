@@ -671,6 +671,13 @@ fn print_config_validation(config: &Config) {
                 println!("  Batch size: {}", config.delta_sink.batch_size);
                 println!("  Flush interval: {}s", config.delta_sink.flush_interval_secs);
             }
+            println!("ZeroBus sink enabled: {}", config.zerobus_sink.enabled);
+            if config.zerobus_sink.enabled {
+                println!("  Endpoint: {}", config.zerobus_sink.endpoint);
+                println!("  Unity Catalog URL: {}", config.zerobus_sink.unity_catalog_url);
+                println!("  Table name: {}", config.zerobus_sink.table_name);
+                println!("  Max inflight records: {}", config.zerobus_sink.max_inflight_records);
+            }
         }
         Err(errors) => {
             eprintln!("Configuration validation failed:");
