@@ -171,8 +171,10 @@ pub async fn run_zerobus_sink(
                                 // Record queued; ack arrives asynchronously via SDK internals
                                 // Drop ack future — flush() at shutdown collects pending acks
                                 record_counter += 1;
+                                metrics::counter!("certstream_zerobus_records_ingested").increment(1);
                             }
                             Err(e) => {
+                                metrics::counter!("certstream_zerobus_ingest_errors").increment(1);
                                 if e.is_retryable() {
                                     // AC1.3: retryable error -> recreate stream
                                     // Note: recreate_stream() takes stream by value (consumes it)
@@ -181,15 +183,18 @@ pub async fn run_zerobus_sink(
                                         Ok(new_stream) => {
                                             stream = new_stream;
                                             info!("zerobus stream recovered");
+                                            metrics::counter!("certstream_zerobus_stream_recoveries").increment(1);
                                             // Retry the record on new stream
                                             let cert_record = proto::CertRecord::from_delta_cert(&record);
                                             let encoded = cert_record.encode_to_vec();
                                             match stream.ingest_record(encoded).await {
                                                 Ok(_ack) => {
                                                     record_counter += 1;
+                                                    metrics::counter!("certstream_zerobus_records_ingested").increment(1);
                                                 }
                                                 Err(retry_err) => {
                                                     warn!(error = %retry_err, "failed to ingest after stream recovery, skipping record");
+                                                    metrics::counter!("certstream_zerobus_records_skipped").increment(1);
                                                 }
                                             }
                                         }
@@ -202,6 +207,7 @@ pub async fn run_zerobus_sink(
                                 } else {
                                     // AC1.4: non-retryable error -> skip record
                                     warn!(error = %e, "non-retryable ingest error, skipping record");
+                                    metrics::counter!("certstream_zerobus_records_skipped").increment(1);
                                 }
                             }
                         }
@@ -209,6 +215,7 @@ pub async fn run_zerobus_sink(
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Match delta_sink lagged handling pattern (delta_sink.rs:712-720)
                         warn!(count = n, "zerobus sink lagged, dropped {} messages", n);
+                        metrics::counter!("certstream_zerobus_messages_lagged").increment(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("broadcast channel closed, zerobus sink shutting down");
