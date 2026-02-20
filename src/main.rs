@@ -98,6 +98,30 @@ async fn main() {
     }
 
     if cli_args.backfill {
+        // Validate --sink flag
+        if let Some(ref sink_name) = cli_args.backfill_sink {
+            match sink_name.as_str() {
+                "delta" => {} // valid, default behavior
+                "zerobus" => {
+                    // AC3.4: zerobus_sink must be enabled
+                    if !config.zerobus_sink.enabled {
+                        eprintln!("Error: --sink zerobus requires zerobus_sink.enabled = true in config");
+                        std::process::exit(1);
+                    }
+                    // AC3.3: --from is required for zerobus sink
+                    if cli_args.backfill_from.is_none() {
+                        eprintln!("Error: --sink zerobus requires --from <INDEX> (historical mode only, catch-up gap detection not supported for remote tables)");
+                        std::process::exit(1);
+                    }
+                }
+                other => {
+                    // AC3.5: invalid sink name
+                    eprintln!("Error: unknown sink '{}'. Valid sinks: delta, zerobus", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -113,6 +137,7 @@ async fn main() {
             cli_args.staging_path,
             cli_args.backfill_from,
             cli_args.backfill_logs,
+            cli_args.backfill_sink,
             shutdown_token,
         )
         .await;
