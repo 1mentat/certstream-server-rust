@@ -9,6 +9,7 @@ description = "High-performance Certificate Transparency log streaming server"
 [features]
 default = []
 simd = ["simd-json"]
+integration = []
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
