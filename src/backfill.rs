@@ -2400,6 +2400,7 @@ mod tests {
                 batch_size: 100,
                 flush_interval_secs: 60,
             },
+            query_api: crate::config::QueryApiConfig::default(),
             config_path: None,
         }
     }
