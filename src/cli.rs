@@ -105,6 +105,58 @@ impl CliArgs {
     }
 }
 
+/// Validates backfill sink command-line arguments.
+///
+/// # Arguments
+/// * `sink_name` - The name of the sink (e.g., "delta", "zerobus"), or None
+/// * `backfill_from` - The starting index for backfill, or None for catch-up mode
+/// * `zerobus_enabled` - Whether zerobus_sink is enabled in config
+///
+/// # Returns
+/// * `Ok(())` if validation passes
+/// * `Err(String)` if validation fails, with a descriptive error message
+pub fn validate_backfill_sink_command(
+    sink_name: Option<&str>,
+    backfill_from: Option<u64>,
+    zerobus_enabled: bool,
+) -> Result<(), String> {
+    if let Some(sink) = sink_name {
+        match sink {
+            "delta" => {
+                // delta is always valid
+                Ok(())
+            }
+            "zerobus" => {
+                // AC3.4: zerobus_sink must be enabled in config
+                if !zerobus_enabled {
+                    return Err(
+                        "Error: --sink zerobus requires zerobus_sink.enabled = true in config"
+                            .to_string(),
+                    );
+                }
+                // AC3.3: --from is required for zerobus sink (historical mode only)
+                if backfill_from.is_none() {
+                    return Err(
+                        "Error: --sink zerobus requires --from <INDEX> (historical mode only, catch-up gap detection not supported for remote tables)"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            other => {
+                // AC3.5: invalid sink name
+                Err(format!(
+                    "Error: unknown sink '{}'. Valid sinks: delta, zerobus",
+                    other
+                ))
+            }
+        }
+    } else {
+        // No sink specified; defaults to delta
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +260,83 @@ mod tests {
         assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()));
         assert_eq!(parsed.backfill_from, Some(100));
         assert_eq!(parsed.staging_path, Some("/tmp/staging".to_string()));
+    }
+
+    // AC3.3: --sink zerobus without --from must be validated as an error
+    #[test]
+    fn test_ac3_3_zerobus_without_from_is_error() {
+        let result = validate_backfill_sink_command(Some("zerobus"), None, true);
+        assert!(
+            result.is_err(),
+            "zerobus sink without --from should produce error"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("requires --from"),
+            "error message should mention 'requires --from', got: {}",
+            err_msg
+        );
+    }
+
+    // AC3.4: --sink zerobus when zerobus_sink.enabled = false must be validated as an error
+    #[test]
+    fn test_ac3_4_zerobus_disabled_is_error() {
+        let result = validate_backfill_sink_command(Some("zerobus"), Some(0), false);
+        assert!(
+            result.is_err(),
+            "zerobus sink when disabled in config should produce error"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("requires zerobus_sink.enabled = true"),
+            "error message should mention 'requires zerobus_sink.enabled = true', got: {}",
+            err_msg
+        );
+    }
+
+    // AC3.3: --sink zerobus WITH --from should be valid (when zerobus is enabled)
+    #[test]
+    fn test_ac3_3_zerobus_with_from_is_valid() {
+        let result = validate_backfill_sink_command(Some("zerobus"), Some(12345), true);
+        assert!(
+            result.is_ok(),
+            "zerobus sink with --from and enabled config should be valid"
+        );
+    }
+
+    // AC3.4: --sink delta when zerobus is disabled should still work
+    #[test]
+    fn test_ac3_4_delta_sink_always_valid() {
+        let result = validate_backfill_sink_command(Some("delta"), None, false);
+        assert!(
+            result.is_ok(),
+            "delta sink should always be valid regardless of zerobus config"
+        );
+    }
+
+    // Test that no sink specified is valid (defaults to delta)
+    #[test]
+    fn test_no_sink_specified_is_valid() {
+        let result = validate_backfill_sink_command(None, None, false);
+        assert!(
+            result.is_ok(),
+            "no sink specified should default to delta and be valid"
+        );
+    }
+
+    // AC3.5: unknown sink name should error
+    #[test]
+    fn test_ac3_5_unknown_sink_is_error() {
+        let result = validate_backfill_sink_command(Some("unknown"), None, false);
+        assert!(
+            result.is_err(),
+            "unknown sink name should produce error"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("unknown sink"),
+            "error message should mention 'unknown sink', got: {}",
+            err_msg
+        );
     }
 }
