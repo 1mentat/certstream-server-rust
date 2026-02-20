@@ -2373,7 +2373,7 @@ mod tests {
 
     /// Helper function to create a minimal Config for testing
     fn make_test_config(table_path: &str) -> Config {
-        use crate::config::DeltaSinkConfig;
+        use crate::config::{DeltaSinkConfig, QueryApiConfig, ZerobusSinkConfig};
         use std::net::IpAddr;
         use std::str::FromStr;
 
@@ -2400,7 +2400,8 @@ mod tests {
                 batch_size: 100,
                 flush_interval_secs: 60,
             },
-            query_api: crate::config::QueryApiConfig::default(),
+            query_api: QueryApiConfig::default(),
+            zerobus_sink: ZerobusSinkConfig::default(),
             config_path: None,
         }
     }
