@@ -14,6 +14,7 @@ mod rate_limit;
 mod sse;
 mod state;
 mod websocket;
+mod zerobus_sink;
 
 use axum::{middleware as axum_middleware, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusBuilder;
