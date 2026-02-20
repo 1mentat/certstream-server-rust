@@ -361,6 +361,42 @@ fn default_query_api_timeout_secs() -> u64 {
     30
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZerobusSinkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub unity_catalog_url: String,
+    #[serde(default)]
+    pub table_name: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default = "default_zerobus_max_inflight_records")]
+    pub max_inflight_records: usize,
+}
+
+fn default_zerobus_max_inflight_records() -> usize {
+    10000
+}
+
+impl Default for ZerobusSinkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            unity_catalog_url: String::new(),
+            table_name: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            max_inflight_records: default_zerobus_max_inflight_records(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -385,6 +421,7 @@ pub struct Config {
     pub hot_reload: HotReloadConfig,
     pub delta_sink: DeltaSinkConfig,
     pub query_api: QueryApiConfig,
+    pub zerobus_sink: ZerobusSinkConfig,
     pub config_path: Option<String>,
 }
 
@@ -419,6 +456,8 @@ struct YamlConfig {
     delta_sink: Option<DeltaSinkConfig>,
     #[serde(default)]
     query_api: Option<QueryApiConfig>,
+    #[serde(default)]
+    zerobus_sink: Option<ZerobusSinkConfig>,
 }
 
 struct YamlConfigWithPath {
@@ -588,6 +627,29 @@ impl Config {
             query_api.query_timeout_secs = v.parse().unwrap_or(query_api.query_timeout_secs);
         }
 
+        let mut zerobus_sink = yaml_config.zerobus_sink.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_ENABLED") {
+            zerobus_sink.enabled = v.parse().unwrap_or(zerobus_sink.enabled);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_ENDPOINT") {
+            zerobus_sink.endpoint = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL") {
+            zerobus_sink.unity_catalog_url = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_TABLE_NAME") {
+            zerobus_sink.table_name = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_CLIENT_ID") {
+            zerobus_sink.client_id = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_CLIENT_SECRET") {
+            zerobus_sink.client_secret = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS") {
+            zerobus_sink.max_inflight_records = v.parse().unwrap_or(zerobus_sink.max_inflight_records);
+        }
+
         Self {
             host,
             port,
@@ -607,6 +669,7 @@ impl Config {
             hot_reload,
             delta_sink,
             query_api,
+            zerobus_sink,
             config_path,
         }
     }
@@ -681,6 +744,47 @@ impl Config {
             });
         }
 
+        if self.zerobus_sink.enabled {
+            if self.zerobus_sink.endpoint.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.endpoint".to_string(),
+                    message: "Endpoint cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if self.zerobus_sink.unity_catalog_url.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.unity_catalog_url".to_string(),
+                    message: "Unity Catalog URL cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if self.zerobus_sink.table_name.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.table_name".to_string(),
+                    message: "Table name cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if !self.zerobus_sink.table_name.is_empty()
+                && self.zerobus_sink.table_name.matches('.').count() != 2
+            {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.table_name".to_string(),
+                    message: "Table name must be in Unity Catalog format: catalog.schema.table".to_string(),
+                });
+            }
+            if self.zerobus_sink.client_id.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.client_id".to_string(),
+                    message: "Client ID cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if self.zerobus_sink.client_secret.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.client_secret".to_string(),
+                    message: "Client secret cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -749,6 +853,7 @@ mod tests {
             hot_reload: HotReloadConfig::default(),
             delta_sink: DeltaSinkConfig::default(),
             query_api: QueryApiConfig::default(),
+            zerobus_sink: ZerobusSinkConfig::default(),
             config_path: None,
         }
     }
