@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-18
-Last context update: 2026-02-18
+Last verified: 2026-02-26
+Last context update: 2026-02-26
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -69,7 +69,7 @@ The binary has three execution modes selected in main.rs:
 - **Error recovery**: failed writes retain buffer for retry; table handle reopened
 - **Non-fatal startup**: if table creation fails, task exits without crashing server
 - **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
-- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer()`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer(table, buffer, schema, batch_size, compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
 
 ## Query API Contracts
 - **Disabled by default** (`query_api.enabled = false`)
