@@ -59,6 +59,7 @@ delta_sink:
   table_path: "./data/certstream"   # Local filesystem path for Delta table
   batch_size: 10000                 # Records before size-triggered flush
   flush_interval_secs: 30           # Max seconds between flushes
+  compression_level: 9              # Zstd compression level (1-22, default 9)
 
 # Query API for searching certificates in Delta table
 # Provides REST API for querying historical CT records stored in Delta Lake

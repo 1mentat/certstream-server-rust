@@ -744,6 +744,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "notify",
  "parking_lot",
+ "parquet",
  "prost",
  "prost-build",
  "prost-types",
