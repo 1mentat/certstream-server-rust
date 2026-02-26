@@ -8,8 +8,8 @@
 ## Environment Setup
 ```bash
 export CERTSTREAM_ZEROBUS_ENABLED=true
-export CERTSTREAM_ZEROBUS_ENDPOINT="<zerobus-endpoint>"
-export CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL="<uc-url>"
+export CERTSTREAM_ZEROBUS_ENDPOINT="https://<workspace-id>.zerobus.<region>.cloud.databricks.com"
+export CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL="https://<workspace-instance>.cloud.databricks.com"
 export CERTSTREAM_ZEROBUS_TABLE_NAME="catalog.schema.table"
 export CERTSTREAM_ZEROBUS_CLIENT_ID="<client-id>"
 export CERTSTREAM_ZEROBUS_CLIENT_SECRET="<client-secret>"
@@ -35,8 +35,8 @@ export CERTSTREAM_ZEROBUS_CLIENT_SECRET="<client-secret>"
 
 ## Integration Test
 ```bash
-ZEROBUS_TEST_ENDPOINT="<endpoint>" \
-ZEROBUS_TEST_UC_URL="<uc-url>" \
+ZEROBUS_TEST_ENDPOINT="https://<workspace-id>.zerobus.<region>.cloud.databricks.com" \
+ZEROBUS_TEST_UC_URL="https://<workspace-instance>.cloud.databricks.com" \
 ZEROBUS_TEST_TABLE_NAME="catalog.schema.table" \
 ZEROBUS_TEST_CLIENT_ID="<id>" \
 ZEROBUS_TEST_CLIENT_SECRET="<secret>" \

@@ -75,8 +75,8 @@ query_api:
 # Credentials should be provided via env vars: CERTSTREAM_ZEROBUS_CLIENT_ID, CERTSTREAM_ZEROBUS_CLIENT_SECRET
 # zerobus_sink:
 #   enabled: false
-#   endpoint: ""                          # ZeroBus endpoint URL
-#   unity_catalog_url: ""                 # Databricks Unity Catalog URL
+#   endpoint: ""                          # ZeroBus gRPC endpoint: https://<workspace-id>.zerobus.<region>.cloud.databricks.com
+#   unity_catalog_url: ""                 # Databricks workspace URL: https://<workspace-instance>.cloud.databricks.com
 #   table_name: ""                        # Unity Catalog table: catalog.schema.table
 #   client_id: ""                         # OAuth client ID (prefer env var)
 #   client_secret: ""                     # OAuth client secret (prefer env var)

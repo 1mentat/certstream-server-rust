@@ -4,8 +4,8 @@
 
 - Rust toolchain installed (edition 2024)
 - All automated tests passing: `cargo test` (350 tests, 0 failures)
-- For live Databricks tests: OAuth M2M application credentials, ZeroBus endpoint URL, Unity Catalog URL, and a target table in `catalog.schema.table` format
-- For integration tests: `ZEROBUS_TEST_*` environment variables configured
+- For live Databricks tests: OAuth M2M service principal credentials, ZeroBus gRPC endpoint (`https://<workspace-id>.zerobus.<region>.cloud.databricks.com`), workspace base URL (`https://<instance>.cloud.databricks.com`), and a managed Delta table in `catalog.schema.table` format (catalog must have explicit managed storage location, not default workspace storage)
+- For integration tests: `ZEROBUS_TEST_ENDPOINT` (gRPC endpoint), `ZEROBUS_TEST_UC_URL` (workspace base URL), `ZEROBUS_TEST_TABLE_NAME`, `ZEROBUS_TEST_CLIENT_ID`, `ZEROBUS_TEST_CLIENT_SECRET`
 
 ## Phase 1: Configuration Validation (AC4.1, AC4.2, AC4.3)
 
