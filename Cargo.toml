@@ -51,6 +51,7 @@ deltalake = { version = "0.25", features = ["datafusion"] }
 prost = "0.13"
 prost-types = "0.13"
 databricks-zerobus-ingest-sdk = "0.1"
+parquet = "54"
 
 [dev-dependencies]
 rcgen = "0.13"

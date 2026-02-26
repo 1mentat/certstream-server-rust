@@ -705,6 +705,7 @@ fn print_config_validation(config: &Config) {
                 println!("  Table path: {}", config.delta_sink.table_path);
                 println!("  Batch size: {}", config.delta_sink.batch_size);
                 println!("  Flush interval: {}s", config.delta_sink.flush_interval_secs);
+                println!("  Compression level: {} (zstd)", config.delta_sink.compression_level);
             }
             println!("ZeroBus sink enabled: {}", config.zerobus_sink.enabled);
             if config.zerobus_sink.enabled {
