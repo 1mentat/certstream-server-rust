@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
+use parquet::basic::ZstdLevel;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CustomCtLog {
@@ -688,6 +689,16 @@ impl Config {
             errors.push(ConfigValidationError {
                 field: "delta_sink.flush_interval_secs".to_string(),
                 message: "Flush interval must be greater than 0 when delta sink is enabled".to_string(),
+            });
+        }
+
+        if ZstdLevel::try_new(self.delta_sink.compression_level).is_err() {
+            errors.push(ConfigValidationError {
+                field: "delta_sink.compression_level".to_string(),
+                message: format!(
+                    "Compression level {} is invalid. Must be between 1 and 22",
+                    self.delta_sink.compression_level
+                ),
             });
         }
 
