@@ -674,6 +674,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "notify",
  "parking_lot",
+ "parquet",
  "rcgen",
  "regex",
  "reqwest",
