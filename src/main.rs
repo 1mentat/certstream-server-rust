@@ -44,6 +44,13 @@ use websocket::{handle_domains_only, handle_full_stream, handle_lite_stream, App
 
 #[tokio::main]
 async fn main() {
+    // Install rustls crypto provider before any TLS usage.
+    // Both ring and aws-lc-rs are in the dependency tree, so rustls
+    // cannot auto-detect which to use.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let cli_args = CliArgs::parse();
 
     if cli_args.show_help {
