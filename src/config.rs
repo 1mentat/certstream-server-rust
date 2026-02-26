@@ -979,4 +979,106 @@ query_timeout_secs: 60
         assert_eq!(config.default_results_per_page, 25);
         assert_eq!(config.query_timeout_secs, 60);
     }
+
+    #[test]
+    fn test_delta_sink_config_default_compression_level() {
+        // Verifies zstd-compression.AC1.1: Default config has compression_level == 9
+        let config = DeltaSinkConfig::default();
+        assert_eq!(config.compression_level, 9);
+    }
+
+    #[test]
+    fn test_delta_sink_config_deserialize_compression_level() {
+        // Verifies zstd-compression.AC1.2: Config with compression_level = 1 passes
+        let yaml = r#"
+enabled: true
+table_path: "./data/test"
+batch_size: 1000
+flush_interval_secs: 30
+compression_level: 1
+"#;
+        let config: DeltaSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.compression_level, 1);
+    }
+
+    #[test]
+    fn test_delta_sink_config_deserialize_compression_level_defaults_to_9() {
+        // Verifies zstd-compression.AC1.1: Omitted compression_level defaults to 9
+        let yaml = r#"
+enabled: true
+table_path: "./data/test"
+batch_size: 1000
+flush_interval_secs: 30
+"#;
+        let config: DeltaSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.compression_level, 9);
+    }
+
+    #[test]
+    fn test_validate_compression_level_zero() {
+        // Verifies zstd-compression.AC1.3: Config with compression_level = 0 fails
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                compression_level: 0,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "delta_sink.compression_level"));
+    }
+
+    #[test]
+    fn test_validate_compression_level_too_high() {
+        // Verifies zstd-compression.AC1.4: Config with compression_level = 23 fails
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                compression_level: 23,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "delta_sink.compression_level"));
+    }
+
+    #[test]
+    fn test_validate_compression_level_valid_min() {
+        // Verifies zstd-compression.AC1.1: Config with compression_level = 1 passes
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                compression_level: 1,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_compression_level_valid_max() {
+        // Verifies compression_level = 22 (max) passes
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                compression_level: 22,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_compression_level_default() {
+        // Verifies zstd-compression.AC1.1: Default compression_level = 9 passes
+        let config = Config {
+            delta_sink: DeltaSinkConfig::default(),
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
 }
