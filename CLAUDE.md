@@ -82,6 +82,9 @@ The binary has three execution modes selected in main.rs:
 - **Config**: `ZerobusSinkConfig { enabled, endpoint, unity_catalog_url, table_name, client_id, client_secret, max_inflight_records }`
 - **Defaults**: max_inflight_records `10000`, all strings empty
 - **Env vars**: `CERTSTREAM_ZEROBUS_ENABLED`, `CERTSTREAM_ZEROBUS_ENDPOINT`, `CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL`, `CERTSTREAM_ZEROBUS_TABLE_NAME`, `CERTSTREAM_ZEROBUS_CLIENT_ID`, `CERTSTREAM_ZEROBUS_CLIENT_SECRET`, `CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS`
+- **Endpoint format**: `CERTSTREAM_ZEROBUS_ENDPOINT` is a gRPC endpoint: `https://<workspace-id>.zerobus.<region>.cloud.databricks.com` (workspace-id is numeric, from `?o=` param; region from DNS e.g. `us-east-2`)
+- **UC URL format**: `CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL` is the workspace base URL: `https://<workspace-instance>.cloud.databricks.com` (no `/api/...` path — SDK appends `/oidc/v1/token` internally)
+- **Table requirements**: target table must be a managed Delta table in a catalog with an explicit managed storage location (not default workspace storage); ZeroBus error 4024 if using default storage
 - **Validation (when enabled)**: endpoint, unity_catalog_url, table_name, client_id, client_secret must be non-empty; table_name must be Unity Catalog format (`catalog.schema.table`, exactly 2 dots)
 - **Entry point**: `zerobus_sink::run_zerobus_sink(config, rx, shutdown)` spawned in main
 - **Wire format**: Protobuf `CertRecord` (20 fields mirroring `DeltaCertRecord`), compiled from `proto/cert_record.proto` via `build.rs`
