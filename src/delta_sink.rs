@@ -1389,6 +1389,7 @@ mod tests {
             table_path: table_path.clone(),
             batch_size: 100,
             flush_interval_secs: 1,
+            compression_level: 9,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1446,6 +1447,7 @@ mod tests {
             table_path: table_path.clone(),
             batch_size: 100,
             flush_interval_secs: 60,
+            compression_level: 9,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1577,6 +1579,7 @@ mod tests {
             table_path: table_path.clone(),
             batch_size: 5,
             flush_interval_secs: 60,
+            compression_level: 9,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1652,6 +1655,7 @@ mod tests {
             table_path: table_path.clone(),
             batch_size: 5,
             flush_interval_secs: 60,
+            compression_level: 9,
         };
 
         // Create broadcast channel (like main.rs does)
@@ -1751,6 +1755,7 @@ mod tests {
             table_path: table_path.clone(),
             batch_size: 100, // Large batch size so flush doesn't happen immediately
             flush_interval_secs: 60,
+            compression_level: 9,
         };
 
         // Small buffer to force lagging
@@ -1817,6 +1822,7 @@ mod tests {
             table_path: "/nonexistent/path/that/cannot/be/created/delta_table".to_string(),
             batch_size: 10,
             flush_interval_secs: 1,
+            compression_level: 9,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1877,6 +1883,7 @@ mod tests {
             table_path: table_path.clone(),
             batch_size: 10,
             flush_interval_secs: 2,
+            compression_level: 9,
         };
 
         // Create broadcast channel
