@@ -14,6 +14,7 @@ mod rate_limit;
 mod sse;
 mod state;
 mod websocket;
+mod zerobus_sink;
 
 use axum::{middleware as axum_middleware, routing::get, Router};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -43,6 +44,13 @@ use websocket::{handle_domains_only, handle_full_stream, handle_lite_stream, App
 
 #[tokio::main]
 async fn main() {
+    // Install rustls crypto provider before any TLS usage.
+    // Both ring and aws-lc-rs are in the dependency tree, so rustls
+    // cannot auto-detect which to use.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let cli_args = CliArgs::parse();
 
     if cli_args.show_help {
@@ -97,6 +105,16 @@ async fn main() {
     }
 
     if cli_args.backfill {
+        // Validate --sink flag
+        if let Err(error_msg) = cli::validate_backfill_sink_command(
+            cli_args.backfill_sink.as_deref(),
+            cli_args.backfill_from,
+            config.zerobus_sink.enabled,
+        ) {
+            eprintln!("{}", error_msg);
+            std::process::exit(1);
+        }
+
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -112,6 +130,7 @@ async fn main() {
             cli_args.staging_path,
             cli_args.backfill_from,
             cli_args.backfill_logs,
+            cli_args.backfill_sink,
             shutdown_token,
         )
         .await;
@@ -187,6 +206,22 @@ async fn main() {
         Some(handle)
     } else {
         info!("delta sink disabled");
+        None
+    };
+
+    let zerobus_sink_handle = if config.zerobus_sink.enabled {
+        let zerobus_rx = tx.subscribe();
+        let zerobus_config = config.zerobus_sink.clone();
+        let zerobus_shutdown = shutdown_token.clone();
+        let handle = tokio::spawn(zerobus_sink::run_zerobus_sink(
+            zerobus_config,
+            zerobus_rx,
+            zerobus_shutdown,
+        ));
+        info!("zerobus sink enabled, streaming to: {}", config.zerobus_sink.table_name);
+        Some(handle)
+    } else {
+        info!("zerobus sink disabled");
         None
     };
 
@@ -276,6 +311,14 @@ async fn main() {
             Ok(Ok(())) => info!("delta sink shutdown complete"),
             Ok(Err(e)) => warn!(error = %e, "delta sink task panicked during shutdown"),
             Err(_) => warn!("delta sink shutdown timed out after 30s"),
+        }
+    }
+
+    if let Some(handle) = zerobus_sink_handle {
+        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+            Ok(Ok(())) => info!("zerobus sink shutdown complete"),
+            Ok(Err(e)) => warn!(error = %e, "zerobus sink task panicked during shutdown"),
+            Err(_) => warn!("zerobus sink shutdown timed out after 30s"),
         }
     }
 
@@ -670,6 +713,13 @@ fn print_config_validation(config: &Config) {
                 println!("  Batch size: {}", config.delta_sink.batch_size);
                 println!("  Flush interval: {}s", config.delta_sink.flush_interval_secs);
                 println!("  Compression level: {} (zstd)", config.delta_sink.compression_level);
+            }
+            println!("ZeroBus sink enabled: {}", config.zerobus_sink.enabled);
+            if config.zerobus_sink.enabled {
+                println!("  Endpoint: {}", config.zerobus_sink.endpoint);
+                println!("  Unity Catalog URL: {}", config.zerobus_sink.unity_catalog_url);
+                println!("  Table name: {}", config.zerobus_sink.table_name);
+                println!("  Max inflight records: {}", config.zerobus_sink.max_inflight_records);
             }
         }
         Err(errors) => {

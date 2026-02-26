@@ -69,3 +69,15 @@ query_api:
   max_results_per_page: 500         # Hard cap on results per page
   default_results_per_page: 50      # Default when limit not specified
   query_timeout_secs: 30            # DataFusion query timeout
+
+# ZeroBus Ingest sink (Databricks managed Delta table)
+# Streams CT entries to a Databricks-managed Delta table via ZeroBus SDK.
+# Credentials should be provided via env vars: CERTSTREAM_ZEROBUS_CLIENT_ID, CERTSTREAM_ZEROBUS_CLIENT_SECRET
+# zerobus_sink:
+#   enabled: false
+#   endpoint: ""                          # ZeroBus gRPC endpoint: https://<workspace-id>.zerobus.<region>.cloud.databricks.com
+#   unity_catalog_url: ""                 # Databricks workspace URL: https://<workspace-instance>.cloud.databricks.com
+#   table_name: ""                        # Unity Catalog table: catalog.schema.table
+#   client_id: ""                         # OAuth client ID (prefer env var)
+#   client_secret: ""                     # OAuth client secret (prefer env var)
+#   max_inflight_records: 10000           # Max records in-flight without acknowledgment

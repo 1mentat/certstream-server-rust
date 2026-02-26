@@ -9,6 +9,7 @@ description = "High-performance Certificate Transparency log streaming server"
 [features]
 default = []
 simd = ["simd-json"]
+integration = []
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
@@ -17,6 +18,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 reqwest = { version = "0.12", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 simd-json = { version = "0.14", optional = true }
@@ -47,10 +49,16 @@ tokio-util = { version = "0.7.18", features = ["full"] }
 futures = "0.3.31"
 flate2 = "1.0"
 deltalake = { version = "0.25", features = ["datafusion"] }
+prost = "0.13"
+prost-types = "0.13"
+databricks-zerobus-ingest-sdk = "0.1"
 parquet = "54"
 
 [dev-dependencies]
 rcgen = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
 
 [profile.release]
 lto = true

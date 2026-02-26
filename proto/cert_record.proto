@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package certstream;
+
+// Mirrors the 20-column DeltaCertRecord struct (src/delta_sink.rs:22-43).
+// Used as the wire format for ZeroBus SDK ingestion into Databricks.
+message CertRecord {
+  uint64 cert_index = 1;
+  string update_type = 2;
+  double seen = 3;
+  string seen_date = 4;
+  string source_name = 5;
+  string source_url = 6;
+  string cert_link = 7;
+  string serial_number = 8;
+  string fingerprint = 9;
+  string sha256 = 10;
+  string sha1 = 11;
+  int64 not_before = 12;
+  int64 not_after = 13;
+  bool is_ca = 14;
+  string signature_algorithm = 15;
+  string subject_aggregated = 16;
+  string issuer_aggregated = 17;
+  repeated string all_domains = 18;
+  string as_der = 19;
+  repeated string chain = 20;
+}

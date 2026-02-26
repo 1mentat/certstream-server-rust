@@ -369,6 +369,42 @@ fn default_query_api_timeout_secs() -> u64 {
     30
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZerobusSinkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub unity_catalog_url: String,
+    #[serde(default)]
+    pub table_name: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default = "default_zerobus_max_inflight_records")]
+    pub max_inflight_records: usize,
+}
+
+fn default_zerobus_max_inflight_records() -> usize {
+    10000
+}
+
+impl Default for ZerobusSinkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            unity_catalog_url: String::new(),
+            table_name: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            max_inflight_records: default_zerobus_max_inflight_records(),
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -393,6 +429,7 @@ pub struct Config {
     pub hot_reload: HotReloadConfig,
     pub delta_sink: DeltaSinkConfig,
     pub query_api: QueryApiConfig,
+    pub zerobus_sink: ZerobusSinkConfig,
     pub config_path: Option<String>,
 }
 
@@ -427,6 +464,8 @@ struct YamlConfig {
     delta_sink: Option<DeltaSinkConfig>,
     #[serde(default)]
     query_api: Option<QueryApiConfig>,
+    #[serde(default)]
+    zerobus_sink: Option<ZerobusSinkConfig>,
 }
 
 struct YamlConfigWithPath {
@@ -599,6 +638,29 @@ impl Config {
             query_api.query_timeout_secs = v.parse().unwrap_or(query_api.query_timeout_secs);
         }
 
+        let mut zerobus_sink = yaml_config.zerobus_sink.unwrap_or_default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_ENABLED") {
+            zerobus_sink.enabled = v.parse().unwrap_or(zerobus_sink.enabled);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_ENDPOINT") {
+            zerobus_sink.endpoint = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL") {
+            zerobus_sink.unity_catalog_url = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_TABLE_NAME") {
+            zerobus_sink.table_name = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_CLIENT_ID") {
+            zerobus_sink.client_id = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_CLIENT_SECRET") {
+            zerobus_sink.client_secret = v;
+        }
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS") {
+            zerobus_sink.max_inflight_records = v.parse().unwrap_or(zerobus_sink.max_inflight_records);
+        }
+
         Self {
             host,
             port,
@@ -618,6 +680,7 @@ impl Config {
             hot_reload,
             delta_sink,
             query_api,
+            zerobus_sink,
             config_path,
         }
     }
@@ -692,6 +755,46 @@ impl Config {
             });
         }
 
+        if self.zerobus_sink.enabled {
+            if self.zerobus_sink.endpoint.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.endpoint".to_string(),
+                    message: "Endpoint cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if self.zerobus_sink.unity_catalog_url.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.unity_catalog_url".to_string(),
+                    message: "Unity Catalog URL cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if self.zerobus_sink.table_name.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.table_name".to_string(),
+                    message: "Table name cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if !self.zerobus_sink.table_name.is_empty()
+                && self.zerobus_sink.table_name.matches('.').count() != 2
+            {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.table_name".to_string(),
+                    message: "Table name must be in Unity Catalog format: catalog.schema.table".to_string(),
+                });
+            }
+            if self.zerobus_sink.client_id.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.client_id".to_string(),
+                    message: "Client ID cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+            if self.zerobus_sink.client_secret.is_empty() {
+                errors.push(ConfigValidationError {
+                    field: "zerobus_sink.client_secret".to_string(),
+                    message: "Client secret cannot be empty when ZeroBus sink is enabled".to_string(),
+                });
+            }
+        }
         if ZstdLevel::try_new(self.delta_sink.compression_level).is_err() {
             errors.push(ConfigValidationError {
                 field: "delta_sink.compression_level".to_string(),
@@ -770,6 +873,7 @@ mod tests {
             hot_reload: HotReloadConfig::default(),
             delta_sink: DeltaSinkConfig::default(),
             query_api: QueryApiConfig::default(),
+            zerobus_sink: ZerobusSinkConfig::default(),
             config_path: None,
         }
     }
@@ -979,6 +1083,356 @@ query_timeout_secs: 60
         assert_eq!(config.default_results_per_page, 25);
         assert_eq!(config.query_timeout_secs, 60);
     }
+
+    // Task 6: Tests for ZerobusSinkConfig defaults and env var overrides
+
+    #[test]
+    fn test_zerobus_sink_config_defaults() {
+        let config = ZerobusSinkConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.endpoint, "");
+        assert_eq!(config.unity_catalog_url, "");
+        assert_eq!(config.table_name, "");
+        assert_eq!(config.client_id, "");
+        assert_eq!(config.client_secret, "");
+        assert_eq!(config.max_inflight_records, 10000);
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_yaml_empty() {
+        let yaml = "enabled: false";
+        let config: ZerobusSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.endpoint, "");
+        assert_eq!(config.unity_catalog_url, "");
+        assert_eq!(config.table_name, "");
+        assert_eq!(config.client_id, "");
+        assert_eq!(config.client_secret, "");
+        assert_eq!(config.max_inflight_records, 10000);
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_yaml_partial() {
+        let yaml = r#"
+enabled: true
+endpoint: "https://zerobus.example.com"
+unity_catalog_url: "https://uc.example.com"
+table_name: "catalog.schema.table"
+max_inflight_records: 5000
+"#;
+        let config: ZerobusSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.endpoint, "https://zerobus.example.com");
+        assert_eq!(config.unity_catalog_url, "https://uc.example.com");
+        assert_eq!(config.table_name, "catalog.schema.table");
+        assert_eq!(config.client_id, "");
+        assert_eq!(config.client_secret, "");
+        assert_eq!(config.max_inflight_records, 5000);
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_enabled() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_ENABLED", "true");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_ENABLED") {
+            config.enabled = v.parse().unwrap_or(config.enabled);
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_ENABLED");
+        }
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_endpoint() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_ENDPOINT", "https://test.example.com");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_ENDPOINT") {
+            config.endpoint = v;
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_ENDPOINT");
+        }
+        assert_eq!(config.endpoint, "https://test.example.com");
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_unity_catalog_url() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL", "https://uc.test.com");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL") {
+            config.unity_catalog_url = v;
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_UNITY_CATALOG_URL");
+        }
+        assert_eq!(config.unity_catalog_url, "https://uc.test.com");
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_table_name() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_TABLE_NAME", "my.schema.table");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_TABLE_NAME") {
+            config.table_name = v;
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_TABLE_NAME");
+        }
+        assert_eq!(config.table_name, "my.schema.table");
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_client_id() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_CLIENT_ID", "test-client-id");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_CLIENT_ID") {
+            config.client_id = v;
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_CLIENT_ID");
+        }
+        assert_eq!(config.client_id, "test-client-id");
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_client_secret() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_CLIENT_SECRET", "test-secret");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_CLIENT_SECRET") {
+            config.client_secret = v;
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_CLIENT_SECRET");
+        }
+        assert_eq!(config.client_secret, "test-secret");
+    }
+
+    #[test]
+    fn test_zerobus_sink_config_env_var_max_inflight_records() {
+        unsafe {
+            env::set_var("CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS", "20000");
+        }
+        let mut config = ZerobusSinkConfig::default();
+        if let Ok(v) = env::var("CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS") {
+            config.max_inflight_records = v.parse().unwrap_or(config.max_inflight_records);
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_ZEROBUS_MAX_INFLIGHT_RECORDS");
+        }
+        assert_eq!(config.max_inflight_records, 20000);
+    }
+
+    // Task 7: Tests for ZerobusSinkConfig validation
+
+    #[test]
+    fn test_zerobus_sink_validation_disabled() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: false,
+                endpoint: String::new(),
+                unity_catalog_url: String::new(),
+                table_name: String::new(),
+                client_id: String::new(),
+                client_secret: String::new(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_empty_endpoint() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: String::new(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "catalog.schema.table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.endpoint"));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_empty_unity_catalog_url() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: String::new(),
+                table_name: "catalog.schema.table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.unity_catalog_url"));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_empty_table_name() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: String::new(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.table_name"));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_invalid_table_name_format_no_dots() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "just_table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.table_name" && e.message.contains("catalog.schema.table")));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_invalid_table_name_format_one_dot() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "schema.table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.table_name" && e.message.contains("catalog.schema.table")));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_valid_table_name_format() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "catalog.schema.table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        // Should not have a table_name error
+        if let Err(errors) = result {
+            assert!(!errors.iter().any(|e| e.field == "zerobus_sink.table_name"));
+        }
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_empty_client_id() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "catalog.schema.table".to_string(),
+                client_id: String::new(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.client_id"));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_empty_client_secret() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "catalog.schema.table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: String::new(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "zerobus_sink.client_secret"));
+    }
+
+    #[test]
+    fn test_zerobus_sink_validation_all_fields_populated() {
+        let config = Config {
+            zerobus_sink: ZerobusSinkConfig {
+                enabled: true,
+                endpoint: "https://zerobus.example.com".to_string(),
+                unity_catalog_url: "https://uc.example.com".to_string(),
+                table_name: "catalog.schema.table".to_string(),
+                client_id: "test-id".to_string(),
+                client_secret: "test-secret".to_string(),
+                max_inflight_records: 10000,
+            },
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // Compression level tests (from zstd-compression)
 
     #[test]
     fn test_delta_sink_config_default_compression_level() {
