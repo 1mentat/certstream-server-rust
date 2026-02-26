@@ -2399,6 +2399,7 @@ mod tests {
                 table_path: table_path.to_string(),
                 batch_size: 100,
                 flush_interval_secs: 60,
+                compression_level: 9,
             },
             query_api: crate::config::QueryApiConfig::default(),
             config_path: None,
