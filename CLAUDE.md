@@ -60,7 +60,8 @@ The binary has three execution modes selected in main.rs:
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
-- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs }`
+- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level }`
+- **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge)
 - **Entry point**: `delta_sink::run_delta_sink(config, rx, shutdown)` spawned in main
 - **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD)
 - **Flush triggers**: batch_size threshold OR flush_interval_secs timer OR graceful shutdown
