@@ -8,6 +8,8 @@ use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, Str
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -474,6 +476,7 @@ pub async fn flush_buffer(
     buffer: &mut Vec<DeltaCertRecord>,
     schema: &Arc<Schema>,
     batch_size: usize,
+    compression_level: i32,
 ) -> (Option<DeltaTable>, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
     // If buffer is empty, return early
     if buffer.is_empty() {
@@ -498,11 +501,19 @@ pub async fn flush_buffer(
         }
     };
 
+    // Construct WriterProperties with ZSTD compression
+    let writer_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(compression_level).expect("compression level validated at startup"),
+        ))
+        .build();
+
     // Write to Delta using DeltaOps with timing
     let start_time = Instant::now();
     let result = DeltaOps(table)
         .write(vec![batch])
         .with_save_mode(SaveMode::Append)
+        .with_writer_properties(writer_props)
         .await;
     let elapsed = start_time.elapsed();
 
@@ -683,7 +694,7 @@ pub async fn run_delta_sink(
 
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
-                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
                                     match new_table_opt {
                                         Some(new_table) => {
                                             table = new_table;
@@ -728,7 +739,7 @@ pub async fn run_delta_sink(
             _ = flush_interval.tick() => {
                 // Time-triggered flush (AC3.2)
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
                     match new_table_opt {
                         Some(new_table) => {
                             table = new_table;
@@ -752,7 +763,7 @@ pub async fn run_delta_sink(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size).await;
+                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
                     record_flush_metrics(&flush_result, "Shutdown flush");
                     if table_opt.is_none() {
                         warn!(
@@ -773,6 +784,9 @@ pub async fn run_delta_sink(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use std::fs;
 
     fn make_test_json_bytes() -> Vec<u8> {
         let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
@@ -1307,7 +1321,7 @@ mod tests {
         let mut buffer = vec![record1, record2];
 
         // Flush to Delta
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
@@ -1361,7 +1375,7 @@ mod tests {
             .collect();
 
         // Flush exactly batch_size records
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1525,7 +1539,7 @@ mod tests {
         );
 
         // Flush (which includes overflow check)
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1953,5 +1967,91 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_flush_buffer_writes_zstd_compression() {
+        // Test that flush_buffer writes Parquet files with ZSTD codec
+        let test_name = "flush_buffer_zstd";
+        let table_path = format!("/tmp/delta_zstd_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        // Create table
+        let schema = delta_schema();
+        let table = match open_or_create_table(&table_path, &schema).await {
+            Ok(t) => t,
+            Err(e) => panic!("Failed to create table: {}", e),
+        };
+
+        // Create test records
+        let mut buffer = vec![];
+        for i in 0..5 {
+            let mut record = make_test_record();
+            record.cert_index = i as u64;
+            buffer.push(record);
+        }
+
+        // Flush with compression level 9
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+
+        // Verify flush succeeded
+        let _new_table = table_opt.expect("table should be available after flush");
+        assert!(flush_result.is_ok(), "flush should succeed");
+        assert_eq!(flush_result.unwrap(), 5, "should have written 5 records");
+
+        // Find parquet file in table directory (recursively, but exclude _delta_log)
+        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            // Skip _delta_log
+                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
+                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
+                                    return Some(found);
+                                }
+                            }
+                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let parquet_file = find_parquet_file(&table_path)
+            .expect("should find a parquet file in table directory");
+
+        // Read parquet file metadata
+        let file = fs::File::open(&parquet_file)
+            .expect("should be able to open parquet file");
+        let reader = SerializedFileReader::new(file)
+            .expect("should be able to read parquet file");
+        let metadata = reader.metadata();
+
+        // Verify ZSTD compression on first column of first row group
+        assert!(metadata.num_row_groups() > 0, "should have at least one row group");
+        let row_group = metadata.row_group(0);
+        assert!(row_group.num_columns() > 0, "should have at least one column");
+        let compression = row_group.column(0).compression();
+
+        // Verify ZSTD compression is used
+        match compression {
+            Compression::ZSTD(_) => {
+                // Success!
+            }
+            _ => {
+                panic!(
+                    "Expected ZSTD compression, got {:?}",
+                    compression
+                );
+            }
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&table_path);
     }
 }

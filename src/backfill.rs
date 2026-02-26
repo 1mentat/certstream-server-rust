@@ -7,6 +7,8 @@ use crate::state::StateManager;
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -435,6 +437,7 @@ async fn run_writer(
     table_path: String,
     batch_size: usize,
     flush_interval_secs: u64,
+    compression_level: i32,
     mut rx: mpsc::Receiver<DeltaCertRecord>,
     shutdown: CancellationToken,
 ) -> WriterResult {
@@ -482,7 +485,7 @@ async fn run_writer(
 
                         // Flush if buffer reaches batch_size threshold
                         if buffer.len() >= batch_size {
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
                             let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "batch size trigger");
                             if should_break {
                                 break;
@@ -497,7 +500,7 @@ async fn run_writer(
                                 records_in_buffer = buffer.len(),
                                 "Channel closed, flushing remaining buffer"
                             );
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
                             let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "channel close");
                         }
                         break;
@@ -507,7 +510,7 @@ async fn run_writer(
             _ = flush_timer.tick() => {
                 // Time-triggered flush
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
                     let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "time trigger");
                     if should_break {
                         break;
@@ -522,7 +525,7 @@ async fn run_writer(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
                     let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "shutdown");
                 }
                 break;
@@ -689,10 +692,11 @@ pub async fn run_backfill(
         .unwrap_or_else(|| config.delta_sink.table_path.clone());
     let batch_size = config.delta_sink.batch_size;
     let flush_interval_secs = config.delta_sink.flush_interval_secs;
+    let compression_level = config.delta_sink.compression_level;
     let shutdown_clone = shutdown.clone();
 
     let writer_handle = tokio::spawn(async move {
-        run_writer(table_path, batch_size, flush_interval_secs, rx, shutdown_clone).await
+        run_writer(table_path, batch_size, flush_interval_secs, compression_level, rx, shutdown_clone).await
     });
 
     // Drop the original sender so the receiver knows when all senders are gone
@@ -836,6 +840,14 @@ pub async fn run_merge(
     let total_staging_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     info!(total_staging_rows = total_staging_rows, "read staging records");
 
+    // Construct WriterProperties with ZSTD compression
+    let writer_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(config.delta_sink.compression_level)
+                .expect("compression level validated at startup"),
+        ))
+        .build();
+
     // Merge batch-by-batch
     let mut current_table = main_table;
     let mut total_inserted: usize = 0;
@@ -893,7 +905,7 @@ pub async fn run_merge(
                     .set("as_der", "source.as_der")
                     .set("chain", "source.chain")
             }) {
-                Ok(builder) => builder,
+                Ok(builder) => builder.with_writer_properties(writer_props.clone()),
                 Err(e) => {
                     warn!(batch = i + 1, error = %e, "failed to build merge operation");
                     return 1;
@@ -1625,7 +1637,7 @@ mod tests {
         // Spawn writer
         let table_path_clone = table_path.clone();
         let writer_task = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, rx, shutdown).await
         });
 
         // Send 2 records (should trigger batch flush)
@@ -1667,7 +1679,7 @@ mod tests {
         // Spawn writer task with batch_size = 3 to trigger flush on channel close
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 3, 60, rx, shutdown).await
+            run_writer(table_path_clone, 3, 60, 9, rx, shutdown).await
         });
 
         // Send records
@@ -1735,7 +1747,7 @@ mod tests {
         // Spawn writer task with small batch size to trigger flush
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, rx, shutdown).await
         });
 
         // Send records
@@ -1779,7 +1791,7 @@ mod tests {
 
         // Use invalid path to trigger table creation failure
         let writer_handle = tokio::spawn(async move {
-            run_writer("/invalid/path/that/cannot/be/created".to_string(), 10, 60, rx, shutdown).await
+            run_writer("/invalid/path/that/cannot/be/created".to_string(), 10, 60, 9, rx, shutdown).await
         });
 
         // Send one record
@@ -1841,7 +1853,7 @@ mod tests {
         // Spawn writer task
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 10, 60, rx, shutdown).await
+            run_writer(table_path_clone, 10, 60, 9, rx, shutdown).await
         });
 
         // Wait for fetchers
@@ -1879,7 +1891,7 @@ mod tests {
         // Spawn writer
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, rx, shutdown).await
         });
 
         // Send records to trigger flushes
@@ -1914,7 +1926,7 @@ mod tests {
         // Spawn writer with batch_size=3
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, batch_size, 60, rx, shutdown).await
+            run_writer(table_path_clone, batch_size, 60, 9, rx, shutdown).await
         });
 
         // Send exactly batch_size records to trigger flush
@@ -2060,7 +2072,7 @@ mod tests {
 
         let staging_path_clone = staging_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(staging_path_clone, 3, 60, rx, shutdown).await
+            run_writer(staging_path_clone, 3, 60, 9, rx, shutdown).await
         });
 
         // Send a few records
@@ -3037,7 +3049,7 @@ mod tests {
 
         let staging_path_clone = staging_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(staging_path_clone, 3, 60, rx, shutdown).await
+            run_writer(staging_path_clone, 3, 60, 9, rx, shutdown).await
         });
 
         // Send records to staging
