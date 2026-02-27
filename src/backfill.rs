@@ -4059,8 +4059,6 @@ mod tests {
         let _ = fs::remove_dir_all(&table_path);
         let _ = fs::create_dir_all(&table_path);
 
-        let schema = delta_schema();
-
         // Create an mpsc channel for writer
         let (tx, rx) = tokio::sync::mpsc::channel(100);
 
