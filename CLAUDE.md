@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-26
-Last context update: 2026-02-26
+Last verified: 2026-02-27
+Last context update: 2026-02-27
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -56,10 +56,11 @@ The delta_sink and zerobus_sink are spawned as optional tokio tasks and do not a
 
 In Delta Lake storage, the `as_der` column is stored as raw binary bytes (not base64-encoded). The WriterProperties builder applies dictionary encoding to low-cardinality columns (update_type, source_name, source_url, signature_algorithm, issuer_aggregated) and skips it for high-cardinality columns (fingerprint, sha256, sha1, serial_number, as_der, subject_aggregated, cert_link), with per-column ZSTD compression using `compression_level` for most columns and `heavy_column_compression_level` for the `as_der` column.
 
-The binary has three execution modes selected in main.rs:
+The binary has four execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
 2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
 3. **Merge mode** (`--merge --staging-path <PATH>`): merges a staging Delta table into the main table using Delta MERGE INTO with deduplication, then deletes the staging directory on success
+4. **Migrate mode** (`--migrate --output <PATH>`): reads an existing Delta table, converts `as_der` from base64 Utf8 to raw Binary, and writes to a new output table with optimized WriterProperties
 
 ## Key Conventions
 - Config structs use serde Deserialize with defaults; env vars override YAML
@@ -93,7 +94,7 @@ The binary has three execution modes selected in main.rs:
 - **Wire format**: Protobuf `CertRecord` (20 fields mirroring `DeltaCertRecord`), compiled from `proto/cert_record.proto` via `build.rs`
 - **Conversion**: `proto::CertRecord::from_delta_cert(&DeltaCertRecord)` maps all 20 fields
 - **Descriptor**: `cert_record_descriptor_proto()` returns `DescriptorProto` from compiled file descriptor set for SDK `TableProperties`
-- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` -> encodes to protobuf bytes -> ingests via ZeroBus SDK
+- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` (base64-encoding `as_der` bytes back to string for protobuf wire format) -> encodes to protobuf bytes -> ingests via ZeroBus SDK
 - **Error handling**: retryable errors recreate the stream and retry the record once; non-retryable errors skip the record; failed stream recreation exits the sink
 - **Non-fatal startup**: if SDK or stream creation fails, task exits without crashing server
 - **Graceful shutdown**: flushes and closes the stream on CancellationToken
@@ -152,6 +153,20 @@ The binary has three execution modes selected in main.rs:
 - **Staging cleanup**: on successful merge, the staging directory is deleted via `remove_dir_all`; cleanup failure is non-fatal (logged as warning)
 - **Error handling**: any failure during merge leaves staging intact for retry and exits with code 1
 - **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (staging left intact)
+
+## Migrate Contracts
+- **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--migrate` without `--output` exits with error
+- **Entry point**: `backfill::run_migrate(config, output_path, shutdown)` called from main, returns exit code (i32)
+- **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
+- **Source table**: reads from `config.delta_sink.table_path`; if source table cannot be opened, exits with code 1
+- **Output table**: created at `output_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
+- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially
+- **as_der conversion**: base64-decodes each Utf8 string to raw bytes; decode failures produce null values and are logged as warnings (non-fatal)
+- **Column alignment**: source columns are matched by name (not index) and cast to target types if needed, handling DataFusion column reordering
+- **WriterProperties**: applies `delta_writer_properties(compression_level, heavy_column_compression_level)` to all writes
+- **Empty source**: if source table has no partitions, exits with code 0
+- **Graceful shutdown**: CancellationToken checked between partitions; if cancelled, exits with code 1
+- **Error handling**: any failure (table open, query, write) exits with code 1
 
 ## CT Fetch Contracts
 - **Module**: `ct::fetch` (public module)
