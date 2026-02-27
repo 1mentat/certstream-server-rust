@@ -3166,6 +3166,8 @@ mod tests {
             staging_path: None,
             backfill_sink: None,
             merge: true,
+            migrate: false,
+            migrate_output: None,
         };
 
         // Verify that merge is true and staging_path is None
