@@ -135,7 +135,7 @@ pub async fn run_reparse_audit(
     config: Config,
     from_date: Option<String>,
     to_date: Option<String>,
-    _shutdown: CancellationToken,
+    shutdown: CancellationToken,
 ) -> (i32, AuditReport) {
     info!(
         table_path = %config.delta_sink.table_path,
@@ -249,6 +249,69 @@ pub async fn run_reparse_audit(
 
     // Step 5 & 6: Iterate through batches
     while let Some(batch_result) = stream.next().await {
+        if shutdown.is_cancelled() {
+            warn!("reparse audit interrupted by shutdown signal");
+            // Print partial report before exiting
+            let percentage = if total_records > 0 {
+                mismatch_record_count as f64 / total_records as f64 * 100.0
+            } else {
+                0.0
+            };
+
+            println!("\nReparse Audit Report (Partial - Interrupted)");
+            println!("=============================================");
+            println!("Records scanned: {}", total_records);
+            println!("Partitions scanned: {}", partition_count);
+            println!(
+                "Records with mismatches: {} ({:.1}%)",
+                mismatch_record_count, percentage
+            );
+            println!("Unparseable records: {}", unparseable_count);
+            println!();
+
+            if !field_mismatch_counts.is_empty() {
+                println!("Field breakdown:");
+                let mut field_names: Vec<_> = field_mismatch_counts.keys().collect();
+                field_names.sort();
+                for field_name in field_names {
+                    let count = field_mismatch_counts[field_name];
+                    println!("  {}: {} mismatches", field_name, count);
+                }
+                println!();
+            }
+
+            if !sample_diffs.is_empty() {
+                println!(
+                    "Sample mismatches ({} of {}):",
+                    sample_diffs.len(),
+                    mismatch_record_count
+                );
+                for sample in &sample_diffs {
+                    println!(
+                        "  [cert_index={}, source={}]",
+                        sample.cert_index, sample.source_url
+                    );
+                    for field_diff in &sample.fields {
+                        println!(
+                            "    {}: stored=\"{}\" reparsed=\"{}\"",
+                            field_diff.field_name, field_diff.stored, field_diff.reparsed
+                        );
+                    }
+                }
+            }
+            println!();
+
+            let report = AuditReport {
+                total_records,
+                mismatch_record_count,
+                unparseable_count,
+                partition_count,
+                field_mismatch_counts,
+                sample_diffs,
+            };
+            return (1, report);
+        }
+
         let batch = match batch_result {
             Ok(b) => b,
             Err(e) => {
@@ -628,7 +691,7 @@ pub async fn run_extract_metadata(
     output_path: String,
     from_date: Option<String>,
     to_date: Option<String>,
-    _shutdown: CancellationToken,
+    shutdown: CancellationToken,
 ) -> i32 {
     use deltalake::protocol::SaveMode;
     use deltalake::DeltaOps;
@@ -745,6 +808,12 @@ pub async fn run_extract_metadata(
     let mut any_rows_seen = false;
 
     while let Some(batch_result) = stream.next().await {
+        if shutdown.is_cancelled() {
+            warn!("metadata extraction interrupted by shutdown signal");
+            info!(records_written = total_records_written, "partial extraction left intact at {}", output_path);
+            return 1;
+        }
+
         let batch = match batch_result {
             Ok(b) => {
                 b
