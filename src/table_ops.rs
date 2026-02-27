@@ -1,10 +1,43 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
+use deltalake::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, ListArray, StringArray, UInt64Array};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use deltalake::datafusion::prelude::SessionContext;
+use deltalake::open_table;
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::ct::parse_certificate;
+
+/// Helper struct to track field mismatches and collect sample diffs.
+struct SampleDiff {
+    cert_index: u64,
+    source_url: String,
+    fields: Vec<FieldDiff>,
+}
+
+/// Individual field difference for a sample mismatch.
+struct FieldDiff {
+    field_name: String,
+    stored: String,
+    reparsed: String,
+}
+
+/// Helper function to extract domains from a ListArray at a given row index.
+fn extract_domains_from_list(list_array: &ListArray, row: usize) -> Vec<String> {
+    let values = list_array.value(row);
+    let string_values = values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap_or_else(|| panic!("Failed to downcast ListArray value to StringArray"));
+    (0..string_values.len())
+        .map(|i| string_values.value(i).to_string())
+        .collect()
+}
 
 /// Validate that a date string matches the expected YYYY-MM-DD format.
 /// Returns true if the format is valid, false otherwise.
@@ -95,8 +128,362 @@ pub async fn run_reparse_audit(
         table_path = %config.delta_sink.table_path,
         from_date = ?from_date,
         to_date = ?to_date,
-        "reparse audit: stub implementation"
+        "Starting reparse audit"
     );
+
+    // Step 1: Open the Delta table
+    let table = match open_table(&config.delta_sink.table_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                error = %e,
+                table_path = %config.delta_sink.table_path,
+                "Failed to open Delta table"
+            );
+            return 1;
+        }
+    };
+
+    // Step 2: Create DataFusion session context
+    let ctx = SessionContext::new();
+
+    // Register table as ct_main
+    if let Err(e) = ctx.register_table("ct_main", Arc::new(table)) {
+        error!(error = %e, "Failed to register Delta table in DataFusion");
+        return 1;
+    }
+
+    // Step 3: Build the SQL query
+    let base_sql = r#"SELECT cert_index, source_url, seen_date, as_der, subject_aggregated, issuer_aggregated,
+           all_domains, signature_algorithm, is_ca, not_before, not_after, serial_number
+    FROM ct_main"#;
+
+    let date_filter = match date_filter_clause(&from_date, &to_date) {
+        Ok(clause) => clause,
+        Err(e) => {
+            error!(error = %e, "Invalid date filter");
+            return 1;
+        }
+    };
+
+    let sql = format!("{}{}", base_sql, date_filter);
+
+    // Step 4: Execute the query and get a stream
+    let df = match ctx.sql(&sql).await {
+        Ok(df) => df,
+        Err(e) => {
+            error!(error = %e, "Failed to execute SQL query");
+            return 1;
+        }
+    };
+
+    let mut stream = match df.execute_stream().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed to get record batch stream");
+            return 1;
+        }
+    };
+
+    // Initialize tracking variables
+    let mut total_records: u64 = 0;
+    let mut mismatch_record_count: u64 = 0;
+    let mut unparseable_count: u64 = 0;
+    let mut partition_count: u64 = 0;
+    let mut field_mismatch_counts: HashMap<String, u64> = HashMap::new();
+    let mut sample_diffs: Vec<SampleDiff> = Vec::new();
+    let mut any_rows_seen = false;
+
+    // Step 5 & 6: Iterate through batches
+    while let Some(batch_result) = stream.next().await {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "Error reading batch from stream");
+                return 1;
+            }
+        };
+
+        if batch.num_rows() > 0 {
+            any_rows_seen = true;
+            partition_count += 1;
+        }
+
+        // Get column indices
+        let cert_index_col = batch.column_by_name("cert_index").unwrap();
+        let source_url_col = batch.column_by_name("source_url").unwrap();
+        let as_der_col = batch.column_by_name("as_der").unwrap();
+        let subject_agg_col = batch.column_by_name("subject_aggregated").unwrap();
+        let issuer_agg_col = batch.column_by_name("issuer_aggregated").unwrap();
+        let all_domains_col = batch.column_by_name("all_domains").unwrap();
+        let sig_algo_col = batch.column_by_name("signature_algorithm").unwrap();
+        let is_ca_col = batch.column_by_name("is_ca").unwrap();
+        let not_before_col = batch.column_by_name("not_before").unwrap();
+        let not_after_col = batch.column_by_name("not_after").unwrap();
+        let serial_col = batch.column_by_name("serial_number").unwrap();
+
+        let cert_index_array = cert_index_col.as_any().downcast_ref::<UInt64Array>().unwrap();
+        let source_url_array = source_url_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let subject_agg_array = subject_agg_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let issuer_agg_array = issuer_agg_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let all_domains_list = all_domains_col.as_any().downcast_ref::<ListArray>().unwrap();
+        let sig_algo_array = sig_algo_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let is_ca_array = is_ca_col.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let not_before_array = not_before_col.as_any().downcast_ref::<Int64Array>().unwrap();
+        let not_after_array = not_after_col.as_any().downcast_ref::<Int64Array>().unwrap();
+        let serial_array = serial_col.as_any().downcast_ref::<StringArray>().unwrap();
+
+        // Iterate rows in this batch
+        for row in 0..batch.num_rows() {
+            total_records += 1;
+
+            let cert_index = cert_index_array.value(row);
+            let source_url = source_url_array.value(row).to_string();
+
+            // Extract as_der from the batch
+            let der_bytes = match as_der_col.data_type() {
+                DataType::Binary => {
+                    // Binary column type
+                    let binary_array = as_der_col.as_any().downcast_ref::<BinaryArray>().unwrap();
+                    if binary_array.is_null(row) {
+                        unparseable_count += 1;
+                        continue;
+                    }
+                    binary_array.value(row).to_vec()
+                }
+                DataType::Utf8 => {
+                    // Utf8 column type (base64 encoded)
+                    let utf8_array = as_der_col.as_any().downcast_ref::<StringArray>().unwrap();
+                    if utf8_array.is_null(row) {
+                        unparseable_count += 1;
+                        continue;
+                    }
+                    let base64_str = utf8_array.value(row);
+                    if base64_str.is_empty() {
+                        unparseable_count += 1;
+                        continue;
+                    }
+                    match STANDARD.decode(base64_str) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            unparseable_count += 1;
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    warn!("Unexpected as_der column type: {:?}", as_der_col.data_type());
+                    unparseable_count += 1;
+                    continue;
+                }
+            };
+
+            // Parse the certificate
+            let leaf = match parse_certificate(&der_bytes, false) {
+                Some(leaf) => leaf,
+                None => {
+                    unparseable_count += 1;
+                    continue;
+                }
+            };
+
+            // Compare fields
+            let mut mismatches_in_row: Vec<FieldDiff> = Vec::new();
+
+            // subject_aggregated comparison
+            let stored_subject = subject_agg_array.value(row);
+            let reparsed_subject = leaf.subject.aggregated.as_deref().unwrap_or("");
+            if stored_subject != reparsed_subject {
+                field_mismatch_counts
+                    .entry("subject_aggregated".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "subject_aggregated".to_string(),
+                    stored: stored_subject.to_string(),
+                    reparsed: reparsed_subject.to_string(),
+                });
+            }
+
+            // issuer_aggregated comparison
+            let stored_issuer = issuer_agg_array.value(row);
+            let reparsed_issuer = leaf.issuer.aggregated.as_deref().unwrap_or("");
+            if stored_issuer != reparsed_issuer {
+                field_mismatch_counts
+                    .entry("issuer_aggregated".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "issuer_aggregated".to_string(),
+                    stored: stored_issuer.to_string(),
+                    reparsed: reparsed_issuer.to_string(),
+                });
+            }
+
+            // all_domains comparison
+            let mut stored_domains: Vec<String> = extract_domains_from_list(all_domains_list, row);
+            let mut reparsed_domains: Vec<String> = leaf.all_domains.to_vec();
+            stored_domains.sort();
+            reparsed_domains.sort();
+            if stored_domains != reparsed_domains {
+                field_mismatch_counts
+                    .entry("all_domains".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "all_domains".to_string(),
+                    stored: format!("{:?}", stored_domains),
+                    reparsed: format!("{:?}", reparsed_domains),
+                });
+            }
+
+            // signature_algorithm comparison
+            let stored_sig_algo = sig_algo_array.value(row);
+            if stored_sig_algo != leaf.signature_algorithm {
+                field_mismatch_counts
+                    .entry("signature_algorithm".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "signature_algorithm".to_string(),
+                    stored: stored_sig_algo.to_string(),
+                    reparsed: leaf.signature_algorithm.clone(),
+                });
+            }
+
+            // is_ca comparison
+            let stored_is_ca = is_ca_array.value(row);
+            if stored_is_ca != leaf.is_ca {
+                field_mismatch_counts
+                    .entry("is_ca".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "is_ca".to_string(),
+                    stored: stored_is_ca.to_string(),
+                    reparsed: leaf.is_ca.to_string(),
+                });
+            }
+
+            // not_before comparison
+            let stored_not_before = not_before_array.value(row);
+            if stored_not_before != leaf.not_before {
+                field_mismatch_counts
+                    .entry("not_before".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "not_before".to_string(),
+                    stored: stored_not_before.to_string(),
+                    reparsed: leaf.not_before.to_string(),
+                });
+            }
+
+            // not_after comparison
+            let stored_not_after = not_after_array.value(row);
+            if stored_not_after != leaf.not_after {
+                field_mismatch_counts
+                    .entry("not_after".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "not_after".to_string(),
+                    stored: stored_not_after.to_string(),
+                    reparsed: leaf.not_after.to_string(),
+                });
+            }
+
+            // serial_number comparison
+            let stored_serial = serial_array.value(row);
+            if stored_serial != leaf.serial_number {
+                field_mismatch_counts
+                    .entry("serial_number".to_string())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
+                mismatches_in_row.push(FieldDiff {
+                    field_name: "serial_number".to_string(),
+                    stored: stored_serial.to_string(),
+                    reparsed: leaf.serial_number.clone(),
+                });
+            }
+
+            // If there were mismatches, increment counter and collect sample
+            if !mismatches_in_row.is_empty() {
+                mismatch_record_count += 1;
+                if sample_diffs.len() < 10 {
+                    sample_diffs.push(SampleDiff {
+                        cert_index,
+                        source_url,
+                        fields: mismatches_in_row,
+                    });
+                }
+            }
+        }
+    }
+
+    // Step 5 check: If no rows were seen, print informational message and return 0
+    if !any_rows_seen {
+        println!("No records found in the specified date range");
+        return 0;
+    }
+
+    // Step 7: Print the report
+    let percentage = if total_records > 0 {
+        (mismatch_record_count * 100) / total_records
+    } else {
+        0
+    };
+
+    println!("\nReparse Audit Report");
+    println!("====================");
+    println!("Records scanned: {}", total_records);
+    println!("Partitions scanned: {}", partition_count);
+    println!(
+        "Records with mismatches: {} ({}%)",
+        mismatch_record_count, percentage
+    );
+    println!("Unparseable records: {}", unparseable_count);
+    println!();
+
+    if !field_mismatch_counts.is_empty() {
+        println!("Field breakdown:");
+        let mut field_names: Vec<_> = field_mismatch_counts.keys().collect();
+        field_names.sort();
+        for field_name in field_names {
+            let count = field_mismatch_counts[field_name];
+            println!("  {}: {} mismatches", field_name, count);
+        }
+        println!();
+    }
+
+    if !sample_diffs.is_empty() {
+        println!(
+            "Sample mismatches ({} of {}):",
+            sample_diffs.len(),
+            field_mismatch_counts.len()
+        );
+        for sample in &sample_diffs {
+            println!(
+                "  [cert_index={}, source={}]",
+                sample.cert_index, sample.source_url
+            );
+            for field_diff in &sample.fields {
+                println!(
+                    "    {}: stored=\"{}\" reparsed=\"{}\"",
+                    field_diff.field_name, field_diff.stored, field_diff.reparsed
+                );
+            }
+        }
+    }
+    println!();
+
+    // Step 8: Return 0 (audit always exits 0 unless infrastructure failure)
     0
 }
 
@@ -261,5 +648,30 @@ mod tests {
 
         let is_ca_field = schema.field_with_name("is_ca").unwrap();
         assert_eq!(is_ca_field.data_type(), &DataType::Boolean);
+    }
+
+    #[test]
+    fn test_parse_certificate_returns_none_for_garbage() {
+        // AC1.5: garbage bytes should return None
+        let garbage = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        let result = parse_certificate(&garbage, false);
+        assert!(result.is_none(), "Should return None for garbage bytes");
+    }
+
+    #[test]
+    fn test_base64_decode_invalid_base64() {
+        // AC1.4: Invalid base64 should fail to decode
+        let invalid_base64 = "not_valid_base64!!!";
+        let result = STANDARD.decode(invalid_base64);
+        assert!(result.is_err(), "Invalid base64 should fail to decode");
+    }
+
+    #[test]
+    fn test_base64_decode_valid_base64() {
+        // AC1.4: Valid base64 should decode successfully
+        let valid_base64 = STANDARD.encode(b"test data");
+        let result = STANDARD.decode(valid_base64);
+        assert!(result.is_ok(), "Valid base64 should decode successfully");
+        assert_eq!(result.unwrap(), b"test data".to_vec());
     }
 }
