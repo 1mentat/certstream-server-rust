@@ -15,6 +15,8 @@ pub struct CliArgs {
     pub staging_path: Option<String>,
     pub backfill_sink: Option<String>,
     pub merge: bool,
+    pub migrate: bool,
+    pub migrate_output: Option<String>,
 }
 
 impl CliArgs {
@@ -30,6 +32,7 @@ impl CliArgs {
         let mut backfill_logs = None;
         let mut staging_path = None;
         let mut backfill_sink = None;
+        let mut migrate_output = None;
 
         for (i, arg) in args.iter().enumerate() {
             if arg == "--from" && i + 1 < args.len() {
@@ -42,6 +45,8 @@ impl CliArgs {
                 staging_path = Some(args[i + 1].clone());
             } else if arg == "--sink" && i + 1 < args.len() {
                 backfill_sink = Some(args[i + 1].clone());
+            } else if arg == "--output" && i + 1 < args.len() {
+                migrate_output = Some(args[i + 1].clone());
             }
         }
 
@@ -57,6 +62,8 @@ impl CliArgs {
             staging_path,
             backfill_sink,
             merge: args.iter().any(|a| a == "--merge"),
+            migrate: args.iter().any(|a| a == "--migrate"),
+            migrate_output,
         }
     }
 
@@ -89,6 +96,10 @@ impl CliArgs {
         println!("STAGING/MERGE OPTIONS:");
         println!("    --staging-path <PATH>  Write backfill to staging Delta table at PATH");
         println!("    --merge                Merge staging table into main table");
+        println!();
+        println!("MIGRATION OPTIONS:");
+        println!("    --migrate              Migrate existing Delta table to new schema");
+        println!("    --output <PATH>        Output path for migrated table (required with --migrate)");
         println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
@@ -338,5 +349,85 @@ mod tests {
             "error message should mention 'unknown sink', got: {}",
             err_msg
         );
+    }
+
+    // Task 1: Tests for --migrate and --output flags
+    #[test]
+    fn test_migrate_flag_parsed_correctly() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate, "migrate should be true when --migrate is provided");
+    }
+
+    #[test]
+    fn test_migrate_flag_false_when_not_provided() {
+        let args = vec![
+            "certstream".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(!parsed.migrate, "migrate should be false when --migrate is not provided");
+    }
+
+    #[test]
+    fn test_output_flag_parsed_correctly() {
+        let args = vec![
+            "certstream".to_string(),
+            "--output".to_string(),
+            "/tmp/output".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(
+            parsed.migrate_output,
+            Some("/tmp/output".to_string()),
+            "migrate_output should be /tmp/output when --output is provided"
+        );
+    }
+
+    #[test]
+    fn test_output_flag_none_when_not_provided() {
+        let args = vec![
+            "certstream".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(
+            parsed.migrate_output,
+            None,
+            "migrate_output should be None when --output is not provided"
+        );
+    }
+
+    #[test]
+    fn test_migrate_and_output_flags_together() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--output".to_string(),
+            "/data/migrated".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate, "migrate should be true");
+        assert_eq!(
+            parsed.migrate_output,
+            Some("/data/migrated".to_string()),
+            "migrate_output should be /data/migrated"
+        );
+    }
+
+    #[test]
+    fn test_migrate_with_other_flags() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--output".to_string(),
+            "/tmp/out".to_string(),
+            "--validate-config".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate, "migrate should be true");
+        assert_eq!(parsed.migrate_output, Some("/tmp/out".to_string()));
+        assert!(parsed.validate_config, "validate_config should be true");
     }
 }
