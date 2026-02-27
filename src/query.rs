@@ -667,7 +667,7 @@ mod tests {
             subject_aggregated: "CN=example.com".to_string(),
             issuer_aggregated: "CN=Example CA".to_string(),
             all_domains: domains.iter().map(|s| s.to_string()).collect(),
-            as_der: "".to_string(),
+            as_der: vec![],
             chain: vec![],
         }
     }
