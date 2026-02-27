@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use deltalake::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, ListArray, StringArray, UInt64Array};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use deltalake::datafusion::prelude::SessionContext;
-use deltalake::open_table;
+use deltalake::{open_table, DeltaTableError};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -147,12 +147,23 @@ pub async fn run_reparse_audit(
     // Step 1: Open the Delta table
     let table = match open_table(&config.delta_sink.table_path).await {
         Ok(t) => t,
-        Err(e) => {
+        Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             error!(
-                error = %e,
                 table_path = %config.delta_sink.table_path,
-                "Failed to open Delta table"
+                "source Delta table does not exist"
             );
+            let report = AuditReport {
+                total_records: 0,
+                mismatch_record_count: 0,
+                unparseable_count: 0,
+                partition_count: 0,
+                field_mismatch_counts: HashMap::new(),
+                sample_diffs: Vec::new(),
+            };
+            return (1, report);
+        }
+        Err(e) => {
+            error!(error = %e, "failed to open source Delta table");
             let report = AuditReport {
                 total_records: 0,
                 mismatch_record_count: 0,
@@ -713,12 +724,15 @@ pub async fn run_extract_metadata(
             info!("Source table opened successfully");
             t
         }
-        Err(e) => {
+        Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             error!(
-                error = %e,
                 table_path = %config.delta_sink.table_path,
-                "Failed to open source Delta table"
+                "source Delta table does not exist"
             );
+            return 1;
+        }
+        Err(e) => {
+            error!(error = %e, "failed to open source Delta table");
             return 1;
         }
     };
