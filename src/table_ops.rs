@@ -1592,4 +1592,55 @@ mod tests {
         cleanup_test_dir(test_dir);
         cleanup_test_dir(output_dir);
     }
+
+    #[tokio::test]
+    async fn test_ac4_4_reparse_audit_shutdown() {
+        // AC4.4: Reparse audit responds to shutdown by stopping cleanly and returning exit code 1
+        let test_dir = "/tmp/delta_table_ops_test_ac4_4_reparse_shutdown";
+        cleanup_test_dir(test_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Cancel the token before calling the function to simulate shutdown signal
+        shutdown.cancel();
+
+        let (exit_code, _report) = run_reparse_audit(config, None, None, shutdown).await;
+
+        assert_eq!(exit_code, 1, "AC4.4: Audit should exit with code 1 on shutdown");
+
+        cleanup_test_dir(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac4_4_metadata_extraction_shutdown() {
+        // AC4.4: Metadata extraction responds to shutdown by stopping cleanly and returning exit code 1
+        let test_dir = "/tmp/delta_table_ops_test_ac4_4_extract_shutdown_source";
+        let output_dir = "/tmp/delta_table_ops_test_ac4_4_extract_shutdown_output";
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Cancel the token before calling the function to simulate shutdown signal
+        shutdown.cancel();
+
+        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+
+        assert_eq!(exit_code, 1, "AC4.4: Metadata extraction should exit with code 1 on shutdown");
+
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+    }
 }
