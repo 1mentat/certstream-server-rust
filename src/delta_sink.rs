@@ -1,5 +1,6 @@
 use crate::config::DeltaSinkConfig;
 use crate::models::{CertificateMessage, PreSerializedMessage};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -41,7 +42,7 @@ pub struct DeltaCertRecord {
     pub subject_aggregated: String,
     pub issuer_aggregated: String,
     pub all_domains: Vec<String>,
-    pub as_der: String,
+    pub as_der: Vec<u8>,
     pub chain: Vec<String>,
 }
 
@@ -123,7 +124,13 @@ impl DeltaCertRecord {
             subject_aggregated: msg.data.leaf_cert.subject.aggregated.clone().unwrap_or_default(),
             issuer_aggregated: msg.data.leaf_cert.issuer.aggregated.clone().unwrap_or_default(),
             all_domains,
-            as_der: msg.data.leaf_cert.as_der.clone().unwrap_or_default(),
+            as_der: msg
+                .data
+                .leaf_cert
+                .as_der
+                .as_deref()
+                .and_then(|s| STANDARD.decode(s).ok())
+                .unwrap_or_default(),
             chain,
         }
     }
@@ -160,7 +167,7 @@ pub fn delta_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
-        Field::new("as_der", DataType::Utf8, false),
+        Field::new("as_der", DataType::Binary, false),
         Field::new(
             "chain",
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
@@ -381,10 +388,10 @@ pub fn records_to_batch(
     }
     let chain = chain_builder.finish();
 
-    // Build as_der column (Utf8)
-    let as_der: StringArray = records
+    // Build as_der column (Binary)
+    let as_der: BinaryArray = records
         .iter()
-        .map(|r| Some(r.as_der.as_str()))
+        .map(|r| Some(r.as_der.as_slice()))
         .collect();
 
     // Create RecordBatch
@@ -834,7 +841,7 @@ mod tests {
     use std::fs;
 
     fn make_test_json_bytes() -> Vec<u8> {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         json_str.as_bytes().to_vec()
     }
 
@@ -865,7 +872,7 @@ mod tests {
         assert_eq!(record.subject_aggregated, "/CN=example.com");
         assert_eq!(record.issuer_aggregated, "/CN=Test CA");
         assert_eq!(record.all_domains, vec!["example.com", "www.example.com"]);
-        assert_eq!(record.as_der, "base64encodedderdata");
+        assert_eq!(record.as_der, vec![1u8, 2, 3]);
     }
 
     #[test]
@@ -889,7 +896,7 @@ mod tests {
 
     #[test]
     fn test_from_json_with_empty_chain() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -902,12 +909,12 @@ mod tests {
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
-        assert_eq!(record.as_der, "");
+        assert_eq!(record.as_der, Vec::<u8>::new());
     }
 
     #[test]
     fn test_from_json_with_empty_domains() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -993,6 +1000,10 @@ mod tests {
         assert_eq!(fields[13].name(), "is_ca");
         assert_eq!(fields[13].data_type(), &DataType::Boolean);
 
+        // Check as_der is Binary
+        assert_eq!(fields[18].name(), "as_der");
+        assert_eq!(fields[18].data_type(), &DataType::Binary);
+
         // Check chain is List(Utf8)
         assert_eq!(fields[19].name(), "chain");
         match fields[19].data_type() {
@@ -1024,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn test_records_to_batch_contains_as_der_string() {
+    fn test_records_to_batch_contains_as_der_binary() {
         let schema = delta_schema();
         let record = make_test_record();
 
@@ -1034,9 +1045,9 @@ mod tests {
         let as_der_col = batch
             .column(18)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("as_der column should be StringArray");
-        assert_eq!(as_der_col.value(0), "base64encodedderdata");
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der column should be BinaryArray");
+        assert_eq!(as_der_col.value(0), &[1u8, 2, 3]);
     }
 
     #[test]
@@ -1141,13 +1152,13 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 20);
 
-        // as_der should be empty string (index 18)
+        // as_der should be empty bytes (index 18)
         let as_der_col = batch
             .column(18)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("as_der column should be StringArray");
-        assert_eq!(as_der_col.value(0), "");
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der column should be BinaryArray");
+        assert_eq!(as_der_col.value(0), &[] as &[u8]);
     }
 
     #[tokio::test]
@@ -2195,7 +2206,7 @@ mod tests {
         for i in 0..3 {
             let mut record = make_test_record();
             record.cert_index = i as u64;
-            record.as_der = format!("der_data_{}_", i); // Distinctive data to verify correct compression
+            record.as_der = format!("der_data_{}_", i).into_bytes(); // Distinctive data to verify correct compression
             buffer.push(record);
         }
 
@@ -2271,5 +2282,92 @@ mod tests {
         // Simply verify we got a WriterProperties object back - if it's valid
         // it should not panic when used in actual write operations
         // (tested implicitly via the compression test above)
+    }
+
+    #[tokio::test]
+    async fn test_as_der_binary_round_trip() {
+        // AC2.2: Verify that as_der bytes are written and read back correctly
+        let test_name = "as_der_binary_roundtrip";
+        let table_path = format!("/tmp/delta_as_der_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Create a record with known as_der bytes from base64 decoding "AQID" → [1, 2, 3]
+        // to match the JSON test data
+        let test_bytes = vec![1u8, 2, 3];
+        let record = make_test_record();
+        // make_test_record already has as_der = [1, 2, 3] from the JSON "AQID"
+        assert_eq!(record.as_der, test_bytes, "make_test_record should set as_der correctly");
+
+        // Flush the record to the table
+        let mut buffer = vec![record];
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let _new_table = table_opt.expect("table should be available after flush");
+        assert!(
+            flush_result.is_ok(),
+            "flush should succeed: {:?}",
+            flush_result
+        );
+
+        // Verify the parquet file was created with Binary column
+        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
+                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
+                                    return Some(found);
+                                }
+                            }
+                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let parquet_file = find_parquet_file(&table_path)
+            .expect("should find a parquet file in table directory");
+
+        // Read parquet file and verify as_der column type
+        let file = fs::File::open(&parquet_file)
+            .expect("should be able to open parquet file");
+        let reader = SerializedFileReader::new(file)
+            .expect("should be able to read parquet file");
+        let metadata = reader.metadata();
+
+        // Check the schema - find the as_der column (it's a binary column)
+        let schema = metadata.file_metadata().schema_descr();
+        let num_cols = schema.num_columns();
+
+        // Find the as_der column by name
+        let mut found_as_der = false;
+        for i in 0..num_cols {
+            let col = schema.column(i);
+            if col.name() == "as_der" {
+                found_as_der = true;
+                // Verify it's Binary (BYTE_ARRAY physical type with BINARY logical type)
+                let physical_type = col.physical_type();
+                assert_eq!(
+                    format!("{:?}", physical_type),
+                    "BYTE_ARRAY",
+                    "as_der should be BYTE_ARRAY in Parquet"
+                );
+                break;
+            }
+        }
+        assert!(found_as_der, "as_der column should exist in Parquet schema");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&table_path);
     }
 }
