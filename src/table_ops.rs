@@ -630,12 +630,137 @@ pub async fn run_extract_metadata(
     to_date: Option<String>,
     _shutdown: CancellationToken,
 ) -> i32 {
+    use deltalake::protocol::SaveMode;
+    use deltalake::DeltaOps;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use crate::delta_sink::open_or_create_table;
+
     info!(
         table_path = %config.delta_sink.table_path,
         output_path = %output_path,
         from_date = ?from_date,
         to_date = ?to_date,
-        "extract metadata: stub implementation"
+        "Starting metadata extraction"
+    );
+
+    // Step 1: Open the source Delta table
+    let source_table = match open_table(&config.delta_sink.table_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(
+                error = %e,
+                table_path = %config.delta_sink.table_path,
+                "Failed to open source Delta table"
+            );
+            return 1;
+        }
+    };
+
+    // Step 2: Create DataFusion session context and register the source table
+    let ctx = SessionContext::new();
+    if let Err(e) = ctx.register_table("ct_main", Arc::new(source_table)) {
+        error!(error = %e, "Failed to register source Delta table in DataFusion");
+        return 1;
+    }
+
+    // Step 3: Build the SQL query selecting 19 metadata columns (all except as_der)
+    let base_sql = r#"SELECT cert_index, update_type, seen, seen_date, source_name, source_url,
+           cert_link, serial_number, fingerprint, sha256, sha1, not_before,
+           not_after, is_ca, signature_algorithm, subject_aggregated,
+           issuer_aggregated, all_domains, chain
+    FROM ct_main"#;
+
+    let date_filter = match date_filter_clause(&from_date, &to_date) {
+        Ok(clause) => clause,
+        Err(e) => {
+            error!(error = %e, "Invalid date filter");
+            return 1;
+        }
+    };
+
+    let sql = format!("{}{}", base_sql, date_filter);
+
+    // Step 4: Execute the query to get a stream
+    let df = match ctx.sql(&sql).await {
+        Ok(df) => df,
+        Err(e) => {
+            error!(error = %e, "Failed to execute SQL query");
+            return 1;
+        }
+    };
+
+    let mut stream = match df.execute_stream().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed to get record batch stream");
+            return 1;
+        }
+    };
+
+    // Step 5: Open or create the output Delta table
+    let mut output_table = match open_or_create_table(&output_path, &metadata_schema()).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(error = %e, output_path = %output_path, "Failed to open or create output table");
+            return 1;
+        }
+    };
+
+    // Step 6: Build WriterProperties with zstd compression
+    let writer_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(config.delta_sink.compression_level)
+                .expect("compression level validated at startup"),
+        ))
+        .build();
+
+    // Step 7: Iterate through batches and write to output table
+    let mut total_records_written: u64 = 0;
+    let mut any_rows_seen = false;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "Error reading batch from stream");
+                return 1;
+            }
+        };
+
+        if batch.num_rows() > 0 {
+            any_rows_seen = true;
+            let batch_records = batch.num_rows() as u64;
+
+            // Write the batch to the output table
+            match DeltaOps(output_table)
+                .write(vec![batch.clone()])
+                .with_save_mode(SaveMode::Append)
+                .with_writer_properties(writer_props.clone())
+                .await
+            {
+                Ok(new_table) => {
+                    output_table = new_table;
+                    total_records_written += batch_records;
+                    info!("Written {} records", batch_records);
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to write batch to output table");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // Step 8: Check if any records were extracted
+    if !any_rows_seen || total_records_written == 0 {
+        info!("No records found in the specified date range");
+        return 0;
+    }
+
+    info!(
+        total_records = total_records_written,
+        "Metadata extraction completed successfully"
     );
     0
 }
