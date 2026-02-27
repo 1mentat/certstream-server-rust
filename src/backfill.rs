@@ -1151,7 +1151,6 @@ pub async fn run_migrate(
     let source_table = match deltalake::open_table(&config.delta_sink.table_path).await {
         Ok(t) => t,
         Err(e) => {
-
             warn!(
                 source_path = %config.delta_sink.table_path,
                 error = %e,
@@ -1165,7 +1164,6 @@ pub async fn run_migrate(
     let output_table = match open_or_create_table(&output_path, &schema).await {
         Ok(t) => t,
         Err(e) => {
-
             warn!(error = %e, output_path = %output_path, "failed to create output table");
             return 1;
         }
@@ -1261,7 +1259,6 @@ pub async fn run_migrate(
         let partition_df = match partition_ctx.sql(&partition_query).await {
             Ok(df) => df,
             Err(e) => {
-
                 warn!(error = %e, partition = %seen_date, "failed to query partition");
                 return 1;
             }
@@ -1351,7 +1348,6 @@ pub async fn run_migrate(
             let new_batch = match RecordBatch::try_new(output_schema, columns) {
                 Ok(b) => b,
                 Err(e) => {
-
                     warn!(error = %e, partition = %seen_date, "failed to create new batch");
                     return 1;
                 }
@@ -1372,7 +1368,6 @@ pub async fn run_migrate(
                     current_output_table = new_table;
                 }
                 Err(e) => {
-
                     warn!(
                         error = %e,
                         partition = %seen_date,
