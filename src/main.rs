@@ -13,6 +13,7 @@ mod query;
 mod rate_limit;
 mod sse;
 mod state;
+mod table_ops;
 mod websocket;
 mod zerobus_sink;
 
