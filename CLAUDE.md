@@ -24,6 +24,7 @@ Last context update: 2026-02-26
 - `cargo run -- --backfill --staging-path /tmp/staging` - Backfill into staging table
 - `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
 - `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
+- `cargo run -- --migrate --output <PATH>` - Migrate Delta table to new schema
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
@@ -53,6 +54,8 @@ All CT log entries flow through a single `broadcast::channel<Arc<PreSerializedMe
 Consumers (WebSocket, SSE, delta_sink, zerobus_sink) each subscribe independently via `tx.subscribe()`.
 The delta_sink and zerobus_sink are spawned as optional tokio tasks and do not affect other consumers.
 
+In Delta Lake storage, the `as_der` column is stored as raw binary bytes (not base64-encoded). The WriterProperties builder applies dictionary encoding to low-cardinality columns (update_type, source_name, source_url, signature_algorithm, issuer_aggregated) and skips it for high-cardinality columns (fingerprint, sha256, sha1, serial_number, as_der, subject_aggregated, cert_link), with per-column ZSTD compression using `compression_level` for most columns and `heavy_column_compression_level` for the `as_der` column.
+
 The binary has three execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
 2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
@@ -66,16 +69,16 @@ The binary has three execution modes selected in main.rs:
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
-- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level }`
-- **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge)
+- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level }`
+- **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; `heavy_column_compression_level` (i32, default 15, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_HEAVY_COLUMN_COMPRESSION_LEVEL` env var; both validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge) with per-column encoding via WriterProperties
 - **Entry point**: `delta_sink::run_delta_sink(config, rx, shutdown)` spawned in main
-- **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD)
+- **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD); `as_der` is `DataType::Binary` (raw DER bytes, not base64)
 - **Flush triggers**: batch_size threshold OR flush_interval_secs timer OR graceful shutdown
 - **Buffer overflow**: if buffer > 2x batch_size, drops oldest half
 - **Error recovery**: failed writes retain buffer for retry; table handle reopened
 - **Non-fatal startup**: if table creation fails, task exits without crashing server
 - **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
-- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer(table, buffer, schema, batch_size, compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `delta_writer_properties(compression_level, heavy_column_compression_level)`, `flush_buffer(table, buffer, schema, batch_size, compression_level, heavy_column_compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
 
 ## ZeroBus Sink Contracts
 - **Disabled by default** (`zerobus_sink.enabled = false`)
