@@ -297,6 +297,8 @@ pub struct DeltaSinkConfig {
     pub flush_interval_secs: u64,
     #[serde(default = "default_delta_sink_compression_level")]
     pub compression_level: i32,
+    #[serde(default = "default_delta_sink_heavy_column_compression_level")]
+    pub heavy_column_compression_level: i32,
 }
 
 impl Default for DeltaSinkConfig {
@@ -307,6 +309,7 @@ impl Default for DeltaSinkConfig {
             batch_size: default_delta_sink_batch_size(),
             flush_interval_secs: default_delta_sink_flush_interval_secs(),
             compression_level: default_delta_sink_compression_level(),
+            heavy_column_compression_level: default_delta_sink_heavy_column_compression_level(),
         }
     }
 }
@@ -325,6 +328,10 @@ fn default_delta_sink_flush_interval_secs() -> u64 {
 
 fn default_delta_sink_compression_level() -> i32 {
     9
+}
+
+fn default_delta_sink_heavy_column_compression_level() -> i32 {
+    15
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -620,6 +627,9 @@ impl Config {
         if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL") {
             delta_sink.compression_level = v.parse().unwrap_or(delta_sink.compression_level);
         }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_HEAVY_COLUMN_COMPRESSION_LEVEL") {
+            delta_sink.heavy_column_compression_level = v.parse().unwrap_or(delta_sink.heavy_column_compression_level);
+        }
 
         let mut query_api = yaml_config.query_api.unwrap_or_default();
         if let Ok(v) = env::var("CERTSTREAM_QUERY_API_ENABLED") {
@@ -801,6 +811,15 @@ impl Config {
                 message: format!(
                     "Compression level {} is invalid. Must be between 1 and 22",
                     self.delta_sink.compression_level
+                ),
+            });
+        }
+        if ZstdLevel::try_new(self.delta_sink.heavy_column_compression_level).is_err() {
+            errors.push(ConfigValidationError {
+                field: "delta_sink.heavy_column_compression_level".to_string(),
+                message: format!(
+                    "Heavy column compression level {} is invalid. Must be between 1 and 22",
+                    self.delta_sink.heavy_column_compression_level
                 ),
             });
         }
