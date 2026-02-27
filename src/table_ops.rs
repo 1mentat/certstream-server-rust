@@ -646,7 +646,10 @@ pub async fn run_extract_metadata(
 
     // Step 1: Open the source Delta table
     let source_table = match open_table(&config.delta_sink.table_path).await {
-        Ok(t) => t,
+        Ok(t) => {
+            info!("Source table opened successfully");
+            t
+        }
         Err(e) => {
             error!(
                 error = %e,
@@ -663,16 +666,22 @@ pub async fn run_extract_metadata(
         error!(error = %e, "Failed to register source Delta table in DataFusion");
         return 1;
     }
+    info!("Source table registered in DataFusion");
 
     // Step 3: Build the SQL query selecting 19 metadata columns (all except as_der)
-    let base_sql = r#"SELECT cert_index, update_type, seen, seen_date, source_name, source_url,
+    // Cast fields to ensure they match the expected schema:
+    // - cert_index: use CAST or just let it be, seems DataFusion returns Int64
+    // - seen_date: cast to VARCHAR to prevent dictionary encoding which Delta can't handle for partitions
+    let base_sql = r#"SELECT cert_index, update_type, seen, CAST(seen_date AS VARCHAR) as seen_date, source_name, source_url,
            cert_link, serial_number, fingerprint, sha256, sha1, not_before,
            not_after, is_ca, signature_algorithm, subject_aggregated,
            issuer_aggregated, all_domains, chain
     FROM ct_main"#;
 
     let date_filter = match date_filter_clause(&from_date, &to_date) {
-        Ok(clause) => clause,
+        Ok(clause) => {
+            clause
+        }
         Err(e) => {
             error!(error = %e, "Invalid date filter");
             return 1;
@@ -680,18 +689,28 @@ pub async fn run_extract_metadata(
     };
 
     let sql = format!("{}{}", base_sql, date_filter);
+    info!("SQL query: {}", sql);
 
     // Step 4: Execute the query to get a stream
     let df = match ctx.sql(&sql).await {
-        Ok(df) => df,
+        Ok(df) => {
+            info!("SQL query executed successfully");
+            df
+        }
         Err(e) => {
             error!(error = %e, "Failed to execute SQL query");
             return 1;
         }
     };
 
+    // Get the schema before consuming the DataFrame (needed for batch construction)
+    let _df_schema = df.schema().clone();
+
     let mut stream = match df.execute_stream().await {
-        Ok(s) => s,
+        Ok(s) => {
+            info!("Record batch stream obtained");
+            s
+        }
         Err(e) => {
             error!(error = %e, "Failed to get record batch stream");
             return 1;
@@ -699,8 +718,17 @@ pub async fn run_extract_metadata(
     };
 
     // Step 5: Open or create the output Delta table
+    // First, ensure the output directory exists
+    if let Err(e) = std::fs::create_dir_all(&output_path) {
+        error!(error = %e, output_path = %output_path, "Failed to create output directory");
+        return 1;
+    }
+
+    // Use the metadata schema to create the output table with the correct structure
     let mut output_table = match open_or_create_table(&output_path, &metadata_schema()).await {
-        Ok(t) => t,
+        Ok(t) => {
+            t
+        }
         Err(e) => {
             error!(error = %e, output_path = %output_path, "Failed to open or create output table");
             return 1;
@@ -721,7 +749,9 @@ pub async fn run_extract_metadata(
 
     while let Some(batch_result) = stream.next().await {
         let batch = match batch_result {
-            Ok(b) => b,
+            Ok(b) => {
+                b
+            }
             Err(e) => {
                 error!(error = %e, "Error reading batch from stream");
                 return 1;
@@ -1223,5 +1253,263 @@ mod tests {
         assert_eq!(exit_code, 0, "Audit should exit with code 0 for empty date range");
         assert_eq!(report.total_records, 0, "AC1.6: Should have zero total records");
         cleanup_test_dir(test_dir);
+    }
+
+    // Integration tests for metadata extraction using real Delta tables
+
+    #[tokio::test]
+    async fn test_ac2_1_extract_metadata_output_schema_has_19_columns_no_as_der() {
+        // AC2.1: Output Delta table contains exactly 19 columns (all except as_der)
+        let test_dir = "/tmp/delta_table_ops_test_ac2_1_source";
+        let output_dir = "/tmp/delta_table_ops_test_ac2_1_output";
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        // Debug: verify source table exists
+        let source_check = open_table(test_dir).await;
+        assert!(source_check.is_ok(), "Source table should exist before extraction");
+
+        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "AC2.1: Extraction should succeed");
+
+        // Open the output table via DataFusion and verify schema has 19 columns
+        let output_table = open_table(output_dir).await.expect("Failed to open output table");
+        let ctx = SessionContext::new();
+        ctx.register_table("output", Arc::new(output_table)).expect("Failed to register output table");
+
+        // Use SQL to verify the schema
+        let sql = "SELECT * FROM output LIMIT 0";
+        let df = ctx.sql(sql).await.expect("Failed to execute schema query");
+        let schema = df.schema();
+
+        // Verify 19 columns
+        assert_eq!(schema.fields().len(), 19, "AC2.1: Output schema should have 19 fields");
+
+        // Verify no as_der field
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(!field_names.contains(&"as_der"), "AC2.1: Output should not contain as_der field");
+
+        // Verify all expected fields are present
+        let expected_fields = vec![
+            "cert_index", "update_type", "seen", "seen_date", "source_name", "source_url",
+            "cert_link", "serial_number", "fingerprint", "sha256", "sha1", "not_before",
+            "not_after", "is_ca", "signature_algorithm", "subject_aggregated",
+            "issuer_aggregated", "all_domains", "chain",
+        ];
+        for expected in &expected_fields {
+            assert!(field_names.contains(expected), "AC2.1: Field {} should be present", expected);
+        }
+
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_2_extract_metadata_preserves_all_field_values() {
+        // AC2.2: All metadata field values in output match source table exactly
+        let test_dir = "/tmp/delta_table_ops_test_ac2_2_source";
+        let output_dir = "/tmp/delta_table_ops_test_ac2_2_output";
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        let subject_aggregated = record.subject_aggregated.clone();
+        let not_before = record.not_before;
+        let not_after = record.not_after;
+        let is_ca = record.is_ca;
+        let source_url = record.source_url.clone();
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "AC2.2: Extraction should succeed");
+
+        // Query the output table to verify field values
+        let output_table = open_table(output_dir).await.expect("Failed to open output table");
+        let ctx = SessionContext::new();
+        ctx.register_table("output", Arc::new(output_table)).expect("Failed to register output table");
+
+        let sql = "SELECT cert_index, subject_aggregated, not_before, not_after, is_ca, source_url FROM output";
+        let df = ctx.sql(sql).await.expect("Failed to execute SQL");
+        let batches = df.collect().await.expect("Failed to collect batches");
+
+        assert!(!batches.is_empty(), "AC2.2: Output table should have records");
+        let batch = &batches[0];
+
+        // Extract values from batch
+        // Note: cert_index might be Int64 from DataFusion even though schema says UInt64
+        let cert_index_col = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("cert_index should be Int64");
+        let subject_col = batch.column(1).as_any().downcast_ref::<StringArray>().expect("subject_aggregated should be Utf8");
+        let not_before_col = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("not_before should be Int64");
+        let not_after_col = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("not_after should be Int64");
+        let is_ca_col = batch.column(4).as_any().downcast_ref::<BooleanArray>().expect("is_ca should be Boolean");
+        let source_url_col = batch.column(5).as_any().downcast_ref::<StringArray>().expect("source_url should be Utf8");
+
+        // Verify values match source record
+        assert_eq!(cert_index_col.value(0) as u64, 1, "AC2.2: cert_index should match");
+        assert_eq!(subject_col.value(0), subject_aggregated, "AC2.2: subject_aggregated should match");
+        assert_eq!(not_before_col.value(0), not_before, "AC2.2: not_before should match");
+        assert_eq!(not_after_col.value(0), not_after, "AC2.2: not_after should match");
+        assert_eq!(is_ca_col.value(0), is_ca, "AC2.2: is_ca should match");
+        assert_eq!(source_url_col.value(0), source_url, "AC2.2: source_url should match");
+
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_3_extract_metadata_output_is_partitioned_by_seen_date() {
+        // AC2.3: Output table is partitioned by seen_date
+        let test_dir = "/tmp/delta_table_ops_test_ac2_3_source";
+        let output_dir = "/tmp/delta_table_ops_test_ac2_3_output";
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "AC2.3: Extraction should succeed");
+
+        // Open the output table and check partition columns
+        let output_table = open_table(output_dir).await.expect("Failed to open output table");
+        let metadata = output_table.metadata().expect("Failed to get table metadata");
+        let partition_cols = &metadata.partition_columns;
+
+        assert!(!partition_cols.is_empty(), "AC2.3: Output table should have partition columns");
+        assert_eq!(partition_cols[0], "seen_date", "AC2.3: First partition column should be seen_date");
+
+        // Verify directory structure includes seen_date=YYYY-MM-DD/ subdirectories
+        let path = std::path::Path::new(output_dir);
+        let entries: Vec<_> = fs::read_dir(path)
+            .expect("Failed to read output directory")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("seen_date="))
+            .collect();
+
+        assert!(!entries.is_empty(), "AC2.3: Output directory should have seen_date= subdirectories");
+
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_4_extract_metadata_preserves_chain_column() {
+        // AC2.4: Chain column is preserved with full chain certificate metadata JSON
+        let test_dir = "/tmp/delta_table_ops_test_ac2_4_source";
+        let output_dir = "/tmp/delta_table_ops_test_ac2_4_output";
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let mut record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        // Add chain values
+        record.chain = vec![
+            "{\"subject\": \"CN=intermediate\"}".to_string(),
+            "{\"subject\": \"CN=root\"}".to_string(),
+        ];
+
+        let expected_chain_0 = "{\"subject\": \"CN=intermediate\"}".to_string();
+        let expected_chain_1 = "{\"subject\": \"CN=root\"}".to_string();
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "AC2.4: Extraction should succeed");
+
+        // Query the output table to verify chain values
+        let output_table = open_table(output_dir).await.expect("Failed to open output table");
+        let ctx = SessionContext::new();
+        ctx.register_table("output", Arc::new(output_table)).expect("Failed to register output table");
+
+        let sql = "SELECT chain FROM output";
+        let df = ctx.sql(sql).await.expect("Failed to execute SQL");
+        let batches = df.collect().await.expect("Failed to collect batches");
+
+        assert!(!batches.is_empty(), "AC2.4: Output table should have records");
+        let batch = &batches[0];
+        let chain_col = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+
+        let chain_values = chain_col.value(0);
+        let chain_str_array = chain_values.as_any().downcast_ref::<StringArray>().unwrap();
+
+        // Verify chain values match
+        assert_eq!(chain_str_array.len(), 2, "AC2.4: Chain should have 2 items");
+        assert_eq!(chain_str_array.value(0), expected_chain_0, "AC2.4: First chain item should match");
+        assert_eq!(chain_str_array.value(1), expected_chain_1, "AC2.4: Second chain item should match");
+
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_5_extract_metadata_fails_with_missing_source_table() {
+        // AC2.5: Missing source table exits 1 with error message
+        let test_dir = "/tmp/delta_table_ops_test_ac2_5_nonexistent";
+        let output_dir = "/tmp/delta_table_ops_test_ac2_5_output";
+        cleanup_test_dir(output_dir);
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+
+        assert_eq!(exit_code, 1, "AC2.5: Should exit with code 1 when source table doesn't exist");
+
+        cleanup_test_dir(output_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac2_6_extract_metadata_empty_date_range_exits_zero() {
+        // AC2.6: Extraction against empty date range exits 0 with informational message
+        let test_dir = "/tmp/delta_table_ops_test_ac2_6_source";
+        let output_dir = "/tmp/delta_table_ops_test_ac2_6_output";
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-01-01".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        // Query for a future date range that doesn't match (2099-01-01)
+        let exit_code = run_extract_metadata(
+            config,
+            output_dir.to_string(),
+            Some("2099-01-01".to_string()),
+            None,
+            shutdown,
+        )
+        .await;
+
+        assert_eq!(exit_code, 0, "AC2.6: Should exit with code 0 for empty date range");
+
+        cleanup_test_dir(test_dir);
+        cleanup_test_dir(output_dir);
     }
 }
