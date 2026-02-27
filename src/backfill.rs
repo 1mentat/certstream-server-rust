@@ -4049,4 +4049,168 @@ mod tests {
         let _ = fs::remove_dir_all(&source_path);
         let _ = fs::remove_dir_all(&output_path);
     }
+
+    #[tokio::test]
+    async fn test_backfill_writer_binary_as_der() {
+        // Verifies Task 3.1: Backfill writer produces Binary as_der
+        // The writer should correctly write DeltaCertRecords with Vec<u8> as_der to Delta table
+        let test_name = "backfill_writer_binary_as_der";
+        let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+
+        // Create an mpsc channel for writer
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        // Spawn the writer task
+        let table_path_clone = table_path.clone();
+        let writer_task = tokio::spawn(async move {
+            run_writer(
+                table_path_clone,
+                10,  // batch_size
+                1,   // flush_interval_secs
+                9,   // compression_level
+                15,  // heavy_column_compression_level
+                rx,
+                CancellationToken::new(),
+            )
+            .await
+        });
+
+        // Send a record with known as_der bytes
+        let mut record = make_test_record(1, "https://log.example.com");
+        record.as_der = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        tx.send(record).await.expect("Failed to send record");
+
+        // Drop the sender to signal channel close
+        drop(tx);
+
+        // Wait for writer to finish
+        let result = writer_task.await.expect("writer task panicked");
+        assert_eq!(result.total_records_written, 1, "Should have written 1 record");
+        assert_eq!(result.write_errors, 0, "Should have no write errors");
+
+        // Re-open the table and verify as_der column is Binary with correct value
+        let table = deltalake::open_table(&table_path)
+            .await
+            .expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        let df = ctx
+            .sql("SELECT as_der FROM ct_records WHERE cert_index = 1")
+            .await
+            .expect("SQL query failed");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        assert!(!batches.is_empty(), "Should have at least one result");
+        let batch = &batches[0];
+        let as_der_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der should be Binary type");
+
+        assert_eq!(as_der_col.len(), 1, "Should have one value");
+        assert_eq!(
+            as_der_col.value(0),
+            &[0xDEu8, 0xAD, 0xBE, 0xEF][..],
+            "as_der value should match what was sent"
+        );
+
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_merge_path_binary_as_der() {
+        // Verifies Task 3.2: Merge path handles Binary as_der correctly
+        // After merging staging into main, as_der should remain Binary and data should be preserved
+        let test_name = "merge_binary_as_der";
+        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(&staging_path);
+
+        let schema = delta_schema();
+
+        // Create main table with a record (cert_index=1)
+        let main_table = open_or_create_table(&main_path, &schema)
+            .await
+            .expect("main table creation failed");
+        let mut main_record = make_test_record(1, "https://log.example.com");
+        main_record.as_der = vec![0x11, 0x22, 0x33, 0x44];
+        let main_records = vec![main_record];
+        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
+        let _ = DeltaOps(main_table)
+            .write(vec![main_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("main write failed");
+
+        // Create staging table with a different record (cert_index=2)
+        let staging_table = open_or_create_table(&staging_path, &schema)
+            .await
+            .expect("staging table creation failed");
+        let mut staging_record = make_test_record(2, "https://log.example.com");
+        staging_record.as_der = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let staging_records = vec![staging_record];
+        let staging_batch =
+            records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
+        let _ = DeltaOps(staging_table)
+            .write(vec![staging_batch])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("staging write failed");
+
+        // Run merge
+        let config = make_test_config(&main_path);
+        let shutdown = CancellationToken::new();
+        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+        assert_eq!(exit_code, 0, "Merge should succeed");
+
+        // Verify the merged table has both records with correct as_der values
+        let main_table = deltalake::open_table(&main_path)
+            .await
+            .expect("Failed to reopen main table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(main_table))
+            .expect("Failed to register table");
+
+        // Query for both records
+        let df = ctx
+            .sql("SELECT cert_index, as_der FROM ct_records ORDER BY cert_index")
+            .await
+            .expect("SQL query failed");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        assert!(!batches.is_empty(), "Should have results");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2, "Should have 2 records");
+
+        // Verify cert_index values
+        let cert_indices = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("cert_index should be Int64");
+        assert_eq!(cert_indices.value(0), 1);
+        assert_eq!(cert_indices.value(1), 2);
+
+        // Verify as_der values
+        let as_der_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der should be Binary type");
+        assert_eq!(as_der_col.value(0), &[0x11u8, 0x22, 0x33, 0x44][..]);
+        assert_eq!(as_der_col.value(1), &[0xAAu8, 0xBB, 0xCC, 0xDD][..]);
+
+        let _ = fs::remove_dir_all(&main_path);
+        let _ = fs::remove_dir_all(&staging_path);
+    }
 }
