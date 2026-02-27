@@ -31,6 +31,7 @@ pub struct FieldDiff {
 
 /// Audit report containing all audit results and statistics.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AuditReport {
     pub total_records: u64,
     pub mismatch_record_count: u64,
@@ -38,6 +39,19 @@ pub struct AuditReport {
     pub partition_count: u64,
     pub field_mismatch_counts: HashMap<String, u64>,
     pub sample_diffs: Vec<SampleDiff>,
+}
+
+impl Default for AuditReport {
+    fn default() -> Self {
+        AuditReport {
+            total_records: 0,
+            mismatch_record_count: 0,
+            unparseable_count: 0,
+            partition_count: 0,
+            field_mismatch_counts: HashMap::new(),
+            sample_diffs: Vec::new(),
+        }
+    }
 }
 
 /// Helper function to extract domains from a ListArray at a given row index.
@@ -131,6 +145,67 @@ pub fn metadata_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Helper function to print a reparse audit report with the given header text.
+/// Used by both the shutdown path and the normal completion path.
+fn print_reparse_report(
+    header: &str,
+    total_records: u64,
+    partition_count: u64,
+    mismatch_record_count: u64,
+    unparseable_count: u64,
+    field_mismatch_counts: &HashMap<String, u64>,
+    sample_diffs: &[SampleDiff],
+) {
+    let percentage = if total_records > 0 {
+        mismatch_record_count as f64 / total_records as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    println!("\n{}", header);
+    println!("{}", "=".repeat(header.len()));
+    println!("Records scanned: {}", total_records);
+    println!("Partitions scanned: {}", partition_count);
+    println!(
+        "Records with mismatches: {} ({:.1}%)",
+        mismatch_record_count, percentage
+    );
+    println!("Unparseable records: {}", unparseable_count);
+    println!();
+
+    if !field_mismatch_counts.is_empty() {
+        println!("Field breakdown:");
+        let mut field_names: Vec<_> = field_mismatch_counts.keys().collect();
+        field_names.sort();
+        for field_name in field_names {
+            let count = field_mismatch_counts[field_name];
+            println!("  {}: {} mismatches", field_name, count);
+        }
+        println!();
+    }
+
+    if !sample_diffs.is_empty() {
+        println!(
+            "Sample mismatches ({} of {}):",
+            sample_diffs.len(),
+            mismatch_record_count
+        );
+        for sample in sample_diffs {
+            println!(
+                "  [cert_index={}, source={}]",
+                sample.cert_index, sample.source_url
+            );
+            for field_diff in &sample.fields {
+                println!(
+                    "    {}: stored=\"{}\" reparsed=\"{}\"",
+                    field_diff.field_name, field_diff.stored, field_diff.reparsed
+                );
+            }
+        }
+    }
+    println!();
+}
+
 pub async fn run_reparse_audit(
     config: Config,
     from_date: Option<String>,
@@ -152,27 +227,11 @@ pub async fn run_reparse_audit(
                 table_path = %config.delta_sink.table_path,
                 "source Delta table does not exist"
             );
-            let report = AuditReport {
-                total_records: 0,
-                mismatch_record_count: 0,
-                unparseable_count: 0,
-                partition_count: 0,
-                field_mismatch_counts: HashMap::new(),
-                sample_diffs: Vec::new(),
-            };
-            return (1, report);
+            return (1, AuditReport::default());
         }
         Err(e) => {
             error!(error = %e, "failed to open source Delta table");
-            let report = AuditReport {
-                total_records: 0,
-                mismatch_record_count: 0,
-                unparseable_count: 0,
-                partition_count: 0,
-                field_mismatch_counts: HashMap::new(),
-                sample_diffs: Vec::new(),
-            };
-            return (1, report);
+            return (1, AuditReport::default());
         }
     };
 
@@ -182,15 +241,7 @@ pub async fn run_reparse_audit(
     // Register table as ct_main
     if let Err(e) = ctx.register_table("ct_main", Arc::new(table)) {
         error!(error = %e, "Failed to register Delta table in DataFusion");
-        let report = AuditReport {
-            total_records: 0,
-            mismatch_record_count: 0,
-            unparseable_count: 0,
-            partition_count: 0,
-            field_mismatch_counts: HashMap::new(),
-            sample_diffs: Vec::new(),
-        };
-        return (1, report);
+        return (1, AuditReport::default());
     }
 
     // Step 3: Build the SQL query
@@ -202,15 +253,7 @@ pub async fn run_reparse_audit(
         Ok(clause) => clause,
         Err(e) => {
             error!(error = %e, "Invalid date filter");
-            let report = AuditReport {
-                total_records: 0,
-                mismatch_record_count: 0,
-                unparseable_count: 0,
-                partition_count: 0,
-                field_mismatch_counts: HashMap::new(),
-                sample_diffs: Vec::new(),
-            };
-            return (1, report);
+            return (1, AuditReport::default());
         }
     };
 
@@ -221,15 +264,7 @@ pub async fn run_reparse_audit(
         Ok(df) => df,
         Err(e) => {
             error!(error = %e, "Failed to execute SQL query");
-            let report = AuditReport {
-                total_records: 0,
-                mismatch_record_count: 0,
-                unparseable_count: 0,
-                partition_count: 0,
-                field_mismatch_counts: HashMap::new(),
-                sample_diffs: Vec::new(),
-            };
-            return (1, report);
+            return (1, AuditReport::default());
         }
     };
 
@@ -237,15 +272,7 @@ pub async fn run_reparse_audit(
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "Failed to get record batch stream");
-            let report = AuditReport {
-                total_records: 0,
-                mismatch_record_count: 0,
-                unparseable_count: 0,
-                partition_count: 0,
-                field_mismatch_counts: HashMap::new(),
-                sample_diffs: Vec::new(),
-            };
-            return (1, report);
+            return (1, AuditReport::default());
         }
     };
 
@@ -262,56 +289,15 @@ pub async fn run_reparse_audit(
     while let Some(batch_result) = stream.next().await {
         if shutdown.is_cancelled() {
             warn!("reparse audit interrupted by shutdown signal");
-            // Print partial report before exiting
-            let percentage = if total_records > 0 {
-                mismatch_record_count as f64 / total_records as f64 * 100.0
-            } else {
-                0.0
-            };
-
-            println!("\nReparse Audit Report (Partial - Interrupted)");
-            println!("=============================================");
-            println!("Records scanned: {}", total_records);
-            println!("Partitions scanned: {}", partition_count);
-            println!(
-                "Records with mismatches: {} ({:.1}%)",
-                mismatch_record_count, percentage
+            print_reparse_report(
+                "Reparse Audit Report (Partial - Interrupted)",
+                total_records,
+                partition_count,
+                mismatch_record_count,
+                unparseable_count,
+                &field_mismatch_counts,
+                &sample_diffs,
             );
-            println!("Unparseable records: {}", unparseable_count);
-            println!();
-
-            if !field_mismatch_counts.is_empty() {
-                println!("Field breakdown:");
-                let mut field_names: Vec<_> = field_mismatch_counts.keys().collect();
-                field_names.sort();
-                for field_name in field_names {
-                    let count = field_mismatch_counts[field_name];
-                    println!("  {}: {} mismatches", field_name, count);
-                }
-                println!();
-            }
-
-            if !sample_diffs.is_empty() {
-                println!(
-                    "Sample mismatches ({} of {}):",
-                    sample_diffs.len(),
-                    mismatch_record_count
-                );
-                for sample in &sample_diffs {
-                    println!(
-                        "  [cert_index={}, source={}]",
-                        sample.cert_index, sample.source_url
-                    );
-                    for field_diff in &sample.fields {
-                        println!(
-                            "    {}: stored=\"{}\" reparsed=\"{}\"",
-                            field_diff.field_name, field_diff.stored, field_diff.reparsed
-                        );
-                    }
-                }
-            }
-            println!();
-
             let report = AuditReport {
                 total_records,
                 mismatch_record_count,
@@ -327,15 +313,14 @@ pub async fn run_reparse_audit(
             Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "Error reading batch from stream");
-                let report = AuditReport {
+                return (1, AuditReport {
                     total_records,
                     mismatch_record_count,
                     unparseable_count,
                     partition_count,
                     field_mismatch_counts,
                     sample_diffs,
-                };
-                return (1, report);
+                });
             }
         };
 
@@ -636,54 +621,15 @@ pub async fn run_reparse_audit(
     }
 
     // Step 7: Print the report
-    let percentage = if total_records > 0 {
-        mismatch_record_count as f64 / total_records as f64 * 100.0
-    } else {
-        0.0
-    };
-
-    println!("\nReparse Audit Report");
-    println!("====================");
-    println!("Records scanned: {}", total_records);
-    println!("Partitions scanned: {}", partition_count);
-    println!(
-        "Records with mismatches: {} ({:.1}%)",
-        mismatch_record_count, percentage
+    print_reparse_report(
+        "Reparse Audit Report",
+        total_records,
+        partition_count,
+        mismatch_record_count,
+        unparseable_count,
+        &field_mismatch_counts,
+        &sample_diffs,
     );
-    println!("Unparseable records: {}", unparseable_count);
-    println!();
-
-    if !field_mismatch_counts.is_empty() {
-        println!("Field breakdown:");
-        let mut field_names: Vec<_> = field_mismatch_counts.keys().collect();
-        field_names.sort();
-        for field_name in field_names {
-            let count = field_mismatch_counts[field_name];
-            println!("  {}: {} mismatches", field_name, count);
-        }
-        println!();
-    }
-
-    if !sample_diffs.is_empty() {
-        println!(
-            "Sample mismatches ({} of {}):",
-            sample_diffs.len(),
-            mismatch_record_count
-        );
-        for sample in &sample_diffs {
-            println!(
-                "  [cert_index={}, source={}]",
-                sample.cert_index, sample.source_url
-            );
-            for field_diff in &sample.fields {
-                println!(
-                    "    {}: stored=\"{}\" reparsed=\"{}\"",
-                    field_diff.field_name, field_diff.stored, field_diff.reparsed
-                );
-            }
-        }
-    }
-    println!();
 
     // Step 8: Return 0 (audit always exits 0 unless infrastructure failure)
     let report = AuditReport {
@@ -1198,6 +1144,7 @@ mod tests {
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.mismatch_record_count, 0, "AC1.1: Should have 0 mismatches");
         assert_eq!(report.unparseable_count, 0, "AC1.1: Should have 0 unparseable records");
+        assert_eq!(report.partition_count, 1, "AC1.1: Should have 1 partition");
         cleanup_test_dir(test_dir);
     }
 
