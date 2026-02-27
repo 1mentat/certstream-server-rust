@@ -5,6 +5,7 @@ use crate::delta_sink::{delta_schema, delta_writer_properties, DeltaCertRecord, 
 use crate::models::Source;
 use crate::state::StateManager;
 use crate::zerobus_sink::{cert_record_descriptor_proto, proto};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_zerobus_ingest_sdk::{StreamConfigurationOptions, TableProperties, ZerobusSdk};
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
@@ -1115,6 +1116,261 @@ pub async fn run_merge(
             // Non-fatal — merge succeeded, staging cleanup failed
         }
     }
+
+    0
+}
+
+/// Migrate an existing Delta table with old schema (Utf8 as_der) to new schema (Binary as_der).
+///
+/// This function:
+/// 1. Opens the source table at config.delta_sink.table_path
+/// 2. Creates or opens the output table at output_path with the new schema
+/// 3. Queries distinct seen_date partitions from the source table
+/// 4. For each partition:
+///    - Checks CancellationToken for graceful shutdown (AC3.4)
+///    - Reads all records for that partition via DataFusion SQL
+///    - Transforms as_der column from StringArray (base64) to BinaryArray (raw bytes)
+///    - Passes all other columns through unchanged (AC3.3)
+///    - Writes the transformed batch to the output table with centralized WriterProperties
+/// 5. Returns exit code 0 on success, 1 on error
+pub async fn run_migrate(
+    config: Config,
+    output_path: String,
+    shutdown: CancellationToken,
+) -> i32 {
+    info!(
+        source_path = %config.delta_sink.table_path,
+        output_path = %output_path,
+        "migration mode starting"
+    );
+
+    let schema = delta_schema();
+
+    // Open source table
+    let source_table = match deltalake::open_table(&config.delta_sink.table_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                source_path = %config.delta_sink.table_path,
+                error = %e,
+                "failed to open source table"
+            );
+            return 1;
+        }
+    };
+
+    // Create or open output table
+    let output_table = match open_or_create_table(&output_path, &schema).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, output_path = %output_path, "failed to create output table");
+            return 1;
+        }
+    };
+
+    // Register source table and query distinct partitions
+    let ctx = SessionContext::new();
+    if let Err(e) = ctx.register_table("source", Arc::new(source_table)) {
+        warn!(error = %e, "failed to register source table");
+        return 1;
+    }
+
+    let partitions_df = match ctx.sql("SELECT DISTINCT seen_date FROM source ORDER BY seen_date").await {
+        Ok(df) => df,
+        Err(e) => {
+            warn!(error = %e, "failed to query partition dates");
+            return 1;
+        }
+    };
+
+    let partition_batches = match partitions_df.collect().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "failed to collect partition batches");
+            return 1;
+        }
+    };
+
+    // Extract partition dates from batches
+    let mut partition_dates: Vec<String> = Vec::new();
+    for batch in &partition_batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let seen_date_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("seen_date should be StringArray");
+        for i in 0..batch.num_rows() {
+            if seen_date_col.is_valid(i) {
+                partition_dates.push(seen_date_col.value(i).to_string());
+            }
+        }
+    }
+
+    if partition_dates.is_empty() {
+        info!("source table is empty, nothing to migrate");
+        return 0;
+    }
+
+    info!(
+        total_partitions = partition_dates.len(),
+        "found partitions to migrate"
+    );
+
+    // Get WriterProperties
+    let writer_props = delta_writer_properties(
+        config.delta_sink.compression_level,
+        config.delta_sink.heavy_column_compression_level,
+    );
+
+    // Migrate partition by partition
+    let mut current_output_table = output_table;
+    let mut total_rows_migrated: usize = 0;
+    let mut total_decode_failures: usize = 0;
+
+    for (partition_idx, seen_date) in partition_dates.iter().enumerate() {
+        if shutdown.is_cancelled() {
+            warn!("migration interrupted by shutdown signal");
+            return 1;
+        }
+
+        // Query all records for this partition
+        let partition_ctx = SessionContext::new();
+        if let Err(e) = partition_ctx.register_table("source", Arc::new(
+            match deltalake::open_table(&config.delta_sink.table_path).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "failed to reopen source table for partition");
+                    return 1;
+                }
+            }
+        )) {
+            warn!(error = %e, "failed to register source table for partition");
+            return 1;
+        }
+
+        let partition_query = format!("SELECT * FROM source WHERE seen_date = '{}'", seen_date);
+        let partition_df = match partition_ctx.sql(&partition_query).await {
+            Ok(df) => df,
+            Err(e) => {
+                warn!(error = %e, partition = %seen_date, "failed to query partition");
+                return 1;
+            }
+        };
+
+        let batches = match partition_df.collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, partition = %seen_date, "failed to collect partition batches");
+                return 1;
+            }
+        };
+
+        // Process each batch in the partition
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Transform as_der column from base64 string to binary bytes
+            let as_der_idx = match batch.schema().index_of("as_der") {
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!(error = %e, partition = %seen_date, "as_der column not found");
+                    return 1;
+                }
+            };
+
+            let as_der_strings = batch.column(as_der_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("source as_der should be StringArray");
+
+            let mut decode_failures: usize = 0;
+            let as_der_binary: BinaryArray = as_der_strings
+                .iter()
+                .map(|opt_val| {
+                    opt_val.and_then(|s| {
+                        match STANDARD.decode(s) {
+                            Ok(bytes) => Some(bytes),
+                            Err(_) => {
+                                decode_failures += 1;
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            if decode_failures > 0 {
+                warn!(
+                    partition = %seen_date,
+                    decode_failures = decode_failures,
+                    "base64 decode failures in as_der column (converted to empty bytes)"
+                );
+                total_decode_failures += decode_failures;
+            }
+
+            // Build new RecordBatch with transformed as_der column
+            let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.num_columns());
+            for (i, _field) in batch.schema().fields().iter().enumerate() {
+                if i == as_der_idx {
+                    columns.push(Arc::new(as_der_binary.clone()));
+                } else {
+                    columns.push(batch.column(i).clone());
+                }
+            }
+
+            let new_batch = match RecordBatch::try_new(schema.clone(), columns) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, partition = %seen_date, "failed to create new batch");
+                    return 1;
+                }
+            };
+
+            let batch_rows = new_batch.num_rows();
+            total_rows_migrated += batch_rows;
+
+            // Write the transformed batch to output table
+            let write_result = DeltaOps(current_output_table)
+                .write(vec![new_batch])
+                .with_save_mode(deltalake::protocol::SaveMode::Append)
+                .with_writer_properties(writer_props.clone())
+                .await;
+
+            match write_result {
+                Ok(new_table) => {
+                    current_output_table = new_table;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        partition = %seen_date,
+                        "failed to write batch to output table"
+                    );
+                    return 1;
+                }
+            }
+        }
+
+        info!(
+            partition = %seen_date,
+            partition_num = partition_idx + 1,
+            total_partitions = partition_dates.len(),
+            "migrated partition"
+        );
+    }
+
+    info!(
+        total_rows_migrated = total_rows_migrated,
+        total_decode_failures = total_decode_failures,
+        source_path = %config.delta_sink.table_path,
+        output_path = %output_path,
+        "migration complete"
+    );
 
     0
 }
