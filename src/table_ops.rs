@@ -703,9 +703,6 @@ pub async fn run_extract_metadata(
         }
     };
 
-    // Get the schema before consuming the DataFrame (needed for batch construction)
-    let _df_schema = df.schema().clone();
-
     let mut stream = match df.execute_stream().await {
         Ok(s) => {
             info!("Record batch stream obtained");
@@ -764,7 +761,7 @@ pub async fn run_extract_metadata(
 
             // Write the batch to the output table
             match DeltaOps(output_table)
-                .write(vec![batch.clone()])
+                .write(vec![batch])
                 .with_save_mode(SaveMode::Append)
                 .with_writer_properties(writer_props.clone())
                 .await
