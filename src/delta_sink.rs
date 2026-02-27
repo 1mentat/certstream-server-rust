@@ -851,6 +851,27 @@ mod tests {
         DeltaCertRecord::from_json(&make_test_json_bytes()).expect("failed to deserialize test record")
     }
 
+    fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        // Skip _delta_log
+                        if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
+                            if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
+                                return Some(found);
+                            }
+                        }
+                    } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn test_from_json_deserializes_all_fields() {
         let json_bytes = make_test_json_bytes();
@@ -2065,28 +2086,7 @@ mod tests {
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 5, "should have written 5 records");
 
-        // Find parquet file in table directory (recursively, but exclude _delta_log)
-        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            // Skip _delta_log
-                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
-                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
-                                    return Some(found);
-                                }
-                            }
-                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-            None
-        }
-
+        // Find parquet file in table directory
         let parquet_file = find_parquet_file(&table_path)
             .expect("should find a parquet file in table directory");
 
@@ -2219,27 +2219,6 @@ mod tests {
         let _new_table = table_opt.expect("table should be available after flush");
         assert!(flush_result.is_ok(), "flush should succeed");
 
-        // Find parquet file in table directory
-        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
-                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
-                                    return Some(found);
-                                }
-                            }
-                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-            None
-        }
-
         let parquet_file = find_parquet_file(&table_path)
             .expect("should find a parquet file in table directory");
 
@@ -2315,27 +2294,6 @@ mod tests {
             "flush should succeed: {:?}",
             flush_result
         );
-
-        // Verify the parquet file was created with Binary column
-        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
-                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
-                                    return Some(found);
-                                }
-                            }
-                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-            None
-        }
 
         let parquet_file = find_parquet_file(&table_path)
             .expect("should find a parquet file in table directory");
@@ -2442,27 +2400,6 @@ mod tests {
         let _new_table = table_opt.expect("table should be available after flush");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 5, "should have written 5 records");
-
-        // Find parquet file (reuse helper pattern from test_flush_buffer_writes_zstd_compression)
-        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
-                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
-                                    return Some(found);
-                                }
-                            }
-                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-            None
-        }
 
         let parquet_file = find_parquet_file(&table_path)
             .expect("should find a parquet file in table directory");
