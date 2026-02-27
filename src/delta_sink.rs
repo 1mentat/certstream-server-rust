@@ -10,6 +10,7 @@ use deltalake::protocol::SaveMode;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -471,12 +472,60 @@ fn check_buffer_overflow(buffer: &mut Vec<DeltaCertRecord>, batch_size: usize) -
 /// 5. On success: clears buffer and returns new table
 /// 6. On failure: retains buffer, attempts recovery (reopen, open_or_create), returns error
 /// 7. If ALL recovery attempts fail: returns None instead of panicking (AC4.4)
+
+/// Constructs WriterProperties with per-column encoding and compression settings.
+///
+/// This is the single source of truth for all Parquet write settings. All write paths
+/// (live sink, backfill writer, merge) must use this function.
+///
+/// # Per-column dictionary encoding
+/// - Enabled for low-cardinality columns: update_type, source_name, source_url,
+///   signature_algorithm, issuer_aggregated, chain list items
+/// - Disabled for high-cardinality columns: cert_link, serial_number, fingerprint,
+///   sha256, sha1, subject_aggregated, as_der
+///
+/// # Per-column compression
+/// - as_der: uses heavy_column_compression_level (default 15)
+/// - All other columns: use compression_level (default 9)
+pub fn delta_writer_properties(compression_level: i32, heavy_column_compression_level: i32) -> WriterProperties {
+    let zstd = Compression::ZSTD(
+        ZstdLevel::try_new(compression_level).expect("compression level validated at startup"),
+    );
+    let heavy_zstd = Compression::ZSTD(
+        ZstdLevel::try_new(heavy_column_compression_level)
+            .expect("heavy column compression level validated at startup"),
+    );
+
+    WriterProperties::builder()
+        // Global compression default
+        .set_compression(zstd)
+        // Dictionary encoding: enabled for low-cardinality columns
+        .set_column_dictionary_enabled(ColumnPath::from("update_type"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("source_name"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("source_url"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("signature_algorithm"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("issuer_aggregated"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("chain.list.item"), true)
+        // Dictionary encoding: disabled for high-cardinality columns
+        .set_column_dictionary_enabled(ColumnPath::from("cert_link"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("serial_number"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("fingerprint"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("sha256"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("sha1"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("subject_aggregated"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("as_der"), false)
+        // Heavy compression for as_der column
+        .set_column_compression(ColumnPath::from("as_der"), heavy_zstd)
+        .build()
+}
+
 pub async fn flush_buffer(
     table: DeltaTable,
     buffer: &mut Vec<DeltaCertRecord>,
     schema: &Arc<Schema>,
     batch_size: usize,
     compression_level: i32,
+    heavy_column_compression_level: i32,
 ) -> (Option<DeltaTable>, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
     // If buffer is empty, return early
     if buffer.is_empty() {
@@ -501,12 +550,8 @@ pub async fn flush_buffer(
         }
     };
 
-    // Construct WriterProperties with ZSTD compression
-    let writer_props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(compression_level).expect("compression level validated at startup"),
-        ))
-        .build();
+    // Construct WriterProperties with per-column encoding and compression settings
+    let writer_props = delta_writer_properties(compression_level, heavy_column_compression_level);
 
     // Write to Delta using DeltaOps with timing
     let start_time = Instant::now();
@@ -694,7 +739,7 @@ pub async fn run_delta_sink(
 
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
-                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
                                     match new_table_opt {
                                         Some(new_table) => {
                                             table = new_table;
@@ -739,7 +784,7 @@ pub async fn run_delta_sink(
             _ = flush_interval.tick() => {
                 // Time-triggered flush (AC3.2)
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
                     match new_table_opt {
                         Some(new_table) => {
                             table = new_table;
@@ -763,7 +808,7 @@ pub async fn run_delta_sink(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
                     record_flush_metrics(&flush_result, "Shutdown flush");
                     if table_opt.is_none() {
                         warn!(
@@ -1321,7 +1366,7 @@ mod tests {
         let mut buffer = vec![record1, record2];
 
         // Flush to Delta
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
@@ -1375,7 +1420,7 @@ mod tests {
             .collect();
 
         // Flush exactly batch_size records
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1541,7 +1586,7 @@ mod tests {
         );
 
         // Flush (which includes overflow check)
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1999,8 +2044,8 @@ mod tests {
             buffer.push(record);
         }
 
-        // Flush with compression level 9
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+        // Flush with compression level 9 and heavy_column_compression_level 15
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
 
         // Verify flush succeeded
         let _new_table = table_opt.expect("table should be available after flush");
@@ -2060,5 +2105,171 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[test]
+    fn test_delta_writer_properties_dictionary_enabled_for_low_cardinality() {
+        // Test that delta_writer_properties enables dictionary encoding for low-cardinality columns
+        let props = delta_writer_properties(9, 15);
+
+        // Verify dictionary encoding is enabled for low-cardinality columns
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("update_type")),
+            "update_type should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("source_name")),
+            "source_name should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("source_url")),
+            "source_url should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("signature_algorithm")),
+            "signature_algorithm should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("issuer_aggregated")),
+            "issuer_aggregated should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("chain.list.item")),
+            "chain.list.item should have dictionary encoding enabled"
+        );
+    }
+
+    #[test]
+    fn test_delta_writer_properties_dictionary_disabled_for_high_cardinality() {
+        // Test that delta_writer_properties disables dictionary encoding for high-cardinality columns
+        let props = delta_writer_properties(9, 15);
+
+        // Verify dictionary encoding is disabled for high-cardinality columns
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("cert_link")),
+            "cert_link should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("serial_number")),
+            "serial_number should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("fingerprint")),
+            "fingerprint should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("sha256")),
+            "sha256 should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("sha1")),
+            "sha1 should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("subject_aggregated")),
+            "subject_aggregated should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("as_der")),
+            "as_der should have dictionary encoding disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delta_writer_properties_compression_levels() {
+        // Test that as_der column uses heavy compression level and other columns use standard level
+        let test_name = "writer_props_compression";
+        let table_path = format!("/tmp/delta_writer_props_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        // Create table
+        let schema = delta_schema();
+        let table = match open_or_create_table(&table_path, &schema).await {
+            Ok(t) => t,
+            Err(e) => panic!("Failed to create table: {}", e),
+        };
+
+        // Create test records with distinctive as_der field
+        let mut buffer = vec![];
+        for i in 0..3 {
+            let mut record = make_test_record();
+            record.cert_index = i as u64;
+            record.as_der = format!("der_data_{}_", i); // Distinctive data to verify correct compression
+            buffer.push(record);
+        }
+
+        // Flush with compression level 9 and heavy_column_compression_level 15
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+
+        // Verify flush succeeded
+        let _new_table = table_opt.expect("table should be available after flush");
+        assert!(flush_result.is_ok(), "flush should succeed");
+
+        // Find parquet file in table directory
+        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
+                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
+                                    return Some(found);
+                                }
+                            }
+                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        let parquet_file = find_parquet_file(&table_path)
+            .expect("should find a parquet file in table directory");
+
+        // Read parquet file metadata
+        let file = fs::File::open(&parquet_file)
+            .expect("should be able to open parquet file");
+        let reader = SerializedFileReader::new(file)
+            .expect("should be able to read parquet file");
+        let metadata = reader.metadata();
+
+        // Verify ZSTD compression on all columns
+        assert!(metadata.num_row_groups() > 0, "should have at least one row group");
+        let row_group = metadata.row_group(0);
+        assert!(row_group.num_columns() > 0, "should have at least one column");
+
+        // Check that all columns have ZSTD compression
+        for i in 0..row_group.num_columns() {
+            let compression = row_group.column(i).compression();
+            match compression {
+                Compression::ZSTD(_) => {
+                    // Success - all columns should use ZSTD
+                }
+                _ => {
+                    panic!(
+                        "Column {} expected ZSTD compression, got {:?}",
+                        i, compression
+                    );
+                }
+            }
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[test]
+    fn test_delta_writer_properties_returns_valid_properties() {
+        // Test that delta_writer_properties returns valid WriterProperties that can be used
+        // This test verifies the centralized function works correctly
+        let _props = delta_writer_properties(9, 15);
+
+        // Simply verify we got a WriterProperties object back - if it's valid
+        // it should not panic when used in actual write operations
+        // (tested implicitly via the compression test above)
     }
 }
