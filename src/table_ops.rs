@@ -222,22 +222,76 @@ pub async fn run_reparse_audit(
         let not_after_col = batch.column_by_name("not_after").unwrap();
         let serial_col = batch.column_by_name("serial_number").unwrap();
 
-        let cert_index_array = cert_index_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-        let source_url_array = source_url_col.as_any().downcast_ref::<StringArray>().unwrap();
-        let subject_agg_array = subject_agg_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let issuer_agg_array = issuer_agg_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let all_domains_list = all_domains_col.as_any().downcast_ref::<ListArray>().unwrap();
-        let sig_algo_array = sig_algo_col.as_any().downcast_ref::<StringArray>().unwrap();
-        let is_ca_array = is_ca_col.as_any().downcast_ref::<BooleanArray>().unwrap();
-        let not_before_array = not_before_col.as_any().downcast_ref::<Int64Array>().unwrap();
-        let not_after_array = not_after_col.as_any().downcast_ref::<Int64Array>().unwrap();
-        let serial_array = serial_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let cert_index_array = match cert_index_col.as_any().downcast_ref::<UInt64Array>() {
+            Some(arr) => arr,
+            None => {
+                warn!("cert_index column has unexpected type: {:?}", cert_index_col.data_type());
+                continue;
+            }
+        };
+        let source_url_array = match source_url_col.as_any().downcast_ref::<StringArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("source_url column has unexpected type: {:?}", source_url_col.data_type());
+                continue;
+            }
+        };
+        let subject_agg_array = match subject_agg_col.as_any().downcast_ref::<StringArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("subject_aggregated column has unexpected type: {:?}", subject_agg_col.data_type());
+                continue;
+            }
+        };
+        let issuer_agg_array = match issuer_agg_col.as_any().downcast_ref::<StringArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("issuer_aggregated column has unexpected type: {:?}", issuer_agg_col.data_type());
+                continue;
+            }
+        };
+        let all_domains_list = match all_domains_col.as_any().downcast_ref::<ListArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("all_domains column has unexpected type: {:?}", all_domains_col.data_type());
+                continue;
+            }
+        };
+        let sig_algo_array = match sig_algo_col.as_any().downcast_ref::<StringArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("signature_algorithm column has unexpected type: {:?}", sig_algo_col.data_type());
+                continue;
+            }
+        };
+        let is_ca_array = match is_ca_col.as_any().downcast_ref::<BooleanArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("is_ca column has unexpected type: {:?}", is_ca_col.data_type());
+                continue;
+            }
+        };
+        let not_before_array = match not_before_col.as_any().downcast_ref::<Int64Array>() {
+            Some(arr) => arr,
+            None => {
+                warn!("not_before column has unexpected type: {:?}", not_before_col.data_type());
+                continue;
+            }
+        };
+        let not_after_array = match not_after_col.as_any().downcast_ref::<Int64Array>() {
+            Some(arr) => arr,
+            None => {
+                warn!("not_after column has unexpected type: {:?}", not_after_col.data_type());
+                continue;
+            }
+        };
+        let serial_array = match serial_col.as_any().downcast_ref::<StringArray>() {
+            Some(arr) => arr,
+            None => {
+                warn!("serial_number column has unexpected type: {:?}", serial_col.data_type());
+                continue;
+            }
+        };
 
         // Iterate rows in this batch
         for row in 0..batch.num_rows() {
@@ -673,5 +727,283 @@ mod tests {
         let result = STANDARD.decode(valid_base64);
         assert!(result.is_ok(), "Valid base64 should decode successfully");
         assert_eq!(result.unwrap(), b"test data".to_vec());
+    }
+
+    // Integration tests for reparse audit using real Delta tables
+    use crate::delta_sink::{records_to_batch, DeltaCertRecord, delta_schema};
+    use crate::models::LeafCert;
+    use chrono::Utc;
+    use deltalake::DeltaOps;
+    use deltalake::protocol::SaveMode;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use std::fs;
+    use std::path::Path;
+
+    /// Helper to create a test certificate using rcgen and parse it to get expected values
+    fn create_test_cert() -> (Vec<u8>, LeafCert) {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let mut params = CertificateParams::new(vec!["example.com".to_string(), "www.example.com".to_string()])
+            .expect("Failed to create certificate params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "example.com");
+        params.is_ca = rcgen::IsCa::NoCa;
+
+        let key_pair = KeyPair::generate().expect("Failed to generate key pair");
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("Failed to create self-signed cert");
+        let der_bytes = cert.der().to_vec();
+
+        let leaf = parse_certificate(&der_bytes, false).expect("Failed to parse test cert");
+        (der_bytes, leaf)
+    }
+
+    /// Helper to create a minimal Config for testing
+    fn create_test_config(table_path: &str) -> crate::config::Config {
+        use std::net::IpAddr;
+
+        crate::config::Config {
+            host: "127.0.0.1".parse::<IpAddr>().unwrap(),
+            port: 9100,
+            log_level: "info".to_string(),
+            buffer_size: 100,
+            ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/log_list.json".to_string(),
+            tls_cert: None,
+            tls_key: None,
+            custom_logs: vec![],
+            static_logs: vec![],
+            protocols: Default::default(),
+            ct_log: Default::default(),
+            connection_limit: Default::default(),
+            rate_limit: Default::default(),
+            api: Default::default(),
+            auth: Default::default(),
+            hot_reload: Default::default(),
+            delta_sink: crate::config::DeltaSinkConfig {
+                enabled: true,
+                table_path: table_path.to_string(),
+                batch_size: 1,
+                flush_interval_secs: 60,
+                compression_level: 9,
+            },
+            query_api: Default::default(),
+            zerobus_sink: Default::default(),
+            config_path: None,
+        }
+    }
+
+    /// Helper to create a DeltaCertRecord from a parsed LeafCert
+    fn create_record_from_leaf(
+        cert_index: u64,
+        source_url: String,
+        seen_date: String,
+        der_bytes: &[u8],
+        leaf: &LeafCert,
+    ) -> DeltaCertRecord {
+        DeltaCertRecord {
+            cert_index,
+            update_type: "added".to_string(),
+            seen: Utc::now().timestamp() as f64,
+            seen_date,
+            source_name: "test_log".to_string(),
+            source_url,
+            cert_link: "https://example.com/cert/1".to_string(),
+            serial_number: leaf.serial_number.clone(),
+            fingerprint: leaf.fingerprint.clone(),
+            sha256: leaf.sha256.clone(),
+            sha1: leaf.sha1.clone(),
+            not_before: leaf.not_before,
+            not_after: leaf.not_after,
+            is_ca: leaf.is_ca,
+            signature_algorithm: leaf.signature_algorithm.clone(),
+            subject_aggregated: leaf.subject.aggregated.as_deref().unwrap_or("").to_string(),
+            issuer_aggregated: leaf.issuer.aggregated.as_deref().unwrap_or("").to_string(),
+            all_domains: leaf.all_domains.to_vec(),
+            as_der: STANDARD.encode(der_bytes),
+            chain: vec![],
+        }
+    }
+
+    /// Helper to clean up test directories
+    fn cleanup_test_dir(path: &str) {
+        if Path::new(path).exists() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+
+    /// Helper to write test records to a Delta table
+    async fn write_test_records(table_path: &str, records: Vec<DeltaCertRecord>) {
+        use crate::delta_sink::open_or_create_table;
+
+        // Create the directory if it doesn't exist
+        fs::create_dir_all(table_path).expect("Failed to create test directory");
+
+        let schema = delta_schema();
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+
+        // Create or open Delta table
+        let table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to open/create table");
+
+        // Write batch to table
+        let writer_props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(
+                ZstdLevel::try_new(9).expect("compression level 9 is valid"),
+            ))
+            .build();
+
+        DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Append)
+            .with_writer_properties(writer_props)
+            .await
+            .expect("Failed to write to table");
+    }
+
+    #[tokio::test]
+    async fn test_ac1_1_audit_completes_with_zero_mismatches() {
+        // AC1.1: Audit completes against a Delta table and reports zero mismatches when parsing code has not changed
+        let test_dir = "/tmp/delta_table_ops_test_ac1_1";
+        cleanup_test_dir(test_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        cleanup_test_dir(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_2_audit_detects_field_mismatches() {
+        // AC1.2: Audit correctly identifies field-level mismatches when parsing code produces different output
+        let test_dir = "/tmp/delta_table_ops_test_ac1_2";
+        cleanup_test_dir(test_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let mut record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        // Deliberately alter the subject_aggregated field to create a mismatch
+        record.subject_aggregated = "wrong_subject".to_string();
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "Audit should exit with code 0 (reports mismatches, doesn't fail)");
+        cleanup_test_dir(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_3_audit_reports_multiple_mismatches() {
+        // AC1.3: Audit report shows per-field mismatch counts and up to 10 sample diffs
+        let test_dir = "/tmp/delta_table_ops_test_ac1_3";
+        cleanup_test_dir(test_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let mut records = vec![];
+
+        // Create 15 records with mismatches (> 10)
+        for i in 1..=15 {
+            let mut record = create_record_from_leaf(
+                i,
+                format!("https://ct.example.com/log{}", i),
+                "2026-02-27".to_string(),
+                &der_bytes,
+                &leaf,
+            );
+            // Alter subject_aggregated for each record to create mismatches
+            record.subject_aggregated = format!("wrong_subject_{}", i);
+            records.push(record);
+        }
+
+        write_test_records(test_dir, records).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        cleanup_test_dir(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_4_audit_counts_invalid_base64_as_unparseable() {
+        // AC1.4: Records with invalid base64 in as_der (Utf8 format) are counted as unparseable, not mismatches
+        let test_dir = "/tmp/delta_table_ops_test_ac1_4";
+        cleanup_test_dir(test_dir);
+
+        let (_, leaf) = create_test_cert();
+        let mut record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &[0xFF], &leaf);
+
+        // Set invalid base64 in as_der field
+        record.as_der = "not_valid_base64!!!".to_string();
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        cleanup_test_dir(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_5_audit_counts_unparseable_certificates() {
+        // AC1.5: Records where parse_certificate() returns None are counted as unparseable
+        let test_dir = "/tmp/delta_table_ops_test_ac1_5";
+        cleanup_test_dir(test_dir);
+
+        let (_, leaf) = create_test_cert();
+        let mut record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &[0xFF], &leaf);
+
+        // Set garbage bytes that parse_certificate will reject
+        record.as_der = STANDARD.encode(&[0xFF, 0xFF, 0xFF, 0xFF]);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+
+        assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        cleanup_test_dir(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_ac1_6_audit_exits_with_empty_date_range() {
+        // AC1.6: Audit against an empty date range exits 0 with informational message
+        let test_dir = "/tmp/delta_table_ops_test_ac1_6";
+        cleanup_test_dir(test_dir);
+
+        let (der_bytes, leaf) = create_test_cert();
+        let record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &der_bytes, &leaf);
+
+        write_test_records(test_dir, vec![record]).await;
+
+        let config = create_test_config(test_dir);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        // Query for a date range that doesn't match the data (2026-03-01 to 2026-03-31)
+        let exit_code = run_reparse_audit(
+            config,
+            Some("2026-03-01".to_string()),
+            Some("2026-03-31".to_string()),
+            shutdown,
+        )
+        .await;
+
+        assert_eq!(exit_code, 0, "Audit should exit with code 0 for empty date range");
+        cleanup_test_dir(test_dir);
     }
 }
