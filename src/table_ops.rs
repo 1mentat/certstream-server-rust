@@ -14,17 +14,30 @@ use crate::config::Config;
 use crate::ct::parse_certificate;
 
 /// Helper struct to track field mismatches and collect sample diffs.
-struct SampleDiff {
-    cert_index: u64,
-    source_url: String,
-    fields: Vec<FieldDiff>,
+#[derive(Debug, Clone)]
+pub struct SampleDiff {
+    pub cert_index: u64,
+    pub source_url: String,
+    pub fields: Vec<FieldDiff>,
 }
 
 /// Individual field difference for a sample mismatch.
-struct FieldDiff {
-    field_name: String,
-    stored: String,
-    reparsed: String,
+#[derive(Debug, Clone)]
+pub struct FieldDiff {
+    pub field_name: String,
+    pub stored: String,
+    pub reparsed: String,
+}
+
+/// Audit report containing all audit results and statistics.
+#[derive(Debug, Clone)]
+pub struct AuditReport {
+    pub total_records: u64,
+    pub mismatch_record_count: u64,
+    pub unparseable_count: u64,
+    pub partition_count: u64,
+    pub field_mismatch_counts: HashMap<String, u64>,
+    pub sample_diffs: Vec<SampleDiff>,
 }
 
 /// Helper function to extract domains from a ListArray at a given row index.
@@ -123,7 +136,7 @@ pub async fn run_reparse_audit(
     from_date: Option<String>,
     to_date: Option<String>,
     _shutdown: CancellationToken,
-) -> i32 {
+) -> (i32, AuditReport) {
     info!(
         table_path = %config.delta_sink.table_path,
         from_date = ?from_date,
@@ -140,7 +153,15 @@ pub async fn run_reparse_audit(
                 table_path = %config.delta_sink.table_path,
                 "Failed to open Delta table"
             );
-            return 1;
+            let report = AuditReport {
+                total_records: 0,
+                mismatch_record_count: 0,
+                unparseable_count: 0,
+                partition_count: 0,
+                field_mismatch_counts: HashMap::new(),
+                sample_diffs: Vec::new(),
+            };
+            return (1, report);
         }
     };
 
@@ -150,7 +171,15 @@ pub async fn run_reparse_audit(
     // Register table as ct_main
     if let Err(e) = ctx.register_table("ct_main", Arc::new(table)) {
         error!(error = %e, "Failed to register Delta table in DataFusion");
-        return 1;
+        let report = AuditReport {
+            total_records: 0,
+            mismatch_record_count: 0,
+            unparseable_count: 0,
+            partition_count: 0,
+            field_mismatch_counts: HashMap::new(),
+            sample_diffs: Vec::new(),
+        };
+        return (1, report);
     }
 
     // Step 3: Build the SQL query
@@ -162,7 +191,15 @@ pub async fn run_reparse_audit(
         Ok(clause) => clause,
         Err(e) => {
             error!(error = %e, "Invalid date filter");
-            return 1;
+            let report = AuditReport {
+                total_records: 0,
+                mismatch_record_count: 0,
+                unparseable_count: 0,
+                partition_count: 0,
+                field_mismatch_counts: HashMap::new(),
+                sample_diffs: Vec::new(),
+            };
+            return (1, report);
         }
     };
 
@@ -173,7 +210,15 @@ pub async fn run_reparse_audit(
         Ok(df) => df,
         Err(e) => {
             error!(error = %e, "Failed to execute SQL query");
-            return 1;
+            let report = AuditReport {
+                total_records: 0,
+                mismatch_record_count: 0,
+                unparseable_count: 0,
+                partition_count: 0,
+                field_mismatch_counts: HashMap::new(),
+                sample_diffs: Vec::new(),
+            };
+            return (1, report);
         }
     };
 
@@ -181,7 +226,15 @@ pub async fn run_reparse_audit(
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "Failed to get record batch stream");
-            return 1;
+            let report = AuditReport {
+                total_records: 0,
+                mismatch_record_count: 0,
+                unparseable_count: 0,
+                partition_count: 0,
+                field_mismatch_counts: HashMap::new(),
+                sample_diffs: Vec::new(),
+            };
+            return (1, report);
         }
     };
 
@@ -200,7 +253,15 @@ pub async fn run_reparse_audit(
             Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "Error reading batch from stream");
-                return 1;
+                let report = AuditReport {
+                    total_records,
+                    mismatch_record_count,
+                    unparseable_count,
+                    partition_count,
+                    field_mismatch_counts,
+                    sample_diffs,
+                };
+                return (1, report);
             }
         };
 
@@ -222,13 +283,14 @@ pub async fn run_reparse_audit(
         let not_after_col = batch.column_by_name("not_after").unwrap();
         let serial_col = batch.column_by_name("serial_number").unwrap();
 
-        let cert_index_array = match cert_index_col.as_any().downcast_ref::<UInt64Array>() {
-            Some(arr) => arr,
-            None => {
-                warn!("cert_index column has unexpected type: {:?}", cert_index_col.data_type());
-                continue;
-            }
-        };
+        // Note: cert_index may be stored as Int64 or UInt64 depending on Delta Lake type handling
+        let cert_index_array_uint = cert_index_col.as_any().downcast_ref::<UInt64Array>();
+        let cert_index_array_int = cert_index_col.as_any().downcast_ref::<Int64Array>();
+
+        if cert_index_array_uint.is_none() && cert_index_array_int.is_none() {
+            warn!("cert_index column has unexpected type: {:?}", cert_index_col.data_type());
+            continue;
+        }
         let source_url_array = match source_url_col.as_any().downcast_ref::<StringArray>() {
             Some(arr) => arr,
             None => {
@@ -297,7 +359,11 @@ pub async fn run_reparse_audit(
         for row in 0..batch.num_rows() {
             total_records += 1;
 
-            let cert_index = cert_index_array.value(row);
+            let cert_index = if let Some(arr) = cert_index_array_uint {
+                arr.value(row)
+            } else {
+                cert_index_array_int.unwrap().value(row) as u64
+            };
             let source_url = source_url_array.value(row).to_string();
 
             // Extract as_der from the batch
@@ -484,14 +550,22 @@ pub async fn run_reparse_audit(
     // Step 5 check: If no rows were seen, print informational message and return 0
     if !any_rows_seen {
         println!("No records found in the specified date range");
-        return 0;
+        let report = AuditReport {
+            total_records: 0,
+            mismatch_record_count: 0,
+            unparseable_count: 0,
+            partition_count: 0,
+            field_mismatch_counts,
+            sample_diffs,
+        };
+        return (0, report);
     }
 
     // Step 7: Print the report
     let percentage = if total_records > 0 {
-        (mismatch_record_count * 100) / total_records
+        mismatch_record_count as f64 / total_records as f64 * 100.0
     } else {
-        0
+        0.0
     };
 
     println!("\nReparse Audit Report");
@@ -499,7 +573,7 @@ pub async fn run_reparse_audit(
     println!("Records scanned: {}", total_records);
     println!("Partitions scanned: {}", partition_count);
     println!(
-        "Records with mismatches: {} ({}%)",
+        "Records with mismatches: {} ({:.1}%)",
         mismatch_record_count, percentage
     );
     println!("Unparseable records: {}", unparseable_count);
@@ -520,7 +594,7 @@ pub async fn run_reparse_audit(
         println!(
             "Sample mismatches ({} of {}):",
             sample_diffs.len(),
-            field_mismatch_counts.len()
+            mismatch_record_count
         );
         for sample in &sample_diffs {
             println!(
@@ -538,7 +612,15 @@ pub async fn run_reparse_audit(
     println!();
 
     // Step 8: Return 0 (audit always exits 0 unless infrastructure failure)
-    0
+    let report = AuditReport {
+        total_records,
+        mismatch_record_count,
+        unparseable_count,
+        partition_count,
+        field_mismatch_counts,
+        sample_diffs,
+    };
+    (0, report)
 }
 
 pub async fn run_extract_metadata(
@@ -876,9 +958,11 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        assert_eq!(report.mismatch_record_count, 0, "AC1.1: Should have 0 mismatches");
+        assert_eq!(report.unparseable_count, 0, "AC1.1: Should have 0 unparseable records");
         cleanup_test_dir(test_dir);
     }
 
@@ -898,9 +982,11 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0 (reports mismatches, doesn't fail)");
+        assert_eq!(report.mismatch_record_count, 1, "AC1.2: Should detect 1 mismatch");
+        assert!(report.field_mismatch_counts.contains_key("subject_aggregated"), "AC1.2: subject_aggregated mismatch should be detected");
         cleanup_test_dir(test_dir);
     }
 
@@ -931,9 +1017,11 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        assert_eq!(report.mismatch_record_count, 15, "AC1.3: Should detect 15 mismatches");
+        assert_eq!(report.sample_diffs.len(), 10, "AC1.3: Should have exactly 10 sample diffs");
         cleanup_test_dir(test_dir);
     }
 
@@ -953,9 +1041,11 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        assert_eq!(report.unparseable_count, 1, "AC1.4: Invalid base64 should be counted as unparseable");
+        assert_eq!(report.mismatch_record_count, 0, "AC1.4: Invalid base64 should not create mismatches");
         cleanup_test_dir(test_dir);
     }
 
@@ -975,9 +1065,11 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
+        assert_eq!(report.unparseable_count, 1, "AC1.5: Garbage bytes should be counted as unparseable");
+        assert_eq!(report.mismatch_record_count, 0, "AC1.5: Unparseable record should not create mismatches");
         cleanup_test_dir(test_dir);
     }
 
@@ -995,7 +1087,7 @@ mod tests {
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
         // Query for a date range that doesn't match the data (2026-03-01 to 2026-03-31)
-        let exit_code = run_reparse_audit(
+        let (exit_code, report) = run_reparse_audit(
             config,
             Some("2026-03-01".to_string()),
             Some("2026-03-31".to_string()),
@@ -1004,6 +1096,7 @@ mod tests {
         .await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0 for empty date range");
+        assert_eq!(report.total_records, 0, "AC1.6: Should have zero total records");
         cleanup_test_dir(test_dir);
     }
 }

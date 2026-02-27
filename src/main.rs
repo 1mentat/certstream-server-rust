@@ -90,7 +90,7 @@ async fn main() {
         let shutdown_token = CancellationToken::new();
         spawn_signal_handler(shutdown_token.clone());
 
-        let exit_code = table_ops::run_reparse_audit(
+        let (exit_code, _report) = table_ops::run_reparse_audit(
             config,
             cli_args.from_date,
             cli_args.to_date,
