@@ -213,6 +213,7 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
         DataType::Timestamp(_, _) => DeltaDataType::Primitive(PrimitiveType::Timestamp),
         DataType::Int64 => DeltaDataType::Primitive(PrimitiveType::Long),
         DataType::Boolean => DeltaDataType::Primitive(PrimitiveType::Boolean),
+        DataType::Binary => DeltaDataType::Primitive(PrimitiveType::Binary),
         DataType::List(inner_field) => {
             // Convert List(T) to Array(T) in Delta schema
             let element_type = arrow_dtype_to_delta_dtype(inner_field.data_type());
@@ -836,6 +837,7 @@ pub async fn run_delta_sink(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use deltalake::datafusion::prelude::*;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use std::fs;
@@ -2307,7 +2309,7 @@ mod tests {
         // Flush the record to the table
         let mut buffer = vec![record];
         let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
-        let _new_table = table_opt.expect("table should be available after flush");
+        let table = table_opt.expect("table should be available after flush");
         assert!(
             flush_result.is_ok(),
             "flush should succeed: {:?}",
@@ -2346,15 +2348,15 @@ mod tests {
         let metadata = reader.metadata();
 
         // Check the schema - find the as_der column (it's a binary column)
-        let schema = metadata.file_metadata().schema_descr();
-        let num_cols = schema.num_columns();
+        let parquet_schema = metadata.file_metadata().schema_descr();
+        let num_cols = parquet_schema.num_columns();
 
         // Find the as_der column by name
-        let mut found_as_der = false;
+        let mut found_as_der_schema = false;
         for i in 0..num_cols {
-            let col = schema.column(i);
+            let col = parquet_schema.column(i);
             if col.name() == "as_der" {
-                found_as_der = true;
+                found_as_der_schema = true;
                 // Verify it's Binary (BYTE_ARRAY physical type with BINARY logical type)
                 let physical_type = col.physical_type();
                 assert_eq!(
@@ -2365,7 +2367,40 @@ mod tests {
                 break;
             }
         }
-        assert!(found_as_der, "as_der column should exist in Parquet schema");
+        assert!(found_as_der_schema, "as_der column should exist in Parquet schema");
+
+        // Read back the data via DataFusion SQL and verify bytes match original (AC2.2)
+        let ctx = SessionContext::new();
+        ctx.register_table("test_data", std::sync::Arc::new(table))
+            .expect("should register table");
+
+        let df = ctx
+            .sql("SELECT as_der FROM test_data WHERE cert_index = 12345")
+            .await
+            .expect("should execute query");
+
+        let batches = df
+            .collect()
+            .await
+            .expect("should collect results");
+
+        assert!(!batches.is_empty(), "should have at least one batch");
+
+        // Extract the as_der column from the first batch
+        let batch = &batches[0];
+        let as_der_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der column should be BinaryArray");
+
+        // Verify the bytes match the original
+        assert_eq!(as_der_col.len(), 1, "should have one row");
+        let read_back_bytes = as_der_col.value(0);
+        assert_eq!(
+            read_back_bytes, &test_bytes[..],
+            "read-back bytes should match original bytes [1, 2, 3]"
+        );
 
         // Clean up
         let _ = fs::remove_dir_all(&table_path);
