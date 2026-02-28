@@ -17,7 +17,11 @@ pub struct CliArgs {
     pub merge: bool,
     pub migrate: bool,
     pub migrate_output: Option<String>,
+    /// Source table path for migrate mode (Phase 2: used in migrate dispatch)
+    #[allow(dead_code)]
     pub migrate_source: Option<String>,
+    /// End date filter for migrate mode (Phase 2: used in migrate dispatch)
+    #[allow(dead_code)]
     pub to: Option<String>,
 }
 
@@ -112,6 +116,8 @@ impl CliArgs {
         println!("    --from <DATE>          Start date filter (YYYY-MM-DD, inclusive)");
         println!("    --to <DATE>            End date filter (YYYY-MM-DD, inclusive)");
         println!();
+        println!("    Note: --from is shared between backfill (integer index) and migrate (date).");
+        println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
         println!("    CERTSTREAM_HOST                Server host (default: 0.0.0.0)");
@@ -188,6 +194,10 @@ pub fn validate_backfill_sink_command(
 /// # Returns
 /// * `Ok(())` if the date is valid
 /// * `Err(String)` with a descriptive error message if invalid
+///
+/// # Phase 2
+/// This function is used in migrate mode dispatch (Phase 2).
+#[allow(dead_code)]
 pub fn validate_date_format(date: &str, flag_name: &str) -> Result<(), String> {
     if date.len() != 10 {
         return Err(format!(
@@ -610,5 +620,14 @@ mod tests {
         assert!(validate_date_format("2024-13-01", "--from").is_err());
         assert!(validate_date_format("2024-01-32", "--from").is_err());
         assert!(validate_date_format("", "--from").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_format_known_limitation_invalid_calendar_dates() {
+        // Known limitation: does not validate days-per-month
+        // These dates are invalid in reality but pass validation
+        assert!(validate_date_format("2024-02-31", "--from").is_ok()); // Feb 31 accepted
+        assert!(validate_date_format("2024-04-31", "--from").is_ok()); // Apr 31 accepted
+        assert!(validate_date_format("2024-06-31", "--from").is_ok()); // Jun 31 accepted
     }
 }
