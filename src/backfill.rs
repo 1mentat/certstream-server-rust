@@ -3447,6 +3447,8 @@ mod tests {
             merge: true,
             migrate: false,
             migrate_output: None,
+            migrate_source: None,
+            to: None,
         };
 
         // Verify that merge is true and staging_path is None
