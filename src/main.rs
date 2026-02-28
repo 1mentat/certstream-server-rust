@@ -131,10 +131,22 @@ async fn main() {
     }
 
     if cli_args.backfill {
+        // Parse --from value to u64 for backfill mode
+        let backfill_from: Option<u64> = match &cli_args.backfill_from {
+            Some(s) => match s.parse::<u64>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    eprintln!("Error: --from value '{}' is not a valid integer for backfill mode", s);
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+
         // Validate --sink flag
         if let Err(error_msg) = cli::validate_backfill_sink_command(
             cli_args.backfill_sink.as_deref(),
-            cli_args.backfill_from,
+            backfill_from,
             config.zerobus_sink.enabled,
         ) {
             eprintln!("{}", error_msg);
@@ -154,7 +166,7 @@ async fn main() {
         let exit_code = backfill::run_backfill(
             config,
             cli_args.staging_path,
-            cli_args.backfill_from,
+            backfill_from,
             cli_args.backfill_logs,
             cli_args.backfill_sink,
             shutdown_token,
