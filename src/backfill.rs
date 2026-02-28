@@ -1124,7 +1124,7 @@ pub async fn run_merge(
 /// Migrate an existing Delta table with old schema (Utf8 as_der) to new schema (Binary as_der).
 ///
 /// This function:
-/// 1. Opens the source table at config.delta_sink.table_path
+/// 1. Opens the source table at source_path
 /// 2. Creates or opens the output table at output_path with the new schema
 /// 3. Queries distinct seen_date partitions from the source table
 /// 4. For each partition:
