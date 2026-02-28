@@ -1137,10 +1137,13 @@ pub async fn run_merge(
 pub async fn run_migrate(
     config: Config,
     output_path: String,
+    source_path: String,
+    from_date: Option<String>,
+    to_date: Option<String>,
     shutdown: CancellationToken,
 ) -> i32 {
     info!(
-        source_path = %config.delta_sink.table_path,
+        source_path = %source_path,
         output_path = %output_path,
         "migration mode starting"
     );
@@ -1148,11 +1151,11 @@ pub async fn run_migrate(
     let schema = delta_schema();
 
     // Open source table
-    let source_table = match deltalake::open_table(&config.delta_sink.table_path).await {
+    let source_table = match deltalake::open_table(&source_path).await {
         Ok(t) => t,
         Err(e) => {
             warn!(
-                source_path = %config.delta_sink.table_path,
+                source_path = %source_path,
                 error = %e,
                 "failed to open source table"
             );
@@ -1213,8 +1216,16 @@ pub async fn run_migrate(
         }
     }
 
+    // Apply date filters
+    if let Some(ref from) = from_date {
+        partition_dates.retain(|d| d.as_str() >= from.as_str());
+    }
+    if let Some(ref to) = to_date {
+        partition_dates.retain(|d| d.as_str() <= to.as_str());
+    }
+
     if partition_dates.is_empty() {
-        info!("source table is empty, nothing to migrate");
+        info!("source table is empty or no partitions match filters, nothing to migrate");
         return 0;
     }
 
@@ -1243,7 +1254,7 @@ pub async fn run_migrate(
         // Query all records for this partition
         let partition_ctx = SessionContext::new();
         if let Err(e) = partition_ctx.register_table("source", Arc::new(
-            match deltalake::open_table(&config.delta_sink.table_path).await {
+            match deltalake::open_table(&source_path).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(error = %e, "failed to reopen source table for partition");
@@ -1389,7 +1400,7 @@ pub async fn run_migrate(
     info!(
         total_rows_migrated = total_rows_migrated,
         total_decode_failures = total_decode_failures,
-        source_path = %config.delta_sink.table_path,
+        source_path = %source_path,
         output_path = %output_path,
         "migration complete"
     );

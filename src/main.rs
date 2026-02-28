@@ -84,6 +84,25 @@ async fn main() {
             std::process::exit(1);
         }
 
+        // Validate --from and --to date formats if provided
+        if let Some(ref from_date) = cli_args.backfill_from {
+            if let Err(e) = cli::validate_date_format(from_date, "--from") {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        if let Some(ref to_date) = cli_args.to {
+            if let Err(e) = cli::validate_date_format(to_date, "--to") {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+
+        // Compute source path: --source flag or config fallback
+        let source_path = cli_args
+            .migrate_source
+            .unwrap_or_else(|| config.delta_sink.table_path.clone());
+
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -97,6 +116,9 @@ async fn main() {
         let exit_code = backfill::run_migrate(
             config,
             cli_args.migrate_output.unwrap(),
+            source_path,
+            cli_args.backfill_from,
+            cli_args.to,
             shutdown_token,
         )
         .await;
