@@ -18,10 +18,8 @@ pub struct CliArgs {
     pub migrate: bool,
     pub migrate_output: Option<String>,
     /// Source table path for migrate mode (Phase 2: used in migrate dispatch)
-    #[allow(dead_code)]
     pub migrate_source: Option<String>,
     /// End date filter for migrate mode (Phase 2: used in migrate dispatch)
-    #[allow(dead_code)]
     pub to: Option<String>,
 }
 
@@ -197,7 +195,6 @@ pub fn validate_backfill_sink_command(
 ///
 /// # Phase 2
 /// This function is used in migrate mode dispatch (Phase 2).
-#[allow(dead_code)]
 pub fn validate_date_format(date: &str, flag_name: &str) -> Result<(), String> {
     if date.len() != 10 {
         return Err(format!(
