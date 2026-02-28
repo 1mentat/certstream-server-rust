@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-27
-Last context update: 2026-02-27
+Last verified: 2026-02-28
+Last context update: 2026-02-28
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -25,6 +25,7 @@ Last context update: 2026-02-27
 - `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
 - `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
 - `cargo run -- --migrate --output <PATH>` - Migrate Delta table to new schema
+- `cargo run -- --migrate --output <PATH> --source <SRC> --from <DATE> --to <DATE>` - Migrate with source and date filters
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
@@ -124,7 +125,7 @@ The binary has four execution modes selected in main.rs:
 - **Reads from**: same Delta table written by delta_sink and backfill
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer); `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
 - **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
@@ -155,16 +156,17 @@ The binary has four execution modes selected in main.rs:
 - **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (staging left intact)
 
 ## Migrate Contracts
-- **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--migrate` without `--output` exits with error
-- **Entry point**: `backfill::run_migrate(config, output_path, shutdown)` called from main, returns exit code (i32)
+- **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--source <PATH>` overrides source table (default: `config.delta_sink.table_path`); `--from <DATE>` start date filter (YYYY-MM-DD, inclusive); `--to <DATE>` end date filter (YYYY-MM-DD, inclusive); `--migrate` without `--output` exits with error
+- **Entry point**: `backfill::run_migrate(config, output_path, source_path, from_date, to_date, shutdown)` called from main, returns exit code (i32)
 - **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
-- **Source table**: reads from `config.delta_sink.table_path`; if source table cannot be opened, exits with code 1
+- **Source table**: reads from `source_path` parameter; defaults to `config.delta_sink.table_path` when `--source` is not provided; if source table cannot be opened, exits with code 1
 - **Output table**: created at `output_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
 - **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially
+- **Partition filtering**: when `--from` is provided, partitions with `seen_date < from` are skipped; when `--to` is provided, partitions with `seen_date > to` are skipped; filters are inclusive and applied via lexicographic string comparison
 - **as_der conversion**: base64-decodes each Utf8 string to raw bytes; decode failures produce null values and are logged as warnings (non-fatal)
 - **Column alignment**: source columns are matched by name (not index) and cast to target types if needed, handling DataFusion column reordering
 - **WriterProperties**: applies `delta_writer_properties(compression_level, heavy_column_compression_level)` to all writes
-- **Empty source**: if source table has no partitions, exits with code 0
+- **Empty source**: if source table has no partitions or no partitions match filters, exits with code 0
 - **Graceful shutdown**: CancellationToken checked between partitions; if cancelled, exits with code 1
 - **Error handling**: any failure (table open, query, write) exits with code 1
 
