@@ -3892,7 +3892,7 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), shutdown).await;
+        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Read back output table and verify
@@ -3992,7 +3992,7 @@ mod tests {
 
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
-        let exit_code = run_migrate(config, output_path.clone(), shutdown).await;
+        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
         assert_eq!(exit_code, 1, "migration with pre-cancelled token should exit 1");
 
         // Clean up
@@ -4011,7 +4011,7 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), shutdown).await;
+        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
         assert_eq!(exit_code, 1, "migration with nonexistent source should fail gracefully");
 
         // Clean up
@@ -4050,8 +4050,95 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), shutdown).await;
+        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&source_path);
+        let _ = fs::remove_dir_all(&output_path);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_with_date_filters(/* AC3.1, AC3.2, AC3.3, AC3.4 */) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use deltalake::datafusion::prelude::*;
+
+        let test_name = "migrate_date_filters";
+        let source_path = format!("/tmp/delta_migrate_test_{}_src", test_name);
+        let output_path = format!("/tmp/delta_migrate_test_{}_out", test_name);
+        let _ = fs::remove_dir_all(&source_path);
+        let _ = fs::remove_dir_all(&output_path);
+        let _ = fs::create_dir_all(&source_path);
+        let _ = fs::create_dir_all(&output_path);
+
+        // Create source table with 3 partitions on different dates
+        let old_schema = old_delta_schema();
+        let b64_1 = STANDARD.encode(&[1u8, 2, 3]);
+        let b64_2 = STANDARD.encode(&[4u8, 5, 6]);
+        let b64_3 = STANDARD.encode(&[7u8, 8, 9]);
+
+        let source_table = open_or_create_table(&source_path, &old_schema)
+            .await
+            .expect("source table creation failed");
+        let batch1 = old_schema_batch(&old_schema, &[100], &[&b64_1], "2024-01-14");
+        let source_table = DeltaOps(source_table)
+            .write(vec![batch1])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write 1 failed");
+        let batch2 = old_schema_batch(&old_schema, &[200], &[&b64_2], "2024-01-15");
+        let source_table = DeltaOps(source_table)
+            .write(vec![batch2])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write 2 failed");
+        let batch3 = old_schema_batch(&old_schema, &[300], &[&b64_3], "2024-01-16");
+        let _source_table = DeltaOps(source_table)
+            .write(vec![batch3])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write 3 failed");
+
+        // AC3.4: Use explicit source_path different from config.delta_sink.table_path
+        let config = make_test_config("/tmp/some_other_path_not_used");
+        // config.delta_sink.table_path points elsewhere — run_migrate should use source_path
+
+        // AC3.1 + AC3.2 + AC3.3: Filter to only 2024-01-15
+        let shutdown = CancellationToken::new();
+        let exit_code = run_migrate(
+            config,
+            output_path.clone(),
+            source_path.clone(),
+            Some("2024-01-15".to_string()),
+            Some("2024-01-15".to_string()),
+            shutdown,
+        )
+        .await;
+        assert_eq!(exit_code, 0, "migration with date filters should succeed");
+
+        // Verify only the 2024-01-15 partition was migrated
+        let output_table = deltalake::open_table(&output_path)
+            .await
+            .expect("output table should exist");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("output", Arc::new(output_table)).expect("register failed");
+        let df = ctx
+            .sql("SELECT cert_index, seen_date FROM output ORDER BY cert_index")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        assert_eq!(batches.len(), 1, "should have one batch");
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 1, "should have exactly 1 row (from 2024-01-15 partition)");
+
+        // Verify it's the correct record (cert_index 200 from 2024-01-15)
+        let cert_idx_raw = result.column_by_name("cert_index").expect("cert_index");
+        let cert_idx_col = deltalake::arrow::compute::cast(cert_idx_raw, &DataType::Int64)
+            .expect("castable to Int64");
+        let cert_idx_arr = cert_idx_col.as_any().downcast_ref::<Int64Array>().expect("Int64");
+        assert_eq!(cert_idx_arr.value(0), 200, "should be cert_index 200 from 2024-01-15");
 
         // Clean up
         let _ = fs::remove_dir_all(&source_path);
