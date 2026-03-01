@@ -4154,6 +4154,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_migrate_streaming_processes_batches(/* AC1.1, AC1.2, AC2.4 */) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use deltalake::datafusion::prelude::*;
+
+        let test_name = "migrate_streaming";
+        let source_path = format!("/tmp/delta_migrate_test_{}_src", test_name);
+        let output_path = format!("/tmp/delta_migrate_test_{}_out", test_name);
+        let _ = fs::remove_dir_all(&source_path);
+        let _ = fs::remove_dir_all(&output_path);
+        let _ = fs::create_dir_all(&source_path);
+        let _ = fs::create_dir_all(&output_path);
+
+        // Create old-schema source table with multiple partitions and records
+        // to ensure multiple batches are produced
+        let old_schema = old_delta_schema();
+
+        let source_table = open_or_create_table(&source_path, &old_schema)
+            .await
+            .expect("source table creation failed");
+
+        // Partition 1: 2024-01-14 with 100 records
+        let b64_1 = STANDARD.encode(&vec![0x01u8; 8]);
+        let cert_indices_1: Vec<u64> = (1..=100).collect();
+        let b64_values_1: Vec<&str> = (0..100).map(|_| b64_1.as_str()).collect();
+        let batch1 = old_schema_batch(&old_schema, &cert_indices_1, &b64_values_1, "2024-01-14");
+
+        let source_table = DeltaOps(source_table)
+            .write(vec![batch1])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write partition 1 failed");
+
+        // Partition 2: 2024-01-15 with 150 records
+        let b64_2 = STANDARD.encode(&vec![0x02u8; 8]);
+        let cert_indices_2: Vec<u64> = (101..=250).collect();
+        let b64_values_2: Vec<&str> = (0..150).map(|_| b64_2.as_str()).collect();
+        let batch2 = old_schema_batch(&old_schema, &cert_indices_2, &b64_values_2, "2024-01-15");
+
+        let source_table = DeltaOps(source_table)
+            .write(vec![batch2])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write partition 2 failed");
+
+        // Partition 3: 2024-01-16 with 75 records
+        let b64_3 = STANDARD.encode(&vec![0x03u8; 8]);
+        let cert_indices_3: Vec<u64> = (251..=325).collect();
+        let b64_values_3: Vec<&str> = (0..75).map(|_| b64_3.as_str()).collect();
+        let batch3 = old_schema_batch(&old_schema, &cert_indices_3, &b64_values_3, "2024-01-16");
+
+        let _source_table = DeltaOps(source_table)
+            .write(vec![batch3])
+            .with_save_mode(SaveMode::Append)
+            .await
+            .expect("write partition 3 failed");
+
+        // Run migration
+        let mut config = make_test_config(&source_path);
+        config.delta_sink.table_path = source_path.clone();
+        let shutdown = CancellationToken::new();
+        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
+        assert_eq!(exit_code, 0, "migration should succeed");
+
+        // Verify output table has all records with correct as_der binary values
+        let output_table = deltalake::open_table(&output_path)
+            .await
+            .expect("output table should exist");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("output", Arc::new(output_table))
+            .expect("register failed");
+
+        // Query all records and verify count and as_der values
+        let df = ctx
+            .sql("SELECT cert_index, as_der FROM output ORDER BY cert_index")
+            .await
+            .expect("query failed");
+        let batches = df.collect().await.expect("collect failed");
+
+        // Verify we got all 325 records across multiple batches
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 325, "should have all 325 rows from all partitions");
+
+        // Verify as_der values are binary and match expected values
+        let mut found_b64_1 = false;
+        let mut found_b64_2 = false;
+        let mut found_b64_3 = false;
+        let expected_bytes_1 = STANDARD.decode(&b64_1).expect("should decode");
+        let expected_bytes_2 = STANDARD.decode(&b64_2).expect("should decode");
+        let expected_bytes_3 = STANDARD.decode(&b64_3).expect("should decode");
+
+        for batch in &batches {
+            let as_der_col = batch
+                .column_by_name("as_der")
+                .expect("as_der column should exist")
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("as_der should be BinaryArray in output");
+
+            for i in 0..batch.num_rows() {
+                let value = as_der_col.value(i);
+                if value == expected_bytes_1.as_slice() {
+                    found_b64_1 = true;
+                } else if value == expected_bytes_2.as_slice() {
+                    found_b64_2 = true;
+                } else if value == expected_bytes_3.as_slice() {
+                    found_b64_3 = true;
+                }
+            }
+        }
+
+        // Verify we found at least one record from each partition
+        assert!(found_b64_1, "should have records from partition 1");
+        assert!(found_b64_2, "should have records from partition 2");
+        assert!(found_b64_3, "should have records from partition 3");
+
+        // Clean up
+        let _ = fs::remove_dir_all(&source_path);
+        let _ = fs::remove_dir_all(&output_path);
+    }
+
+    #[tokio::test]
     async fn test_backfill_writer_binary_as_der() {
         // Verifies Task 3.1: Backfill writer produces Binary as_der
         // The writer should correctly write DeltaCertRecords with Vec<u8> as_der to Delta table
