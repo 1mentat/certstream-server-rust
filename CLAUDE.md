@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-28
-Last context update: 2026-02-28
+Last verified: 2026-03-01
+Last context update: 2026-03-01
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -165,7 +165,7 @@ The binary has four execution modes selected in main.rs:
 - **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
 - **Source table**: reads from `source_path` parameter; defaults to `config.delta_sink.table_path` when `--source` is not provided; if source table cannot be opened, exits with code 1
 - **Output table**: created at `output_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
-- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially
+- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially; within each partition, data is streamed via `execute_stream()` (one RecordBatch at a time) to avoid OOM on large partitions
 - **Partition filtering**: when `--from` is provided, partitions with `seen_date < from` are skipped; when `--to` is provided, partitions with `seen_date > to` are skipped; filters are inclusive and applied via lexicographic string comparison
 - **as_der conversion**: base64-decodes each Utf8 string to raw bytes; decode failures produce null values and are logged as warnings (non-fatal)
 - **Column alignment**: source columns are matched by name (not index) and cast to target types if needed, handling DataFusion column reordering
