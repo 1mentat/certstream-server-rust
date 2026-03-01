@@ -11,6 +11,7 @@ use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::Field;
 use deltalake::datafusion::prelude::*;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
+use futures::stream::StreamExt;
 use prost::Message;
 use std::collections::HashMap;
 use std::error::Error;
@@ -1275,16 +1276,23 @@ pub async fn run_migrate(
             }
         };
 
-        let batches = match partition_df.collect().await {
-            Ok(b) => b,
+        let mut stream = match partition_df.execute_stream().await {
+            Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, partition = %seen_date, "failed to collect partition batches");
+                warn!(error = %e, partition = %seen_date, "failed to start partition stream");
                 return 1;
             }
         };
 
-        // Process each batch in the partition
-        for batch in batches {
+        // Process each batch from the stream
+        while let Some(batch_result) = stream.next().await {
+            let batch = match batch_result {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, partition = %seen_date, "failed to read batch from stream");
+                    return 1;
+                }
+            };
             if batch.num_rows() == 0 {
                 continue;
             }
