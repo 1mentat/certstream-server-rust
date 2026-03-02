@@ -84,13 +84,7 @@ async fn main() {
             std::process::exit(1);
         }
 
-        // Validate --staging-path is a valid URI
-        if let Some(ref staging) = cli_args.staging_path {
-            if let Err(e) = parse_table_uri(staging) {
-                eprintln!("Error: invalid --staging-path: {}", e);
-                std::process::exit(1);
-            }
-        }
+        validate_staging_path_uri(cli_args.staging_path.as_ref());
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -123,13 +117,7 @@ async fn main() {
             std::process::exit(1);
         }
 
-        // Validate --staging-path is a valid URI
-        if let Some(ref staging) = cli_args.staging_path {
-            if let Err(e) = parse_table_uri(staging) {
-                eprintln!("Error: invalid --staging-path: {}", e);
-                std::process::exit(1);
-            }
-        }
+        validate_staging_path_uri(cli_args.staging_path.as_ref());
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -371,6 +359,16 @@ fn spawn_signal_handler(shutdown_token: CancellationToken) {
         warn!("initiating graceful shutdown...");
         shutdown_token.cancel();
     });
+}
+
+/// Validate staging path as a valid URI if provided.
+fn validate_staging_path_uri(staging_path: Option<&String>) {
+    if let Some(staging) = staging_path {
+        if let Err(e) = parse_table_uri(staging) {
+            eprintln!("Error: invalid --staging-path: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn spawn_rfc6962_watchers(

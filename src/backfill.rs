@@ -963,9 +963,11 @@ pub async fn run_backfill(
 async fn cleanup_staging(staging_path: &str, storage_options: &HashMap<String, String>) {
     if staging_path.starts_with("s3://") {
         // S3 cleanup: list all objects and delete them
-        match DeltaTableBuilder::from_uri(staging_path)
-            .with_storage_options(storage_options.clone())
-            .build()
+        match (|| async {
+            DeltaTableBuilder::from_valid_uri(staging_path)?
+                .with_storage_options(storage_options.clone())
+                .build()
+        })().await
         {
             Ok(table) => {
                 let store = table.object_store();
@@ -1069,11 +1071,13 @@ pub async fn run_merge(
         }
     };
 
-    // Open staging table
-    let staging_table = match DeltaTableBuilder::from_uri(&staging_path)
-        .with_storage_options(staging_storage_options.clone())
-        .load()
-        .await
+    // Open staging table using from_valid_uri for defense-in-depth
+    let staging_table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(&staging_path)?
+            .with_storage_options(staging_storage_options.clone())
+            .load()
+            .await
+    })().await
     {
         Ok(t) => t,
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {

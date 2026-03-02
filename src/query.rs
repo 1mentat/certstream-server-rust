@@ -200,8 +200,21 @@ async fn handle_query_certs(
     let (table, version, decoded_cursor) = if let Some(ref cursor_str) = params.cursor {
         match decode_cursor(cursor_str) {
             Ok(cursor) => {
-                // Open table at cursor version
-                match DeltaTableBuilder::from_uri(&state.config.table_path)
+                // Open table at cursor version using from_valid_uri for defense-in-depth
+                let table_builder = match DeltaTableBuilder::from_valid_uri(&state.config.table_path) {
+                    Ok(builder) => builder,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to parse table URI");
+                        metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                        metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse { error: "Internal server error".to_string() }),
+                        ).into_response();
+                    }
+                };
+
+                match table_builder
                     .with_storage_options(state.storage_options.clone())
                     .with_version(cursor.v)
                     .load()
@@ -233,8 +246,21 @@ async fn handle_query_certs(
             }
         }
     } else {
-        // No cursor — open latest version
-        match DeltaTableBuilder::from_uri(&state.config.table_path)
+        // No cursor — open latest version using from_valid_uri for defense-in-depth
+        let table_builder = match DeltaTableBuilder::from_valid_uri(&state.config.table_path) {
+            Ok(builder) => builder,
+            Err(e) => {
+                warn!(error = %e, "Failed to parse table URI");
+                metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: "Internal server error".to_string() }),
+                ).into_response();
+            }
+        };
+
+        match table_builder
             .with_storage_options(state.storage_options.clone())
             .load()
             .await
