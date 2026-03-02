@@ -8,7 +8,6 @@ use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
 use deltalake::DeltaTableError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -602,6 +601,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use deltalake::DeltaOps;
+    use std::collections::HashMap;
     use std::fs;
     use tower::ServiceExt;
 
