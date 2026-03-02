@@ -2570,6 +2570,7 @@ mod tests {
                 batch_size: 100,
                 flush_interval_secs: 60,
                 compression_level: 9,
+                offline_batch_size: 100000,
             },
             query_api: crate::config::QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
@@ -3167,6 +3168,11 @@ mod tests {
             staging_path: None,
             backfill_sink: None,
             merge: true,
+            reparse_audit: false,
+            extract_metadata: false,
+            output_path: None,
+            from_date: None,
+            to_date: None,
         };
 
         // Verify that merge is true and staging_path is None
