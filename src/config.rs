@@ -1600,4 +1600,156 @@ flush_interval_secs: 30
         };
         assert!(config.validate().is_ok());
     }
+
+    // Task 2: Tests for StorageConfig defaults and deserialization
+
+    #[test]
+    fn test_storage_config_defaults() {
+        // Verifies uri-storage.AC2.2: Default StorageConfig has s3: None
+        let config = StorageConfig::default();
+        assert!(config.s3.is_none());
+    }
+
+    #[test]
+    fn test_s3_storage_config_defaults() {
+        // Verifies uri-storage.AC2.2: Default S3StorageConfig has empty strings and None options
+        let config = S3StorageConfig::default();
+        assert_eq!(config.endpoint, "");
+        assert_eq!(config.region, "");
+        assert_eq!(config.access_key_id, "");
+        assert_eq!(config.secret_access_key, "");
+        assert!(config.conditional_put.is_none());
+        assert!(config.allow_http.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_yaml_with_s3_section() {
+        // Verifies uri-storage.AC2.1: Deserialize YAML with storage.s3 section
+        let yaml = r#"
+s3:
+  endpoint: "https://s3.example.com"
+  region: "us-east-1"
+  access_key_id: "test-key-id"
+  secret_access_key: "test-secret"
+  conditional_put: "etag"
+  allow_http: false
+"#;
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.s3.is_some());
+        let s3 = config.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "us-east-1");
+        assert_eq!(s3.access_key_id, "test-key-id");
+        assert_eq!(s3.secret_access_key, "test-secret");
+        assert_eq!(s3.conditional_put, Some("etag".to_string()));
+        assert_eq!(s3.allow_http, Some(false));
+    }
+
+    #[test]
+    fn test_storage_config_yaml_partial_s3_section() {
+        // Verifies uri-storage.AC2.1: Partial S3 config with defaults
+        let yaml = r#"
+s3:
+  endpoint: "https://s3.example.com"
+  region: "us-west-2"
+"#;
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.s3.is_some());
+        let s3 = config.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "us-west-2");
+        assert_eq!(s3.access_key_id, "");
+        assert_eq!(s3.secret_access_key, "");
+        assert!(s3.conditional_put.is_none());
+        assert!(s3.allow_http.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_yaml_no_s3_section() {
+        // Verifies uri-storage.AC2.2: Config with no storage section at all
+        let yaml = "port: 8080";
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.s3.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_env_var_override_endpoint() {
+        // Verifies uri-storage.AC2.5: Env var override pattern
+        unsafe {
+            env::set_var("CERTSTREAM_STORAGE_S3_ENDPOINT", "https://custom-s3.example.com");
+        }
+        let mut storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://original.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+        if let Some(ref mut s3) = storage.s3 {
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT") {
+                s3.endpoint = v;
+            }
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_STORAGE_S3_ENDPOINT");
+        }
+        assert_eq!(storage.s3.unwrap().endpoint, "https://custom-s3.example.com");
+    }
+
+    #[test]
+    fn test_storage_config_env_var_endpoint_trigger_s3_creation() {
+        // Verifies uri-storage.AC2.5: Endpoint env var triggers S3 config creation
+        unsafe {
+            env::set_var("CERTSTREAM_STORAGE_S3_ENDPOINT", "https://s3.example.com");
+            env::set_var("CERTSTREAM_STORAGE_S3_REGION", "auto");
+        }
+        let mut storage = StorageConfig::default();
+        let endpoint = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT").unwrap_or_default();
+        if !endpoint.is_empty() {
+            storage.s3 = Some(S3StorageConfig {
+                endpoint,
+                region: env::var("CERTSTREAM_STORAGE_S3_REGION").unwrap_or_default(),
+                access_key_id: env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID").unwrap_or_default(),
+                secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+                conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
+                allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+            });
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_STORAGE_S3_ENDPOINT");
+            env::remove_var("CERTSTREAM_STORAGE_S3_REGION");
+        }
+        assert!(storage.s3.is_some());
+        let s3 = storage.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "auto");
+    }
+
+    #[test]
+    fn test_storage_config_env_var_no_endpoint_no_s3_created() {
+        // Verifies: Setting CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID WITHOUT ENDPOINT doesn't create S3 config
+        unsafe {
+            env::set_var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID", "test-key");
+            env::remove_var("CERTSTREAM_STORAGE_S3_ENDPOINT"); // Make sure endpoint is not set
+        }
+        let mut storage = StorageConfig::default();
+        let endpoint = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT").unwrap_or_default();
+        if !endpoint.is_empty() {
+            storage.s3 = Some(S3StorageConfig {
+                endpoint,
+                region: env::var("CERTSTREAM_STORAGE_S3_REGION").unwrap_or_default(),
+                access_key_id: env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID").unwrap_or_default(),
+                secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+                conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
+                allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+            });
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID");
+        }
+        assert!(storage.s3.is_none());
+    }
 }
