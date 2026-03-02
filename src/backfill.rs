@@ -2663,7 +2663,7 @@ mod tests {
 
     /// Helper function to create a minimal Config for testing
     fn make_test_config(table_path: &str) -> Config {
-        use crate::config::{DeltaSinkConfig, QueryApiConfig, ZerobusSinkConfig};
+        use crate::config::{DeltaSinkConfig, ZerobusSinkConfig};
         use std::net::IpAddr;
         use std::str::FromStr;
 

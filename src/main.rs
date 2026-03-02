@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 use api::{ApiState, CertificateCache, LogTracker, ServerStats};
 use cli::{CliArgs, VERSION};
-use config::{Config, parse_table_uri};
+use config::{Config, parse_table_uri, resolve_storage_options};
 use ct::{fetch_log_list, WatcherContext};
 use dedup::DedupFilter;
 use health::{deep_health, example_json, health, HealthState};
@@ -578,17 +578,28 @@ fn build_router(protocols: &config::ProtocolConfig, config: &Config, deps: Route
     }
 
     if config.query_api.enabled {
-        // Check table path accessibility (non-fatal warning)
-        let table_path = std::path::Path::new(&config.query_api.table_path);
-        if !table_path.exists() {
-            warn!(
-                table_path = %config.query_api.table_path,
-                "Query API table path does not exist yet; queries will return 503 until data is written"
-            );
+        // Check table path accessibility (non-fatal warning) — only for local paths
+        if !config.query_api.table_path.starts_with("s3://") {
+            let table_path = std::path::Path::new(&config.query_api.table_path);
+            if !table_path.exists() {
+                warn!(
+                    table_path = %config.query_api.table_path,
+                    "Query API table path does not exist yet; queries will return 503 until data is written"
+                );
+            }
         }
+
+        let query_storage_options = match parse_table_uri(&config.query_api.table_path) {
+            Ok(location) => resolve_storage_options(&location, &config.storage),
+            Err(e) => {
+                error!(error = %e, "Invalid query_api.table_path URI");
+                std::process::exit(1);
+            }
+        };
 
         let query_api_state = Arc::new(query::QueryApiState {
             config: config.query_api.clone(),
+            storage_options: query_storage_options,
         });
         let query_router = query::query_api_router(query_api_state);
         app = app.merge(query_router);
