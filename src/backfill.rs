@@ -1245,6 +1245,9 @@ pub async fn run_migrate(
     let mut current_output_table = output_table;
     let mut total_rows_migrated: usize = 0;
     let mut total_decode_failures: usize = 0;
+    let flush_threshold = config.delta_sink.offline_batch_size as u64;
+    let mut pending_batches: Vec<RecordBatch> = Vec::new();
+    let mut pending_rows: u64 = 0;
 
     for (partition_idx, seen_date) in partition_dates.iter().enumerate() {
         if shutdown.is_cancelled() {
@@ -1372,29 +1375,60 @@ pub async fn run_migrate(
                 }
             };
 
-            let batch_rows = new_batch.num_rows();
-            total_rows_migrated += batch_rows;
+            pending_rows += new_batch.num_rows() as u64;
+            pending_batches.push(new_batch);
 
-            // Write the transformed batch to output table
-            let write_result = DeltaOps(current_output_table)
-                .write(vec![new_batch])
+            // Flush when accumulated rows reach offline_batch_size threshold
+            if pending_rows >= flush_threshold {
+                match DeltaOps(current_output_table)
+                    .write(pending_batches)
+                    .with_save_mode(deltalake::protocol::SaveMode::Append)
+                    .with_writer_properties(writer_props.clone())
+                    .await
+                {
+                    Ok(new_table) => {
+                        current_output_table = new_table;
+                        total_rows_migrated += pending_rows as usize;
+                        info!("Written {} records (total: {})", pending_rows, total_rows_migrated);
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            partition = %seen_date,
+                            "failed to write batch to output table"
+                        );
+                        return 1;
+                    }
+                }
+                pending_batches = Vec::new();
+                pending_rows = 0;
+            }
+        }
+
+        // Flush remaining batches after partition stream ends
+        if !pending_batches.is_empty() {
+            match DeltaOps(current_output_table)
+                .write(pending_batches)
                 .with_save_mode(deltalake::protocol::SaveMode::Append)
                 .with_writer_properties(writer_props.clone())
-                .await;
-
-            match write_result {
+                .await
+            {
                 Ok(new_table) => {
                     current_output_table = new_table;
+                    total_rows_migrated += pending_rows as usize;
+                    info!("Written {} records (total: {})", pending_rows, total_rows_migrated);
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
                         partition = %seen_date,
-                        "failed to write batch to output table"
+                        "failed to write remaining batches to output table"
                     );
                     return 1;
                 }
             }
+            pending_batches = Vec::new();
+            pending_rows = 0;
         }
 
         info!(
