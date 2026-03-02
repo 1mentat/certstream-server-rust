@@ -437,6 +437,19 @@ pub enum TableLocation {
     S3 { uri: String },
 }
 
+impl TableLocation {
+    /// Returns the path/URI string for use with DeltaTableBuilder::from_uri().
+    /// For Local, this returns the stripped path (no file:// prefix) because
+    /// DeltaTableBuilder::from_uri() accepts bare paths for local filesystem.
+    /// For S3, this returns the full s3:// URI.
+    pub fn as_uri(&self) -> &str {
+        match self {
+            TableLocation::Local { path } => path,
+            TableLocation::S3 { uri } => uri,
+        }
+    }
+}
+
 /// Parses a table URI and returns the corresponding TableLocation.
 ///
 /// Supported schemes:

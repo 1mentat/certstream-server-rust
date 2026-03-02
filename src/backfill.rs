@@ -455,7 +455,7 @@ async fn run_writer(
     }
 
     // Open or create the delta table
-    let mut table = match open_or_create_table(&table_path, &schema).await {
+    let mut table = match open_or_create_table(&table_path, &schema, HashMap::new()).await {
         Ok(t) => {
             info!(table_path = %table_path, "Delta table opened/created for writing");
             t
@@ -959,7 +959,7 @@ pub async fn run_merge(
     };
 
     // Open or create main table
-    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema).await {
+    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema, HashMap::new()).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "failed to open main table");
@@ -1360,7 +1360,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1400,7 +1400,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1452,7 +1452,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1490,7 +1490,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1541,7 +1541,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1582,7 +1582,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1672,7 +1672,7 @@ mod tests {
 
         // Create an empty delta table
         let schema = delta_schema();
-        let _table = open_or_create_table(&table_path, &schema)
+        let _table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -2120,7 +2120,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -2160,7 +2160,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -2320,7 +2320,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at indices [10, 11, 15, 16]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2337,7 +2337,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at indices [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2381,7 +2381,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at indices [10, 15]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2407,7 +2407,7 @@ mod tests {
         assert_eq!(work_items_first[0].end, 14);
 
         // Now create staging with records at [11, 12]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2449,7 +2449,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2465,7 +2465,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at [13, 14, 25] (25 is beyond ceiling)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2510,7 +2510,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at [10, 11, 15]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2593,7 +2593,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at cert_index [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2609,7 +2609,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at cert_index [13, 14, 15]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2670,7 +2670,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2686,7 +2686,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at [11, 12, 13] (overlap on 11 and 12)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2747,7 +2747,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with [10, 11]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2762,7 +2762,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2807,7 +2807,7 @@ mod tests {
 
         // Recreate staging with same data [12, 13]
         let _ = fs::create_dir_all(&staging_path);
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2864,7 +2864,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![make_test_record(1, "https://log.example.com")];
@@ -2876,7 +2876,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![make_test_record(2, "https://log.example.com")];
@@ -2922,7 +2922,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with [10, 11]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2937,7 +2937,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging with overlap: [11, 12, 13] (11 overlaps, 12 and 13 are new)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2978,7 +2978,7 @@ mod tests {
         // Do NOT create staging_path — it doesn't exist
 
         let schema = delta_schema();
-        let _ = open_or_create_table(&main_path, &schema)
+        let _ = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
 
@@ -3006,12 +3006,12 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table
-        let _ = open_or_create_table(&main_path, &schema)
+        let _ = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
 
         // Create empty staging table (just schema, no data)
-        let _ = open_or_create_table(&staging_path, &schema)
+        let _ = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
 
@@ -3040,7 +3040,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create staging table with records [10, 11, 12]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3100,7 +3100,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3116,7 +3116,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records [13, 14, 15]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3200,7 +3200,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create an empty main table
-        let _ = open_or_create_table(&main_path, &schema)
+        let _ = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
 
@@ -3291,7 +3291,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records [10, 11, 15, 16]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3308,7 +3308,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![

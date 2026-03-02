@@ -8,6 +8,7 @@ use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
 use deltalake::DeltaTableError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -689,7 +690,7 @@ mod tests {
         let schema = delta_schema();
 
         // Open or create the table
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -750,7 +751,7 @@ mod tests {
         )];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -834,7 +835,7 @@ mod tests {
         )];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -880,7 +881,7 @@ mod tests {
         )];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1115,7 +1116,7 @@ mod tests {
         ];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1176,7 +1177,7 @@ mod tests {
         ];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1236,7 +1237,7 @@ mod tests {
         ];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1293,7 +1294,7 @@ mod tests {
         records[2].issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1350,7 +1351,7 @@ mod tests {
         records[2].issuer_aggregated = "/CN=Let's Encrypt Authority X3".to_string();
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1438,7 +1439,7 @@ mod tests {
         ];
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1497,7 +1498,7 @@ mod tests {
             .collect();
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1574,7 +1575,7 @@ mod tests {
             .collect();
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1638,7 +1639,7 @@ mod tests {
             .collect();
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1723,7 +1724,7 @@ mod tests {
         // Create a table and get its version
         let records = vec![create_test_cert_record(1, "log1", "2026-02-15", vec!["example.com"])];
         let schema = delta_schema();
-        let table = open_or_create_table(table_path, &schema)
+        let table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1769,7 +1770,7 @@ mod tests {
             .collect();
 
         let schema = delta_schema();
-        let mut table = open_or_create_table(table_path, &schema)
+        let mut table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to create table");
 
@@ -1845,7 +1846,7 @@ mod tests {
         // Create a table with at least one record so execution reaches the timeout path
         let records = vec![create_test_cert_record(1, "log1", "2026-02-15", vec!["example.com"])];
         let schema = delta_schema();
-        let table = open_or_create_table(table_path, &schema)
+        let table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("create table");
         let batch = records_to_batch(&records, &schema).expect("create batch");
@@ -1885,7 +1886,7 @@ mod tests {
         // Create a valid table with at least one record
         let records = vec![create_test_cert_record(1, "log1", "2026-02-15", vec!["example.com"])];
         let schema = delta_schema();
-        let table = open_or_create_table(table_path, &schema)
+        let table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("create table");
         let batch = records_to_batch(&records, &schema).expect("create batch");
