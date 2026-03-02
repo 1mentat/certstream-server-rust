@@ -21,9 +21,9 @@ Last context update: 2026-03-02
 - `cargo run -- --backfill` - Run delta backfill mode (catch-up gaps)
 - `cargo run -- --backfill --from 0` - Run historical backfill from index 0
 - `cargo run -- --backfill --logs "google"` - Backfill only logs matching filter
-- `cargo run -- --backfill --staging-path /tmp/staging` - Backfill into staging table
+- `cargo run -- --backfill --staging-path file:///tmp/staging` - Backfill into staging table
 - `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
-- `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
+- `cargo run -- --merge --staging-path file:///tmp/staging` - Merge staging into main table
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
@@ -63,19 +63,32 @@ The binary has three execution modes selected in main.rs:
 - Env var pattern: `CERTSTREAM_<SECTION>_<FIELD>` (e.g., `CERTSTREAM_DELTA_SINK_ENABLED`)
 - All optional features use an `enabled: bool` field (default false)
 - Graceful shutdown via CancellationToken propagated to all tasks
+- **Table paths require URI scheme**: all `table_path` and `staging_path` values must use `file://` for local filesystem or `s3://` for S3-compatible storage; bare paths are rejected by `parse_table_uri()` at config validation and CLI dispatch
+
+## Storage Config Contracts
+- **Config**: `StorageConfig { s3: Option<S3StorageConfig> }` — top-level config section for storage backend credentials
+- **S3StorageConfig**: `{ endpoint, region, access_key_id, secret_access_key, conditional_put: Option<String>, allow_http: Option<bool> }`
+- **Env vars**: `CERTSTREAM_STORAGE_S3_ENDPOINT`, `CERTSTREAM_STORAGE_S3_REGION`, `CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID`, `CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY`, `CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT`, `CERTSTREAM_STORAGE_S3_ALLOW_HTTP`
+- **Env var trigger**: if no `storage.s3` section in YAML, `CERTSTREAM_STORAGE_S3_ENDPOINT` being non-empty triggers creation of S3 config from env vars; if endpoint is empty/unset, no S3 config is created even if other S3 env vars are set
+- **TableLocation enum**: `Local { path }` or `S3 { uri }`; `as_uri()` returns the string for `DeltaTableBuilder::from_uri()` (stripped path for Local, full `s3://` URI for S3)
+- **`parse_table_uri(uri)`**: parses `file://` to `Local`, `s3://` to `S3`; rejects empty URIs, unsupported schemes, and bare paths (suggests `file://` prefix)
+- **`resolve_storage_options(location, storage)`**: returns `HashMap<String, String>` — empty for Local, AWS-compatible options (`AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `conditional_put`, `AWS_ALLOW_HTTP`) for S3
+- **Validation (when S3 URIs used)**: `storage.s3` must be present; `endpoint`, `region`, `access_key_id`, `secret_access_key` must be non-empty; validated during `Config::validate()`
+- **Validation scope**: `delta_sink.table_path` validated when delta_sink enabled; `query_api.table_path` validated when query_api enabled; `--staging-path` validated at CLI dispatch in main.rs (both backfill and merge modes)
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
 - **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level }`
 - **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge)
-- **Entry point**: `delta_sink::run_delta_sink(config, rx, shutdown)` spawned in main
+- **Entry point**: `delta_sink::run_delta_sink(config, storage, rx, shutdown)` spawned in main; parses `config.table_path` via `parse_table_uri()` and resolves storage options at startup
 - **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD)
 - **Flush triggers**: batch_size threshold OR flush_interval_secs timer OR graceful shutdown
 - **Buffer overflow**: if buffer > 2x batch_size, drops oldest half
-- **Error recovery**: failed writes retain buffer for retry; table handle reopened
-- **Non-fatal startup**: if table creation fails, task exits without crashing server
+- **Error recovery**: failed writes retain buffer for retry; table handle reopened via `DeltaTableBuilder::from_valid_uri()` with storage options
+- **Non-fatal startup**: if URI parsing or table creation fails, task exits without crashing server
 - **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
-- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer(table, buffer, schema, batch_size, compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+- **Public helpers**: `delta_schema()`, `open_or_create_table(table_path, schema, storage_options)`, `flush_buffer(table, buffer, schema, batch_size, compression_level, storage_options)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+- **S3 integration tests**: gated behind `feature = "integration"`, requires env vars `CERTSTREAM_TEST_S3_ENDPOINT`, `CERTSTREAM_TEST_S3_BUCKET`, `CERTSTREAM_TEST_S3_ACCESS_KEY_ID`, `CERTSTREAM_TEST_S3_SECRET_ACCESS_KEY`; tests table create/write/read round-trip and conditional put (etag) conflict resolution
 
 ## ZeroBus Sink Contracts
 - **Disabled by default** (`zerobus_sink.enabled = false`)
@@ -115,12 +128,13 @@ The binary has three execution modes selected in main.rs:
 - **Query timeout**: DataFusion execution wrapped in `tokio::time::timeout`; exceeded returns 504
 - **Response fields**: `version`, `results[]` (cert_index, fingerprint, sha256, serial_number, subject, issuer, not_before, not_after, all_domains, source_name, seen, is_ca), `next_cursor`, `has_more`
 - **Heavy fields excluded**: as_der, chain, cert_link, source_url, update_type, signature_algorithm not returned
-- **Startup validation**: warns if table_path does not exist (non-fatal; queries return 503 until data written)
+- **Storage options**: `QueryApiState` holds `storage_options: HashMap<String, String>` resolved from `parse_table_uri()` and `resolve_storage_options()` at startup; passed to `DeltaTableBuilder` for all table opens (latest and versioned)
+- **Startup validation**: for local paths, warns if table_path does not exist (non-fatal; queries return 503 until data written); for S3 paths, skips local filesystem check
 - **Metrics**: `certstream_query_requests` (counter, labeled by status), `certstream_query_duration_seconds` (histogram), `certstream_query_results_count` (histogram)
 - **Reads from**: same Delta table written by delta_sink and backfill
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <URI>` writes to staging table instead of main table (must be `file://` or `s3://` URI); `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
 - **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main; parses `config.delta_sink.table_path` URI and resolves storage options at startup; passes storage options to all gap detection and writer operations
 - **Storage options**: `run_backfill()` calls `parse_table_uri(&config.delta_sink.table_path)` and `resolve_storage_options(&location, &config.storage)` to extract S3 credentials and other backend configuration; storage options are then passed to `detect_gaps()` and `run_writer()` for S3-backed Delta table operations
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
@@ -140,9 +154,9 @@ The binary has three execution modes selected in main.rs:
 - **Graceful shutdown**: CancellationToken checked per batch in fetchers; writer flushes remaining buffer on cancellation
 
 ## Merge Contracts
-- **CLI flags**: `--merge --staging-path <PATH>` activates merge mode; `--merge` without `--staging-path` exits with error
+- **CLI flags**: `--merge --staging-path <URI>` activates merge mode; staging path must be `file://` or `s3://` URI; `--merge` without `--staging-path` exits with error
 - **Entry point**: `backfill::run_merge(config, staging_path, shutdown)` called from main, returns exit code (i32)
-- **Storage options**: `run_merge()` calls `parse_table_uri()` on both `config.delta_sink.table_path` and `staging_path`, then calls `resolve_storage_options()` for each to extract S3 credentials and other backend configuration; storage options are passed to table open calls. Bare paths (without URI scheme) are treated as local filesystem with empty storage options for backward compatibility.
+- **Storage options**: `run_merge()` calls `parse_table_uri()` on both `config.delta_sink.table_path` and `staging_path`, then calls `resolve_storage_options()` for each to extract S3 credentials and other backend configuration; storage options are passed to table open calls; both paths must use URI scheme (`file://` or `s3://`)
 - **Merge predicate**: `target.source_url = source.source_url AND target.cert_index = source.cert_index` (deduplication key)
 - **Merge behavior**: uses `DeltaOps::merge()` with `when_not_matched_insert` only (no updates, no deletes); matched source rows are silently skipped
 - **Batch-by-batch**: staging records are read via DataFusion SQL, then each RecordBatch is merged individually into the main table
