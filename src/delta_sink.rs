@@ -7,7 +7,8 @@ use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableError, DeltaTableBuilder};
+use std::collections::HashMap;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use serde_json;
@@ -229,6 +230,7 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
 /// # Arguments
 /// * `table_path` - Path to the Delta table directory
 /// * `schema` - Arrow schema for the table
+/// * `storage_options` - Storage configuration options (e.g., AWS credentials for S3)
 ///
 /// # Returns
 /// * `Ok(DeltaTable)` - The opened or created table
@@ -236,9 +238,14 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
 pub async fn open_or_create_table(
     table_path: &str,
     schema: &Arc<Schema>,
+    storage_options: HashMap<String, String>,
 ) -> Result<DeltaTable, DeltaTableError> {
     // First, try to open an existing table
-    match deltalake::open_table(table_path).await {
+    match DeltaTableBuilder::from_uri(table_path)
+        .with_storage_options(storage_options.clone())
+        .load()
+        .await
+    {
         Ok(table) => Ok(table),
         Err(DeltaTableError::NotATable(_)) => {
             // Table doesn't exist, create a new one
@@ -246,6 +253,7 @@ pub async fn open_or_create_table(
 
             let table = CreateBuilder::new()
                 .with_location(table_path)
+                .with_storage_options(storage_options)
                 .with_columns(struct_fields)
                 .with_partition_columns(vec!["seen_date"])
                 .await?;
@@ -550,7 +558,7 @@ pub async fn flush_buffer(
                     );
 
                     // Try open_or_create as a recovery measure
-                    match open_or_create_table(&table_path, schema).await {
+                    match open_or_create_table(&table_path, schema, HashMap::new()).await {
                         Ok(recovery_table) => {
                             (
                                 Some(recovery_table),
@@ -568,7 +576,7 @@ pub async fn flush_buffer(
                             // Per AC4.4: Table failures must be non-fatal to real-time streaming.
                             // Since table was consumed by DeltaOps, attempt final recovery via open_or_create.
                             // Buffer is retained in caller for potential retry on next flush cycle.
-                            let fallback_table = open_or_create_table(&table_path, schema).await;
+                            let fallback_table = open_or_create_table(&table_path, schema, HashMap::new()).await;
                             match fallback_table {
                                 Ok(recovered_table) => {
                                     (
@@ -657,7 +665,7 @@ pub async fn run_delta_sink(
     let schema = delta_schema();
 
     // Try to open or create the table; if it fails, log error and return
-    let mut table = match open_or_create_table(&config.table_path, &schema).await {
+    let mut table = match open_or_create_table(&config.table_path, &schema, HashMap::new()).await {
         Ok(t) => t,
         Err(e) => {
             error!(
@@ -1117,7 +1125,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let result = open_or_create_table(&table_path, &schema).await;
+        let result = open_or_create_table(&table_path, &schema, HashMap::new()).await;
 
         // Verify table was created successfully
         assert!(result.is_ok(), "table creation should succeed");
@@ -1153,14 +1161,14 @@ mod tests {
         let schema = delta_schema();
 
         // First call: create the table
-        let result1 = open_or_create_table(&table_path, &schema).await;
+        let result1 = open_or_create_table(&table_path, &schema, HashMap::new()).await;
         assert!(result1.is_ok(), "first table creation should succeed");
 
         let table1 = result1.unwrap();
         let version1 = table1.version();
 
         // Second call: should open existing table
-        let result2 = open_or_create_table(&table_path, &schema).await;
+        let result2 = open_or_create_table(&table_path, &schema, HashMap::new()).await;
         assert!(result2.is_ok(), "reopening table should succeed");
 
         let table2 = result2.unwrap();
@@ -1198,7 +1206,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let result = open_or_create_table(&table_path, &schema).await;
+        let result = open_or_create_table(&table_path, &schema, HashMap::new()).await;
 
         assert!(result.is_ok(), "table creation should succeed");
 
@@ -1302,7 +1310,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1361,7 +1369,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1517,7 +1525,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1979,7 +1987,7 @@ mod tests {
 
         // Create table
         let schema = delta_schema();
-        let table = match open_or_create_table(&table_path, &schema).await {
+        let table = match open_or_create_table(&table_path, &schema, HashMap::new()).await {
             Ok(t) => t,
             Err(e) => panic!("Failed to create table: {}", e),
         };
