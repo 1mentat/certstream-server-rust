@@ -669,7 +669,7 @@ fn record_flush_metrics(result: &Result<usize, Box<dyn std::error::Error + Send 
 pub async fn run_delta_sink(
     config: DeltaSinkConfig,
     storage: StorageConfig,
-        mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
+    mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
     shutdown: CancellationToken,
 ) {
     let schema = delta_schema();
