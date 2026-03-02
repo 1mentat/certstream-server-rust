@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-03-01
-Last context update: 2026-03-01
+Last verified: 2026-03-02
+Last context update: 2026-03-02
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -26,6 +26,10 @@ Last context update: 2026-03-01
 - `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
 - `cargo run -- --migrate --output <PATH>` - Migrate Delta table to new schema
 - `cargo run -- --migrate --output <PATH> --source <SRC> --from <DATE> --to <DATE>` - Migrate with source and date filters
+- `cargo run -- --reparse-audit` - Audit stored certs against current parsing code
+- `cargo run -- --reparse-audit --from-date 2026-02-01 --to-date 2026-02-28` - Audit with date filter
+- `cargo run -- --extract-metadata --output /tmp/metadata` - Extract metadata-only Delta table
+- `cargo run -- --extract-metadata --output /tmp/metadata --from-date 2026-02-01` - Extract with date filter
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
@@ -46,6 +50,7 @@ Last context update: 2026-03-01
 - `src/hot_reload.rs` - Config hot-reload via file watcher
 - `src/state.rs` - Shared server state management
 - `src/zerobus_sink.rs` - ZeroBus streaming sink (optional, disabled by default)
+- `src/table_ops.rs` - Table operations: reparse audit and metadata extraction
 - `src/cli.rs` - CLI argument parsing
 - `proto/cert_record.proto` - Protobuf schema for ZeroBus wire format (20 fields mirroring DeltaCertRecord)
 - `build.rs` - prost-build: compiles proto to Rust + file descriptor set
@@ -62,6 +67,8 @@ The binary has four execution modes selected in main.rs:
 2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
 3. **Merge mode** (`--merge --staging-path <PATH>`): merges a staging Delta table into the main table using Delta MERGE INTO with deduplication, then deletes the staging directory on success
 4. **Migrate mode** (`--migrate --output <PATH>`): reads an existing Delta table, converts `as_der` from base64 Utf8 to raw Binary, and writes to a new output table with optimized WriterProperties
+5. **Reparse audit mode** (`--reparse-audit`): reads stored certificates from the Delta table, reparses each from `as_der`, compares parsed fields against stored values, and prints a mismatch report. Exits 0 on success (even with mismatches), 1 on infrastructure failure or shutdown.
+6. **Metadata extraction mode** (`--extract-metadata --output <PATH>`): reads the source Delta table and writes a 19-column metadata-only Delta table (all columns except `as_der`) to the output path. Exits 0 on success, 1 on failure or shutdown.
 
 ## Key Conventions
 - Config structs use serde Deserialize with defaults; env vars override YAML
@@ -71,8 +78,9 @@ The binary has four execution modes selected in main.rs:
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
-- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level }`
+- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level, offline_batch_size }`
 - **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; `heavy_column_compression_level` (i32, default 15, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_HEAVY_COLUMN_COMPRESSION_LEVEL` env var; both validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge) with per-column encoding via WriterProperties
+- **Offline batch size**: `offline_batch_size` (usize, default 100000) configurable via `CERTSTREAM_DELTA_SINK_OFFLINE_BATCH_SIZE` env var; controls how many rows are accumulated before each Delta commit in offline operations (extract-metadata, migrate); larger values = fewer commits = faster bulk writes
 - **Entry point**: `delta_sink::run_delta_sink(config, rx, shutdown)` spawned in main
 - **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD); `as_der` is `DataType::Binary` (raw DER bytes, not base64)
 - **Flush triggers**: batch_size threshold OR flush_interval_secs timer OR graceful shutdown
@@ -173,6 +181,35 @@ The binary has four execution modes selected in main.rs:
 - **Empty source**: if source table has no partitions or no partitions match filters, exits with code 0
 - **Graceful shutdown**: CancellationToken checked between partitions; if cancelled, exits with code 1
 - **Error handling**: any failure (table open, query, write) exits with code 1
+
+## Reparse Audit Contracts
+- **CLI flags**: `--reparse-audit` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date
+- **Entry point**: `table_ops::run_reparse_audit(config, from_date, to_date, shutdown)` called from main, returns `(i32, AuditReport)`
+- **Source table**: reads from `config.delta_sink.table_path` (same Delta table as delta_sink and backfill)
+- **Columns read**: cert_index, source_url, seen_date, as_der, subject_aggregated, issuer_aggregated, all_domains, signature_algorithm, is_ca, not_before, not_after, serial_number
+- **Comparison fields**: subject_aggregated, issuer_aggregated, all_domains (sorted), signature_algorithm, is_ca, not_before, not_after, serial_number (8 fields compared)
+- **as_der handling**: supports both Binary and Utf8 (base64-encoded) column types; null or empty values counted as unparseable
+- **Unparseable records**: invalid base64, null as_der, or `parse_certificate()` returning None are counted as unparseable (not mismatches)
+- **Sample diffs**: collects up to 10 `SampleDiff` records with per-field stored vs reparsed values
+- **AuditReport struct**: `{ total_records, mismatch_record_count, unparseable_count, partition_count, field_mismatch_counts: HashMap<String, u64>, sample_diffs: Vec<SampleDiff> }`
+- **Exit code**: 0 on successful completion (even with mismatches); 1 on missing table, query failure, invalid date format, or shutdown
+- **No records**: if date filter matches zero rows, prints informational message and exits 0
+- **Graceful shutdown**: CancellationToken checked per batch; on cancellation, prints partial report and exits 1
+- **Public helpers**: `date_filter_clause(from_date, to_date)` returns SQL WHERE fragment or Err for invalid format; `metadata_schema()` returns 19-column Arrow Schema (delta_schema minus as_der)
+
+## Metadata Extraction Contracts
+- **CLI flags**: `--extract-metadata` activates extraction mode; `--output <PATH>` (required) sets output Delta table path; `--from-date <YYYY-MM-DD>` and `--to-date <YYYY-MM-DD>` filter partitions
+- **Validation**: `--extract-metadata` without `--output` prints error and exits 1 (checked in main.rs)
+- **Entry point**: `table_ops::run_extract_metadata(config, output_path, from_date, to_date, shutdown)` called from main, returns i32
+- **Source table**: reads from `config.delta_sink.table_path`
+- **Output schema**: 19 columns (all delta_schema columns except `as_der`): cert_index, update_type, seen, seen_date, source_name, source_url, cert_link, serial_number, fingerprint, sha256, sha1, not_before, not_after, is_ca, signature_algorithm, subject_aggregated, issuer_aggregated, all_domains, chain
+- **Output table creation**: uses `delta_sink::open_or_create_table()` with `metadata_schema()`; creates output directory via `create_dir_all`
+- **Partitioning**: output table partitioned by `seen_date` (inherits from `open_or_create_table` behavior)
+- **Compression**: zstd with `config.delta_sink.compression_level`
+- **Write mode**: `SaveMode::Append`; accumulates DataFusion batches up to `offline_batch_size` rows before each Delta commit to minimize transaction overhead
+- **Exit code**: 0 on success or empty date range; 1 on missing source table, query failure, write failure, invalid date, or shutdown
+- **No records**: if date filter matches zero rows, exits 0
+- **Graceful shutdown**: CancellationToken checked per batch; on cancellation, partial output left intact, exits 1
 
 ## CT Fetch Contracts
 - **Module**: `ct::fetch` (public module)

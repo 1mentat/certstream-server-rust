@@ -1484,6 +1484,7 @@ mod tests {
             flush_interval_secs: 1,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1543,6 +1544,7 @@ mod tests {
             flush_interval_secs: 60,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1676,6 +1678,7 @@ mod tests {
             flush_interval_secs: 60,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1753,6 +1756,7 @@ mod tests {
             flush_interval_secs: 60,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         // Create broadcast channel (like main.rs does)
@@ -1854,6 +1858,7 @@ mod tests {
             flush_interval_secs: 60,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         // Small buffer to force lagging
@@ -1922,6 +1927,7 @@ mod tests {
             flush_interval_secs: 1,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         let (tx, _) = tokio::sync::broadcast::channel::<Arc<PreSerializedMessage>>(10);
@@ -1984,6 +1990,7 @@ mod tests {
             flush_interval_secs: 2,
             compression_level: 9,
             heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         };
 
         // Create broadcast channel
