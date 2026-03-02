@@ -1,4 +1,4 @@
-use crate::config::DeltaSinkConfig;
+use crate::config::{DeltaSinkConfig, StorageConfig, parse_table_uri, resolve_storage_options};
 use crate::models::{CertificateMessage, PreSerializedMessage};
 use chrono::prelude::*;
 use deltalake::arrow::array::*;
@@ -486,6 +486,7 @@ pub async fn flush_buffer(
     schema: &Arc<Schema>,
     batch_size: usize,
     compression_level: i32,
+    storage_options: &HashMap<String, String>,
 ) -> (Option<DeltaTable>, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
     // If buffer is empty, return early
     if buffer.is_empty() {
@@ -542,7 +543,14 @@ pub async fn flush_buffer(
             );
 
             // Reopen table to get a fresh handle per specification
-            match deltalake::open_table(&table_path).await {
+            match (async {
+                DeltaTableBuilder::from_valid_uri(&table_path)?
+                    .with_storage_options(storage_options.clone())
+                    .load()
+                    .await
+            })
+            .await
+            {
                 Ok(reopened_table) => {
                     (
                         Some(reopened_table),
@@ -559,7 +567,7 @@ pub async fn flush_buffer(
                     );
 
                     // Try open_or_create as a recovery measure
-                    match open_or_create_table(&table_path, schema, HashMap::new()).await {
+                    match open_or_create_table(&table_path, schema, storage_options.clone()).await {
                         Ok(recovery_table) => {
                             (
                                 Some(recovery_table),
@@ -577,7 +585,7 @@ pub async fn flush_buffer(
                             // Per AC4.4: Table failures must be non-fatal to real-time streaming.
                             // Since table was consumed by DeltaOps, attempt final recovery via open_or_create.
                             // Buffer is retained in caller for potential retry on next flush cycle.
-                            let fallback_table = open_or_create_table(&table_path, schema, HashMap::new()).await;
+                            let fallback_table = open_or_create_table(&table_path, schema, storage_options.clone()).await;
                             match fallback_table {
                                 Ok(recovered_table) => {
                                     (
@@ -660,13 +668,25 @@ fn record_flush_metrics(result: &Result<usize, Box<dyn std::error::Error + Send 
 /// 7. Deserialization failures are logged and skipped (AC1.5)
 pub async fn run_delta_sink(
     config: DeltaSinkConfig,
-    mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
+    storage: StorageConfig,
+        mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
     shutdown: CancellationToken,
 ) {
     let schema = delta_schema();
 
+    // Parse the table path URI and resolve storage options
+    let location = match parse_table_uri(&config.table_path) {
+        Ok(loc) => loc,
+        Err(e) => {
+            error!(error = %e, table_path = %config.table_path, "Invalid table path URI, delta-sink task exiting");
+            return;
+        }
+    };
+    let storage_options = resolve_storage_options(&location, &storage);
+    let table_uri = location.as_uri().to_string();
+
     // Try to open or create the table; if it fails, log error and return
-    let mut table = match open_or_create_table(&config.table_path, &schema, HashMap::new()).await {
+    let mut table = match open_or_create_table(&table_uri, &schema, storage_options.clone()).await {
         Ok(t) => t,
         Err(e) => {
             error!(
@@ -703,7 +723,7 @@ pub async fn run_delta_sink(
 
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
-                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, &storage_options).await;
                                     match new_table_opt {
                                         Some(new_table) => {
                                             table = new_table;
@@ -748,7 +768,7 @@ pub async fn run_delta_sink(
             _ = flush_interval.tick() => {
                 // Time-triggered flush (AC3.2)
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, &storage_options).await;
                     match new_table_opt {
                         Some(new_table) => {
                             table = new_table;
@@ -772,7 +792,7 @@ pub async fn run_delta_sink(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, &storage_options).await;
                     record_flush_metrics(&flush_result, "Shutdown flush");
                     if table_opt.is_none() {
                         warn!(
@@ -1330,7 +1350,7 @@ mod tests {
         let mut buffer = vec![record1, record2];
 
         // Flush to Delta
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, &HashMap::new()).await;
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
@@ -1384,7 +1404,7 @@ mod tests {
             .collect();
 
         // Flush exactly batch_size records
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, &HashMap::new()).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1409,7 +1429,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 100,
             flush_interval_secs: 1,
             compression_level: 9,
@@ -1420,7 +1440,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send a few messages (less than batch_size)
         let msg = make_test_json_bytes();
@@ -1467,7 +1487,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 100,
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1478,7 +1498,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send a few messages (less than batch_size, so timer won't trigger)
         let msg = make_test_json_bytes();
@@ -1548,7 +1568,7 @@ mod tests {
         );
 
         // Flush (which includes overflow check)
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, &HashMap::new()).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1599,7 +1619,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 5,
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1610,7 +1630,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send malformed JSON
         let malformed_psm = Arc::new(PreSerializedMessage {
@@ -1675,7 +1695,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 5,
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1687,7 +1707,7 @@ mod tests {
         // Spawn delta sink task (consumer 1)
         let rx_sink = tx.subscribe();
         let shutdown_sink = CancellationToken::new();
-        let sink_task = tokio::spawn(run_delta_sink(config, rx_sink, shutdown_sink.clone()));
+        let sink_task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx_sink, shutdown_sink.clone()));
 
         // Spawn mock WS-like consumer (consumer 2)
         let mut rx_ws = tx.subscribe();
@@ -1775,7 +1795,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 100, // Large batch size so flush doesn't happen immediately
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1787,7 +1807,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task (it will start lagging due to small buffer)
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send many messages to cause lagging in the receiver
         let valid_msg = make_test_json_bytes();
@@ -1853,7 +1873,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task with invalid path
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Give it a moment to attempt startup
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1903,7 +1923,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 10,
             flush_interval_secs: 2,
             compression_level: 9,
@@ -1915,7 +1935,7 @@ mod tests {
         // Spawn delta sink
         let rx_sink = tx.subscribe();
         let shutdown_sink = CancellationToken::new();
-        let sink_task = tokio::spawn(run_delta_sink(config, rx_sink, shutdown_sink.clone()));
+        let sink_task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx_sink, shutdown_sink.clone()));
 
         // Spawn mock WS consumer
         let mut rx_ws = tx.subscribe();
@@ -2002,7 +2022,7 @@ mod tests {
         }
 
         // Flush with compression level 9
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, &HashMap::new()).await;
 
         // Verify flush succeeded
         let _new_table = table_opt.expect("table should be available after flush");
