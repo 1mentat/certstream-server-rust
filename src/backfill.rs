@@ -487,7 +487,7 @@ async fn run_writer(
 
                         // Flush if buffer reaches batch_size threshold
                         if buffer.len() >= batch_size {
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
                             let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "batch size trigger");
                             if should_break {
                                 break;
@@ -502,7 +502,7 @@ async fn run_writer(
                                 records_in_buffer = buffer.len(),
                                 "Channel closed, flushing remaining buffer"
                             );
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
                             let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "channel close");
                         }
                         break;
@@ -512,7 +512,7 @@ async fn run_writer(
             _ = flush_timer.tick() => {
                 // Time-triggered flush
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
                     let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "time trigger");
                     if should_break {
                         break;
@@ -527,7 +527,7 @@ async fn run_writer(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
                     let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "shutdown");
                 }
                 break;

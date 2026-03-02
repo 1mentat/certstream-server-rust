@@ -216,8 +216,9 @@ async fn main() {
     let delta_sink_handle = if config.delta_sink.enabled {
         let delta_rx = tx.subscribe();
         let delta_config = config.delta_sink.clone();
+        let delta_storage = config.storage.clone();
         let delta_shutdown = shutdown_token.clone();
-        let handle = tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_rx, delta_shutdown));
+        let handle = tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_storage, delta_rx, delta_shutdown));
         info!("delta sink enabled, writing to: {}", config.delta_sink.table_path);
         Some(handle)
     } else {
