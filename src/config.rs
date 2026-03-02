@@ -909,6 +909,67 @@ impl Config {
             });
         }
 
+        // Validate delta_sink.table_path is a valid URI (when delta_sink is enabled)
+        if self.delta_sink.enabled {
+            if let Err(e) = parse_table_uri(&self.delta_sink.table_path) {
+                errors.push(ConfigValidationError {
+                    field: "delta_sink.table_path".to_string(),
+                    message: e,
+                });
+            }
+        }
+
+        // Validate query_api.table_path is a valid URI (when query_api is enabled)
+        if self.query_api.enabled {
+            if let Err(e) = parse_table_uri(&self.query_api.table_path) {
+                errors.push(ConfigValidationError {
+                    field: "query_api.table_path".to_string(),
+                    message: e,
+                });
+            }
+        }
+
+        // Check S3 config presence when any S3 URI is used
+        let has_s3_uri = (self.delta_sink.enabled && self.delta_sink.table_path.starts_with("s3://"))
+            || (self.query_api.enabled && self.query_api.table_path.starts_with("s3://"));
+
+        if has_s3_uri {
+            match &self.storage.s3 {
+                None => {
+                    errors.push(ConfigValidationError {
+                        field: "storage.s3".to_string(),
+                        message: "S3 storage configuration required when using s3:// URIs. Add a [storage.s3] section to config.yaml or set CERTSTREAM_STORAGE_S3_ENDPOINT env var.".to_string(),
+                    });
+                }
+                Some(s3) => {
+                    if s3.endpoint.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.endpoint".to_string(),
+                            message: "S3 endpoint cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                    if s3.region.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.region".to_string(),
+                            message: "S3 region cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                    if s3.access_key_id.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.access_key_id".to_string(),
+                            message: "S3 access key ID cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                    if s3.secret_access_key.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.secret_access_key".to_string(),
+                            message: "S3 secret access key cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         if self.zerobus_sink.enabled {
             if self.zerobus_sink.endpoint.is_empty() {
                 errors.push(ConfigValidationError {
@@ -2018,5 +2079,235 @@ s3:
             Some(&"http://localhost:9000".to_string())
         );
         assert_eq!(opts.get("AWS_ALLOW_HTTP"), Some(&"true".to_string()));
+    }
+
+    // Test URI validation: AC2.1 - Config with S3 URI and full storage config validates OK
+    #[test]
+    fn test_validate_s3_uri_with_full_config() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with S3 URI and full config");
+    }
+
+    // Test URI validation: AC2.2 - Config with file:// URI and no S3 config validates OK
+    #[test]
+    fn test_validate_file_uri_without_s3_config() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "file://./data/certstream".to_string();
+        config.storage = StorageConfig { s3: None };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with file:// URI without S3 config");
+    }
+
+    // Test URI validation: AC2.3 - Config with S3 URI but missing storage.s3 fails validation
+    #[test]
+    fn test_validate_s3_uri_without_storage_config() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig { s3: None };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with S3 URI but no storage config");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3"),
+            "error should be on storage.s3 field"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("S3 storage configuration required")),
+            "error message should suggest S3 configuration required"
+        );
+    }
+
+    // Test URI validation: AC2.4 - Config with S3 URI but empty endpoint fails validation
+    #[test]
+    fn test_validate_s3_uri_with_empty_endpoint() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: String::new(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty endpoint");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3.endpoint"),
+            "error should be on storage.s3.endpoint field"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("S3 endpoint cannot be empty")),
+            "error message should indicate empty endpoint"
+        );
+    }
+
+    // Test URI validation: AC2.6 - parse_table_uri validates both file:// and bare paths
+    #[test]
+    fn test_validate_staging_path_uri_format() {
+        // Valid file:// URI should succeed
+        let result = parse_table_uri("file:///tmp/staging");
+        assert!(result.is_ok(), "file:/// URI should parse successfully");
+
+        // Bare path should fail with helpful error
+        let result = parse_table_uri("/tmp/staging");
+        assert!(result.is_err(), "bare path should fail validation");
+        let error_msg = result.unwrap_err();
+        assert!(
+            error_msg.contains("must use a URI scheme"),
+            "error should suggest using URI scheme, got: {}",
+            error_msg
+        );
+    }
+
+    // Test URI validation: AC2.3/AC2.6 - Config with bare path (no scheme) fails validation
+    #[test]
+    fn test_validate_bare_path_without_scheme() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "./data/certstream".to_string();
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "validation should fail with bare path (no scheme)"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "delta_sink.table_path"),
+            "error should be on delta_sink.table_path field"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must use a URI scheme")),
+            "error message should suggest using URI scheme"
+        );
+    }
+
+    // Test URI validation: query_api.table_path is validated when enabled
+    #[test]
+    fn test_validate_query_api_table_path_uri() {
+        let mut config = test_config();
+        config.query_api.enabled = true;
+        config.query_api.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig { s3: None };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with S3 URI in query_api");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3"),
+            "error should be on storage.s3 field"
+        );
+    }
+
+    // Test URI validation: S3 region requirement when using S3
+    #[test]
+    fn test_validate_s3_uri_with_empty_region() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: String::new(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty region");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3.region"),
+            "error should be on storage.s3.region field"
+        );
+    }
+
+    // Test URI validation: S3 access_key_id requirement when using S3
+    #[test]
+    fn test_validate_s3_uri_with_empty_access_key() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: String::new(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty access key");
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "storage.s3.access_key_id"),
+            "error should be on storage.s3.access_key_id field"
+        );
+    }
+
+    // Test URI validation: S3 secret_access_key requirement when using S3
+    #[test]
+    fn test_validate_s3_uri_with_empty_secret_key() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: String::new(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty secret key");
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "storage.s3.secret_access_key"),
+            "error should be on storage.s3.secret_access_key field"
+        );
     }
 }

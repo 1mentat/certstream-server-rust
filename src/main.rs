@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 use api::{ApiState, CertificateCache, LogTracker, ServerStats};
 use cli::{CliArgs, VERSION};
-use config::Config;
+use config::{Config, parse_table_uri};
 use ct::{fetch_log_list, WatcherContext};
 use dedup::DedupFilter;
 use health::{deep_health, example_json, health, HealthState};
@@ -84,6 +84,14 @@ async fn main() {
             std::process::exit(1);
         }
 
+        // Validate --staging-path is a valid URI
+        if let Some(ref staging) = cli_args.staging_path {
+            if let Err(e) = parse_table_uri(staging) {
+                eprintln!("Error: invalid --staging-path: {}", e);
+                std::process::exit(1);
+            }
+        }
+
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -113,6 +121,14 @@ async fn main() {
         ) {
             eprintln!("{}", error_msg);
             std::process::exit(1);
+        }
+
+        // Validate --staging-path is a valid URI
+        if let Some(ref staging) = cli_args.staging_path {
+            if let Err(e) = parse_table_uri(staging) {
+                eprintln!("Error: invalid --staging-path: {}", e);
+                std::process::exit(1);
+            }
         }
 
         tracing_subscriber::fmt()
