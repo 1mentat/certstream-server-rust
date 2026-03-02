@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use deltalake::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, ListArray, StringArray, UInt64Array};
+use deltalake::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray, UInt64Array};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::{open_table, DeltaTableError};
@@ -763,21 +763,34 @@ pub async fn run_extract_metadata(
         ))
         .build();
 
-    // Step 7: Iterate through batches and write to output table
+    // Step 7: Iterate through batches, accumulate, and write to output table
     let mut total_records_written: u64 = 0;
     let mut any_rows_seen = false;
+    let mut pending_batches: Vec<RecordBatch> = Vec::new();
+    let mut pending_rows: u64 = 0;
+    let flush_threshold: u64 = config.delta_sink.offline_batch_size as u64;
 
     while let Some(batch_result) = stream.next().await {
         if shutdown.is_cancelled() {
+            // Flush any pending batches before exiting
+            if !pending_batches.is_empty() {
+                if let Ok(_new_table) = DeltaOps(output_table)
+                    .write(pending_batches)
+                    .with_save_mode(SaveMode::Append)
+                    .with_writer_properties(writer_props.clone())
+                    .await
+                {
+                    total_records_written += pending_rows;
+                    info!("Flushed {} records before shutdown", pending_rows);
+                }
+            }
             warn!("metadata extraction interrupted by shutdown signal");
             info!(records_written = total_records_written, "partial extraction left intact at {}", output_path);
             return 1;
         }
 
         let batch = match batch_result {
-            Ok(b) => {
-                b
-            }
+            Ok(b) => b,
             Err(e) => {
                 error!(error = %e, "Error reading batch from stream");
                 return 1;
@@ -786,24 +799,48 @@ pub async fn run_extract_metadata(
 
         if batch.num_rows() > 0 {
             any_rows_seen = true;
-            let batch_records = batch.num_rows() as u64;
+            pending_rows += batch.num_rows() as u64;
+            pending_batches.push(batch);
 
-            // Write the batch to the output table
-            match DeltaOps(output_table)
-                .write(vec![batch])
-                .with_save_mode(SaveMode::Append)
-                .with_writer_properties(writer_props.clone())
-                .await
-            {
-                Ok(new_table) => {
-                    output_table = new_table;
-                    total_records_written += batch_records;
-                    info!("Written {} records", batch_records);
+            // Flush when accumulated enough rows
+            if pending_rows >= flush_threshold {
+                match DeltaOps(output_table)
+                    .write(pending_batches)
+                    .with_save_mode(SaveMode::Append)
+                    .with_writer_properties(writer_props.clone())
+                    .await
+                {
+                    Ok(new_table) => {
+                        output_table = new_table;
+                        total_records_written += pending_rows;
+                        info!("Written {} records (total: {})", pending_rows, total_records_written);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to write batch to output table");
+                        return 1;
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "Failed to write batch to output table");
-                    return 1;
-                }
+                pending_batches = Vec::new();
+                pending_rows = 0;
+            }
+        }
+    }
+
+    // Flush remaining batches
+    if !pending_batches.is_empty() {
+        match DeltaOps(output_table)
+            .write(pending_batches)
+            .with_save_mode(SaveMode::Append)
+            .with_writer_properties(writer_props.clone())
+            .await
+        {
+            Ok(_new_table) => {
+                total_records_written += pending_rows;
+                info!("Written {} records (total: {})", pending_rows, total_records_written);
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to write final batch to output table");
+                return 1;
             }
         }
     }
@@ -1050,6 +1087,7 @@ mod tests {
                 batch_size: 1,
                 flush_interval_secs: 60,
                 compression_level: 9,
+                offline_batch_size: 100000,
             },
             query_api: Default::default(),
             zerobus_sink: Default::default(),

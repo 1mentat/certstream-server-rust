@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-27
-Last context update: 2026-02-27
+Last verified: 2026-03-02
+Last context update: 2026-03-02
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -73,8 +73,9 @@ The binary has five execution modes selected in main.rs:
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
-- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level }`
+- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level, offline_batch_size }`
 - **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge)
+- **Offline batch size**: `offline_batch_size` (usize, default 100000) configurable via `CERTSTREAM_DELTA_SINK_OFFLINE_BATCH_SIZE` env var; controls how many rows are accumulated before each Delta commit in offline operations (extract-metadata); larger values = fewer commits = faster bulk writes
 - **Entry point**: `delta_sink::run_delta_sink(config, rx, shutdown)` spawned in main
 - **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD)
 - **Flush triggers**: batch_size threshold OR flush_interval_secs timer OR graceful shutdown
@@ -181,7 +182,7 @@ The binary has five execution modes selected in main.rs:
 - **Output table creation**: uses `delta_sink::open_or_create_table()` with `metadata_schema()`; creates output directory via `create_dir_all`
 - **Partitioning**: output table partitioned by `seen_date` (inherits from `open_or_create_table` behavior)
 - **Compression**: zstd with `config.delta_sink.compression_level`
-- **Write mode**: `SaveMode::Append`, batch-by-batch from DataFusion stream
+- **Write mode**: `SaveMode::Append`; accumulates DataFusion batches up to `offline_batch_size` rows before each Delta commit to minimize transaction overhead
 - **Exit code**: 0 on success or empty date range; 1 on missing source table, query failure, write failure, invalid date, or shutdown
 - **No records**: if date filter matches zero rows, exits 0
 - **Graceful shutdown**: CancellationToken checked per batch; on cancellation, partial output left intact, exits 1
