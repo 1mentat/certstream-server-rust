@@ -79,6 +79,54 @@ async fn main() {
         return;
     }
 
+    if cli_args.migrate {
+        if cli_args.migrate_output.is_none() {
+            eprintln!("Error: --migrate requires --output <PATH>");
+            std::process::exit(1);
+        }
+
+        // Validate --from and --to date formats if provided
+        if let Some(ref from_date) = cli_args.backfill_from {
+            if let Err(e) = cli::validate_date_format(from_date, "--from") {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        if let Some(ref to_date) = cli_args.to {
+            if let Err(e) = cli::validate_date_format(to_date, "--to") {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+
+        // Compute source path: --source flag or config fallback
+        let source_path = cli_args
+            .migrate_source
+            .unwrap_or_else(|| config.delta_sink.table_path.clone());
+
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            )
+            .init();
+
+        let shutdown_token = CancellationToken::new();
+        spawn_signal_handler(shutdown_token.clone());
+
+        let exit_code = backfill::run_migrate(
+            config,
+            cli_args.migrate_output.unwrap(),
+            source_path,
+            cli_args.backfill_from,
+            cli_args.to,
+            shutdown_token,
+        )
+        .await;
+
+        std::process::exit(exit_code);
+    }
+
     if cli_args.reparse_audit {
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -156,10 +204,22 @@ async fn main() {
     }
 
     if cli_args.backfill {
+        // Parse --from value to u64 for backfill mode
+        let backfill_from: Option<u64> = match &cli_args.backfill_from {
+            Some(s) => match s.parse::<u64>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    eprintln!("Error: --from value '{}' is not a valid integer for backfill mode", s);
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+
         // Validate --sink flag
         if let Err(error_msg) = cli::validate_backfill_sink_command(
             cli_args.backfill_sink.as_deref(),
-            cli_args.backfill_from,
+            backfill_from,
             config.zerobus_sink.enabled,
         ) {
             eprintln!("{}", error_msg);
@@ -179,7 +239,7 @@ async fn main() {
         let exit_code = backfill::run_backfill(
             config,
             cli_args.staging_path,
-            cli_args.backfill_from,
+            backfill_from,
             cli_args.backfill_logs,
             cli_args.backfill_sink,
             shutdown_token,

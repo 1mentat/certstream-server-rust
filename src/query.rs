@@ -667,7 +667,7 @@ mod tests {
             subject_aggregated: "CN=example.com".to_string(),
             issuer_aggregated: "CN=Example CA".to_string(),
             all_domains: domains.iter().map(|s| s.to_string()).collect(),
-            as_der: "".to_string(),
+            as_der: vec![],
             chain: vec![],
         }
     }
@@ -1942,5 +1942,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_query_api_with_binary_as_der_schema() {
+        // Verifies Task 4: Query API works against tables with Binary as_der schema
+        // The Query API excludes as_der from SELECT columns, so the schema change should be transparent
+        // This test creates a table with Binary as_der and verifies queries work correctly
+        let table_path = "/tmp/delta_query_test_binary_as_der";
+        let _ = fs::remove_dir_all(table_path);
+        let _ = fs::create_dir_all(table_path);
+
+        // Create test records with Binary as_der
+        let mut record1 = create_test_cert_record(1, "google", "2026-02-15", vec!["example.com"]);
+        record1.as_der = vec![0x30, 0x82, 0x01, 0x00]; // Binary DER bytes
+        let mut record2 = create_test_cert_record(2, "google", "2026-02-20", vec!["test.com"]);
+        record2.as_der = vec![0x30, 0x82, 0x02, 0x00]; // Different binary DER bytes
+        let records = vec![record1, record2];
+
+        let schema = delta_schema();
+        let mut table = open_or_create_table(table_path, &schema)
+            .await
+            .expect("Failed to create table");
+
+        // Write records with Binary as_der
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+        DeltaOps(table)
+            .write(vec![batch])
+            .await
+            .expect("Failed to write to table");
+
+        // Re-open table for querying
+        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        let ctx = SessionContext::new();
+        ctx.register_table("ct_records", Arc::new(table))
+            .expect("Failed to register table");
+
+        // Execute a simple domain search query (similar to what the Query API does)
+        let sql = "SELECT cert_index, fingerprint, sha256, serial_number, \
+                   subject_aggregated, issuer_aggregated, not_before, not_after, \
+                   all_domains, source_name, seen, is_ca \
+                   FROM ct_records WHERE source_name = 'google' ORDER BY cert_index";
+        let df = ctx.sql(sql).await.expect("Failed to execute query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        assert!(!batches.is_empty(), "Should have results");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2, "Should have 2 records");
+
+        // Verify cert_index values
+        let cert_indices = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("cert_index should be Int64");
+        assert_eq!(cert_indices.value(0), 1);
+        assert_eq!(cert_indices.value(1), 2);
+
+        // Verify fingerprint (first string column)
+        let fingerprints = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("fingerprint should be string");
+        assert_eq!(fingerprints.value(0), "fingerprint_1");
+        assert_eq!(fingerprints.value(1), "fingerprint_2");
+
+        // Verify domains (list column at index 8)
+        let domains = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("all_domains should be list");
+        let domain_list_1 = domains.value(0);
+        let domain_strings_1 = domain_list_1
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("domain strings should be string");
+        assert_eq!(domain_strings_1.value(0), "example.com");
+
+        let domain_list_2 = domains.value(1);
+        let domain_strings_2 = domain_list_2
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("domain strings should be string");
+        assert_eq!(domain_strings_2.value(0), "test.com");
+
+        let _ = fs::remove_dir_all(table_path);
     }
 }

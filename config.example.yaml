@@ -60,7 +60,8 @@ delta_sink:
   batch_size: 10000                 # Records before size-triggered flush (live streaming)
   flush_interval_secs: 30           # Max seconds between flushes
   compression_level: 9              # Zstd compression level (1-22, default 9)
-  offline_batch_size: 100000        # Records per Delta commit for offline operations (extract-metadata)
+  heavy_column_compression_level: 15  # Zstd level for as_der column (1-22, default 15)
+  offline_batch_size: 100000        # Records per Delta commit for offline operations (extract-metadata, migrate)
 
 # Query API for searching certificates in Delta table
 # Provides REST API for querying historical CT records stored in Delta Lake

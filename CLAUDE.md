@@ -24,6 +24,8 @@ Last context update: 2026-03-02
 - `cargo run -- --backfill --staging-path /tmp/staging` - Backfill into staging table
 - `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
 - `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
+- `cargo run -- --migrate --output <PATH>` - Migrate Delta table to new schema
+- `cargo run -- --migrate --output <PATH> --source <SRC> --from <DATE> --to <DATE>` - Migrate with source and date filters
 - `cargo run -- --reparse-audit` - Audit stored certs against current parsing code
 - `cargo run -- --reparse-audit --from-date 2026-02-01 --to-date 2026-02-28` - Audit with date filter
 - `cargo run -- --extract-metadata --output /tmp/metadata` - Extract metadata-only Delta table
@@ -58,12 +60,15 @@ All CT log entries flow through a single `broadcast::channel<Arc<PreSerializedMe
 Consumers (WebSocket, SSE, delta_sink, zerobus_sink) each subscribe independently via `tx.subscribe()`.
 The delta_sink and zerobus_sink are spawned as optional tokio tasks and do not affect other consumers.
 
-The binary has five execution modes selected in main.rs:
+In Delta Lake storage, the `as_der` column is stored as raw binary bytes (not base64-encoded). The WriterProperties builder applies dictionary encoding to low-cardinality columns (update_type, source_name, source_url, signature_algorithm, issuer_aggregated) and skips it for high-cardinality columns (fingerprint, sha256, sha1, serial_number, as_der, subject_aggregated, cert_link), with per-column ZSTD compression using `compression_level` for most columns and `heavy_column_compression_level` for the `as_der` column.
+
+The binary has six execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
 2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
 3. **Merge mode** (`--merge --staging-path <PATH>`): merges a staging Delta table into the main table using Delta MERGE INTO with deduplication, then deletes the staging directory on success
-4. **Reparse audit mode** (`--reparse-audit`): reads stored certificates from the Delta table, reparses each from `as_der`, compares parsed fields against stored values, and prints a mismatch report. Exits 0 on success (even with mismatches), 1 on infrastructure failure or shutdown.
-5. **Metadata extraction mode** (`--extract-metadata --output <PATH>`): reads the source Delta table and writes a 19-column metadata-only Delta table (all columns except `as_der`) to the output path. Exits 0 on success, 1 on failure or shutdown.
+4. **Migrate mode** (`--migrate --output <PATH>`): reads an existing Delta table, converts `as_der` from base64 Utf8 to raw Binary, and writes to a new output table with optimized WriterProperties
+5. **Reparse audit mode** (`--reparse-audit`): reads stored certificates from the Delta table, reparses each from `as_der`, compares parsed fields against stored values, and prints a mismatch report. Exits 0 on success (even with mismatches), 1 on infrastructure failure or shutdown.
+6. **Metadata extraction mode** (`--extract-metadata --output <PATH>`): reads the source Delta table and writes a 19-column metadata-only Delta table (all columns except `as_der`) to the output path. Exits 0 on success, 1 on failure or shutdown.
 
 ## Key Conventions
 - Config structs use serde Deserialize with defaults; env vars override YAML
@@ -73,17 +78,17 @@ The binary has five execution modes selected in main.rs:
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
-- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level, offline_batch_size }`
-- **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge)
-- **Offline batch size**: `offline_batch_size` (usize, default 100000) configurable via `CERTSTREAM_DELTA_SINK_OFFLINE_BATCH_SIZE` env var; controls how many rows are accumulated before each Delta commit in offline operations (extract-metadata); larger values = fewer commits = faster bulk writes
+- **Config**: `DeltaSinkConfig { enabled, table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level, offline_batch_size }`
+- **Compression**: zstd (hardcoded codec, not configurable); `compression_level` (i32, default 9, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL` env var; `heavy_column_compression_level` (i32, default 15, range 1-22) configurable via `CERTSTREAM_DELTA_SINK_HEAVY_COLUMN_COMPRESSION_LEVEL` env var; both validated at startup via `ZstdLevel::try_new()`; applied to all write paths (live sink, backfill, merge) with per-column encoding via WriterProperties
+- **Offline batch size**: `offline_batch_size` (usize, default 100000) configurable via `CERTSTREAM_DELTA_SINK_OFFLINE_BATCH_SIZE` env var; controls how many rows are accumulated before each Delta commit in offline operations (extract-metadata, migrate); larger values = fewer commits = faster bulk writes
 - **Entry point**: `delta_sink::run_delta_sink(config, rx, shutdown)` spawned in main
-- **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD)
+- **Schema**: 20-column Arrow schema, partitioned by `seen_date` (YYYY-MM-DD); `as_der` is `DataType::Binary` (raw DER bytes, not base64)
 - **Flush triggers**: batch_size threshold OR flush_interval_secs timer OR graceful shutdown
 - **Buffer overflow**: if buffer > 2x batch_size, drops oldest half
 - **Error recovery**: failed writes retain buffer for retry; table handle reopened
 - **Non-fatal startup**: if table creation fails, task exits without crashing server
 - **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
-- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `flush_buffer(table, buffer, schema, batch_size, compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `delta_writer_properties(compression_level, heavy_column_compression_level)`, `flush_buffer(table, buffer, schema, batch_size, compression_level, heavy_column_compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
 
 ## ZeroBus Sink Contracts
 - **Disabled by default** (`zerobus_sink.enabled = false`)
@@ -98,7 +103,7 @@ The binary has five execution modes selected in main.rs:
 - **Wire format**: Protobuf `CertRecord` (20 fields mirroring `DeltaCertRecord`), compiled from `proto/cert_record.proto` via `build.rs`
 - **Conversion**: `proto::CertRecord::from_delta_cert(&DeltaCertRecord)` maps all 20 fields
 - **Descriptor**: `cert_record_descriptor_proto()` returns `DescriptorProto` from compiled file descriptor set for SDK `TableProperties`
-- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` -> encodes to protobuf bytes -> ingests via ZeroBus SDK
+- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` (base64-encoding `as_der` bytes back to string for protobuf wire format) -> encodes to protobuf bytes -> ingests via ZeroBus SDK
 - **Error handling**: retryable errors recreate the stream and retry the record once; non-retryable errors skip the record; failed stream recreation exits the sink
 - **Non-fatal startup**: if SDK or stream creation fails, task exits without crashing server
 - **Graceful shutdown**: flushes and closes the stream on CancellationToken
@@ -127,8 +132,12 @@ The binary has five execution modes selected in main.rs:
 - **Metrics**: `certstream_query_requests` (counter, labeled by status), `certstream_query_duration_seconds` (histogram), `certstream_query_results_count` (histogram)
 - **Reads from**: same Delta table written by delta_sink and backfill
 
+## CLI Shared Flag Contracts
+- **`--from` dual purpose**: stored as raw `String` in `CliArgs.backfill_from`; interpreted as u64 integer in backfill mode (parsed at dispatch site in `main.rs`), as YYYY-MM-DD date in migrate mode (validated via `validate_date_format()`)
+- **`validate_date_format(date, flag_name)`**: public helper in `cli.rs`; validates YYYY-MM-DD format with year 2000-2099, month 01-12, day 01-31; does NOT validate days-per-month (e.g., Feb 31 passes); returns `Result<(), String>`
+
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start; `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
 - **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
@@ -157,6 +166,21 @@ The binary has five execution modes selected in main.rs:
 - **Staging cleanup**: on successful merge, the staging directory is deleted via `remove_dir_all`; cleanup failure is non-fatal (logged as warning)
 - **Error handling**: any failure during merge leaves staging intact for retry and exits with code 1
 - **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (staging left intact)
+
+## Migrate Contracts
+- **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--source <PATH>` overrides source table (default: `config.delta_sink.table_path`); `--from <DATE>` start date filter (YYYY-MM-DD, inclusive); `--to <DATE>` end date filter (YYYY-MM-DD, inclusive); `--migrate` without `--output` exits with error; `--from` and `--to` validated via `cli::validate_date_format()` at dispatch
+- **Entry point**: `backfill::run_migrate(config, output_path, source_path, from_date, to_date, shutdown)` called from main, returns exit code (i32)
+- **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
+- **Source table**: reads from `source_path` parameter; defaults to `config.delta_sink.table_path` when `--source` is not provided; if source table cannot be opened, exits with code 1
+- **Output table**: created at `output_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
+- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially; within each partition, data is streamed via `execute_stream()` (one RecordBatch at a time) to avoid OOM on large partitions; batches are accumulated up to `offline_batch_size` rows before each Delta commit
+- **Partition filtering**: when `--from` is provided, partitions with `seen_date < from` are skipped; when `--to` is provided, partitions with `seen_date > to` are skipped; filters are inclusive and applied via lexicographic string comparison
+- **as_der conversion**: base64-decodes each Utf8 string to raw bytes; decode failures produce null values and are logged as warnings (non-fatal)
+- **Column alignment**: source columns are matched by name (not index) and cast to target types if needed, handling DataFusion column reordering
+- **WriterProperties**: applies `delta_writer_properties(compression_level, heavy_column_compression_level)` to all writes
+- **Empty source**: if source table has no partitions or no partitions match filters, exits with code 0
+- **Graceful shutdown**: CancellationToken checked between partitions; if cancelled, exits with code 1
+- **Error handling**: any failure (table open, query, write) exits with code 1
 
 ## Reparse Audit Contracts
 - **CLI flags**: `--reparse-audit` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date

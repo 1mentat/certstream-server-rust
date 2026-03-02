@@ -6,6 +6,7 @@
 //! - DescriptorProto extraction for ZeroBus SDK integration
 //! - A live streaming sink that forwards certificate records to Databricks via ZeroBus SDK
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use crate::config::ZerobusSinkConfig;
 use crate::delta_sink::DeltaCertRecord;
 use crate::models::PreSerializedMessage;
@@ -46,7 +47,7 @@ impl proto::CertRecord {
             subject_aggregated: record.subject_aggregated.clone(),
             issuer_aggregated: record.issuer_aggregated.clone(),
             all_domains: record.all_domains.clone(),
-            as_der: record.as_der.clone(),
+            as_der: STANDARD.encode(&record.as_der),
             chain: record.chain.clone(),
         }
     }
@@ -273,7 +274,7 @@ mod tests {
             subject_aggregated: "CN=example.com".to_string(),
             issuer_aggregated: "CN=Let's Encrypt".to_string(),
             all_domains: vec!["example.com".to_string(), "www.example.com".to_string()],
-            as_der: "base64_encoded_der_data".to_string(),
+            as_der: vec![1u8, 2, 3],
             chain: vec!["cert1".to_string(), "cert2".to_string()],
         }
     }
@@ -308,7 +309,8 @@ mod tests {
             cert_record.all_domains,
             vec!["example.com", "www.example.com"]
         );
-        assert_eq!(cert_record.as_der, "base64_encoded_der_data");
+        // Verify as_der is base64-encoded (vec![1, 2, 3] encodes to "AQID")
+        assert_eq!(cert_record.as_der, STANDARD.encode(&[1u8, 2, 3]));
         assert_eq!(cert_record.chain, vec!["cert1", "cert2"]);
     }
 
