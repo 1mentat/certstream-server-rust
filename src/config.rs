@@ -299,6 +299,8 @@ pub struct DeltaSinkConfig {
     pub compression_level: i32,
     #[serde(default = "default_delta_sink_heavy_column_compression_level")]
     pub heavy_column_compression_level: i32,
+    #[serde(default = "default_delta_sink_offline_batch_size")]
+    pub offline_batch_size: usize,
 }
 
 impl Default for DeltaSinkConfig {
@@ -310,6 +312,7 @@ impl Default for DeltaSinkConfig {
             flush_interval_secs: default_delta_sink_flush_interval_secs(),
             compression_level: default_delta_sink_compression_level(),
             heavy_column_compression_level: default_delta_sink_heavy_column_compression_level(),
+            offline_batch_size: default_delta_sink_offline_batch_size(),
         }
     }
 }
@@ -332,6 +335,10 @@ fn default_delta_sink_compression_level() -> i32 {
 
 fn default_delta_sink_heavy_column_compression_level() -> i32 {
     15
+}
+
+fn default_delta_sink_offline_batch_size() -> usize {
+    100000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -629,6 +636,9 @@ impl Config {
         }
         if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_HEAVY_COLUMN_COMPRESSION_LEVEL") {
             delta_sink.heavy_column_compression_level = v.parse().unwrap_or(delta_sink.heavy_column_compression_level);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_OFFLINE_BATCH_SIZE") {
+            delta_sink.offline_batch_size = v.parse().unwrap_or(delta_sink.offline_batch_size);
         }
 
         let mut query_api = yaml_config.query_api.unwrap_or_default();

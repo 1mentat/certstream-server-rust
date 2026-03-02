@@ -13,6 +13,7 @@ mod query;
 mod rate_limit;
 mod sse;
 mod state;
+mod table_ops;
 mod websocket;
 mod zerobus_sink;
 
@@ -119,6 +120,56 @@ async fn main() {
             source_path,
             cli_args.backfill_from,
             cli_args.to,
+            shutdown_token,
+        )
+        .await;
+
+        std::process::exit(exit_code);
+    }
+
+    if cli_args.reparse_audit {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            )
+            .init();
+
+        let shutdown_token = CancellationToken::new();
+        spawn_signal_handler(shutdown_token.clone());
+
+        let (exit_code, _report) = table_ops::run_reparse_audit(
+            config,
+            cli_args.from_date,
+            cli_args.to_date,
+            shutdown_token,
+        )
+        .await;
+
+        std::process::exit(exit_code);
+    }
+
+    if cli_args.extract_metadata {
+        if cli_args.output_path.is_none() {
+            eprintln!("Error: --extract-metadata requires --output <PATH>");
+            std::process::exit(1);
+        }
+
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            )
+            .init();
+
+        let shutdown_token = CancellationToken::new();
+        spawn_signal_handler(shutdown_token.clone());
+
+        let exit_code = table_ops::run_extract_metadata(
+            config,
+            cli_args.output_path.unwrap(),
+            cli_args.from_date,
+            cli_args.to_date,
             shutdown_token,
         )
         .await;
