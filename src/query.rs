@@ -6,8 +6,9 @@ use axum::{Json, Router};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
-use deltalake::DeltaTableError;
+use deltalake::{DeltaTableError, DeltaTableBuilder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -51,6 +52,7 @@ enum DomainSearchMode {
 
 pub struct QueryApiState {
     pub config: QueryApiConfig,
+    pub storage_options: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,7 +201,12 @@ async fn handle_query_certs(
         match decode_cursor(cursor_str) {
             Ok(cursor) => {
                 // Open table at cursor version
-                match deltalake::open_table_with_version(&state.config.table_path, cursor.v).await {
+                match DeltaTableBuilder::from_uri(&state.config.table_path)
+                    .with_storage_options(state.storage_options.clone())
+                    .with_version(cursor.v)
+                    .load()
+                    .await
+                {
                     Ok(t) => {
                         let v = t.version();
                         (t, v, Some(cursor))
@@ -227,7 +234,11 @@ async fn handle_query_certs(
         }
     } else {
         // No cursor — open latest version
-        match deltalake::open_table(&state.config.table_path).await {
+        match DeltaTableBuilder::from_uri(&state.config.table_path)
+            .with_storage_options(state.storage_options.clone())
+            .load()
+            .await
+        {
             Ok(t) => {
                 let v = t.version();
                 (t, v, None)
@@ -627,7 +638,12 @@ mod tests {
     ) -> CursorDecodeResult {
         match decode_cursor(cursor_str) {
             Ok(cursor) => {
-                match deltalake::open_table_with_version(table_path, cursor.v).await {
+                match DeltaTableBuilder::from_uri(table_path)
+                    .with_storage_options(HashMap::new())
+                    .with_version(cursor.v)
+                    .load()
+                    .await
+                {
                     Ok(table) => CursorDecodeResult::Success(table.version()),
                     Err(_) => CursorDecodeResult::ExpiredCursor,
                 }
@@ -702,7 +718,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -761,7 +781,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -845,7 +869,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -891,7 +919,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let version = table.version();
 
         // Version should be >= 0
@@ -905,7 +937,10 @@ mod tests {
         let table_path = "/tmp/delta_query_test_nonexistent/nonexistent";
 
         // Try to open a table that doesn't exist and was never created
-        let result = deltalake::open_table(table_path).await;
+        let result = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await;
 
         // Should fail with NotATable or InvalidTableLocation error
         match result {
@@ -1127,7 +1162,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1187,7 +1226,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1247,7 +1290,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1304,7 +1351,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1361,7 +1412,11 @@ mod tests {
             .await
             .expect("Failed to write to table");
 
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1450,7 +1505,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1509,7 +1568,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let version = table.version();
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
@@ -1586,7 +1649,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let _version = table.version();
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
@@ -1650,7 +1717,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1749,7 +1820,11 @@ mod tests {
         }
 
         // Also verify that deltalake::open_table_with_version fails for non-existent version
-        let direct_open = deltalake::open_table_with_version(table_path, 999999).await;
+        let direct_open = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .with_version(999999)
+            .load()
+            .await;
         assert!(direct_open.is_err(), "Expected error when opening non-existent version");
 
         let _ = fs::remove_dir_all(table_path);
@@ -1781,7 +1856,11 @@ mod tests {
             .expect("Failed to write to table");
 
         // Re-open table for querying
-        table = deltalake::open_table(table_path).await.expect("Failed to reopen table");
+        table = DeltaTableBuilder::from_uri(table_path)
+            .with_storage_options(HashMap::new())
+            .load()
+            .await
+            .expect("Failed to reopen table");
         let ctx = SessionContext::new();
         ctx.register_table("ct_records", Arc::new(table))
             .expect("Failed to register table");
@@ -1858,7 +1937,10 @@ mod tests {
         config.table_path = table_path.to_string();
         config.query_timeout_secs = 0;
 
-        let state = Arc::new(QueryApiState { config });
+        let state = Arc::new(QueryApiState {
+            config,
+            storage_options: HashMap::new(),
+        });
         let app = query_api_router(state);
 
         let response = app
@@ -1898,7 +1980,10 @@ mod tests {
         config.table_path = table_path.to_string();
         config.query_timeout_secs = 30;
 
-        let state = Arc::new(QueryApiState { config });
+        let state = Arc::new(QueryApiState {
+            config,
+            storage_options: HashMap::new(),
+        });
         let app = query_api_router(state);
 
         // Request with invalid Base64 cursor
@@ -1928,7 +2013,10 @@ mod tests {
         config.table_path = table_path.to_string();
         config.query_timeout_secs = 30;
 
-        let state = Arc::new(QueryApiState { config });
+        let state = Arc::new(QueryApiState {
+            config,
+            storage_options: HashMap::new(),
+        });
         let app = query_api_router(state);
 
         // Request with any filter to a nonexistent table
