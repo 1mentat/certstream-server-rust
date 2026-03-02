@@ -241,7 +241,8 @@ pub async fn open_or_create_table(
     storage_options: HashMap<String, String>,
 ) -> Result<DeltaTable, DeltaTableError> {
     // First, try to open an existing table
-    match DeltaTableBuilder::from_uri(table_path)
+    // Use from_valid_uri() which returns Result instead of from_uri() which panics on invalid paths
+    match DeltaTableBuilder::from_valid_uri(table_path)?
         .with_storage_options(storage_options.clone())
         .load()
         .await
