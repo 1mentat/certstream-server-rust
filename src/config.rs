@@ -405,6 +405,28 @@ impl Default for ZerobusSinkConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct S3StorageConfig {
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub conditional_put: Option<String>,
+    #[serde(default)]
+    pub allow_http: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub s3: Option<S3StorageConfig>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -430,6 +452,7 @@ pub struct Config {
     pub delta_sink: DeltaSinkConfig,
     pub query_api: QueryApiConfig,
     pub zerobus_sink: ZerobusSinkConfig,
+    pub storage: StorageConfig,
     pub config_path: Option<String>,
 }
 
@@ -466,6 +489,8 @@ struct YamlConfig {
     query_api: Option<QueryApiConfig>,
     #[serde(default)]
     zerobus_sink: Option<ZerobusSinkConfig>,
+    #[serde(default)]
+    storage: Option<StorageConfig>,
 }
 
 struct YamlConfigWithPath {
@@ -661,6 +686,44 @@ impl Config {
             zerobus_sink.max_inflight_records = v.parse().unwrap_or(zerobus_sink.max_inflight_records);
         }
 
+        let mut storage = yaml_config.storage.unwrap_or_default();
+        if let Some(ref mut s3) = storage.s3 {
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT") {
+                s3.endpoint = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_REGION") {
+                s3.region = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID") {
+                s3.access_key_id = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY") {
+                s3.secret_access_key = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT") {
+                s3.conditional_put = Some(v);
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP") {
+                s3.allow_http = v.parse().ok();
+            }
+        } else {
+            // If no s3 section in YAML, check if env vars want to create one.
+            // CERTSTREAM_STORAGE_S3_ENDPOINT is the trigger: if it's empty or unset,
+            // no S3 config is created even if other S3 env vars are set.
+            // This is intentional — endpoint is required for any S3 operation.
+            let endpoint = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT").unwrap_or_default();
+            if !endpoint.is_empty() {
+                storage.s3 = Some(S3StorageConfig {
+                    endpoint,
+                    region: env::var("CERTSTREAM_STORAGE_S3_REGION").unwrap_or_default(),
+                    access_key_id: env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID").unwrap_or_default(),
+                    secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+                    conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
+                    allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+                });
+            }
+        }
+
         Self {
             host,
             port,
@@ -681,6 +744,7 @@ impl Config {
             delta_sink,
             query_api,
             zerobus_sink,
+            storage,
             config_path,
         }
     }
@@ -874,6 +938,7 @@ mod tests {
             delta_sink: DeltaSinkConfig::default(),
             query_api: QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
+            storage: StorageConfig::default(),
             config_path: None,
         }
     }
