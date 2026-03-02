@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::net::IpAddr;
@@ -425,6 +426,95 @@ pub struct S3StorageConfig {
 pub struct StorageConfig {
     #[serde(default)]
     pub s3: Option<S3StorageConfig>,
+}
+
+/// Represents the location of a table (local filesystem or S3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableLocation {
+    /// Local filesystem path.
+    Local { path: String },
+    /// S3 URI.
+    S3 { uri: String },
+}
+
+/// Parses a table URI and returns the corresponding TableLocation.
+///
+/// Supported schemes:
+/// - `file://` — local filesystem (absolute or relative paths)
+/// - `s3://` — S3-compatible storage
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The URI is empty
+/// - The URI uses an unsupported scheme
+/// - The URI is a bare path (suggests using `file://` prefix)
+pub fn parse_table_uri(uri: &str) -> Result<TableLocation, String> {
+    if uri.is_empty() {
+        return Err("Table path cannot be empty".to_string());
+    }
+
+    if let Some(path) = uri.strip_prefix("file://") {
+        Ok(TableLocation::Local {
+            path: path.to_string(),
+        })
+    } else if uri.starts_with("s3://") {
+        Ok(TableLocation::S3 {
+            uri: uri.to_string(),
+        })
+    } else if uri.contains("://") {
+        let scheme = uri.split("://").next().unwrap_or("");
+        Err(format!(
+            "Unsupported URI scheme '{}://'. Supported schemes: file://, s3://",
+            scheme
+        ))
+    } else {
+        Err(format!(
+            "Table path '{}' must use a URI scheme. Use 'file://{}' for local filesystem paths",
+            uri, uri
+        ))
+    }
+}
+
+/// Resolves storage options for a given TableLocation and StorageConfig.
+///
+/// Returns a HashMap of storage options suitable for use with Delta Lake or similar APIs:
+/// - For Local locations: returns an empty HashMap
+/// - For S3 locations: returns AWS-compatible options (AWS_ENDPOINT_URL, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, conditional_put, AWS_ALLOW_HTTP)
+pub fn resolve_storage_options(
+    location: &TableLocation,
+    storage: &StorageConfig,
+) -> HashMap<String, String> {
+    match location {
+        TableLocation::Local { .. } => HashMap::new(),
+        TableLocation::S3 { .. } => {
+            let mut opts = HashMap::new();
+            if let Some(ref s3) = storage.s3 {
+                if !s3.endpoint.is_empty() {
+                    opts.insert("AWS_ENDPOINT_URL".to_string(), s3.endpoint.clone());
+                }
+                if !s3.region.is_empty() {
+                    opts.insert("AWS_REGION".to_string(), s3.region.clone());
+                }
+                if !s3.access_key_id.is_empty() {
+                    opts.insert("AWS_ACCESS_KEY_ID".to_string(), s3.access_key_id.clone());
+                }
+                if !s3.secret_access_key.is_empty() {
+                    opts.insert(
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        s3.secret_access_key.clone(),
+                    );
+                }
+                if let Some(ref cp) = s3.conditional_put {
+                    opts.insert("conditional_put".to_string(), cp.clone());
+                }
+                if let Some(allow) = s3.allow_http {
+                    opts.insert("AWS_ALLOW_HTTP".to_string(), allow.to_string());
+                }
+            }
+            opts
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -1751,5 +1841,182 @@ s3:
             env::remove_var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID");
         }
         assert!(storage.s3.is_none());
+    }
+
+    // Task 4: Tests for parse_table_uri() and resolve_storage_options()
+    // Verifies uri-storage.AC1.1
+    #[test]
+    fn test_parse_table_uri_absolute_path() {
+        let result = parse_table_uri("file:///absolute/path");
+        assert_eq!(
+            result,
+            Ok(TableLocation::Local {
+                path: "/absolute/path".to_string()
+            })
+        );
+    }
+
+    // Verifies uri-storage.AC1.2
+    #[test]
+    fn test_parse_table_uri_relative_path() {
+        let result = parse_table_uri("file://./relative/path");
+        assert_eq!(
+            result,
+            Ok(TableLocation::Local {
+                path: "./relative/path".to_string()
+            })
+        );
+    }
+
+    // Verifies uri-storage.AC1.3
+    #[test]
+    fn test_parse_table_uri_s3() {
+        let result = parse_table_uri("s3://bucket/prefix");
+        assert_eq!(
+            result,
+            Ok(TableLocation::S3 {
+                uri: "s3://bucket/prefix".to_string()
+            })
+        );
+    }
+
+    // Verifies uri-storage.AC1.4
+    #[test]
+    fn test_parse_table_uri_bare_path() {
+        let result = parse_table_uri("./data/certstream");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("file://"));
+        assert!(err_msg.contains("./data/certstream"));
+    }
+
+    // Verifies uri-storage.AC1.5
+    #[test]
+    fn test_parse_table_uri_unsupported_scheme() {
+        let result = parse_table_uri("gcs://bucket/path");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("Unsupported URI scheme"));
+        assert!(err_msg.contains("gcs"));
+        assert!(err_msg.contains("file://"));
+        assert!(err_msg.contains("s3://"));
+    }
+
+    // Verifies uri-storage.AC1.6
+    #[test]
+    fn test_parse_table_uri_empty_string() {
+        let result = parse_table_uri("");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("cannot be empty"));
+    }
+
+    // Test resolve_storage_options with Local location
+    #[test]
+    fn test_resolve_storage_options_local() {
+        let location = TableLocation::Local {
+            path: "/tmp/data".to_string(),
+        };
+        let storage = StorageConfig::default();
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(opts.is_empty());
+    }
+
+    // Test resolve_storage_options with S3 location and full config
+    #[test]
+    fn test_resolve_storage_options_s3_full() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                conditional_put: Some("etag".to_string()),
+                allow_http: Some(false),
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL"),
+            Some(&"https://s3.example.com".to_string())
+        );
+        assert_eq!(opts.get("AWS_REGION"), Some(&"us-east-1".to_string()));
+        assert_eq!(
+            opts.get("AWS_ACCESS_KEY_ID"),
+            Some(&"AKIAIOSFODNN7EXAMPLE".to_string())
+        );
+        assert_eq!(
+            opts.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string())
+        );
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+        assert_eq!(opts.get("AWS_ALLOW_HTTP"), Some(&"false".to_string()));
+    }
+
+    // Test resolve_storage_options with S3 location but no S3 config
+    #[test]
+    fn test_resolve_storage_options_s3_no_config() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig::default(); // s3: None
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(opts.is_empty());
+    }
+
+    // Test resolve_storage_options with S3 location and conditional_put set
+    #[test]
+    fn test_resolve_storage_options_s3_conditional_put() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: String::new(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                conditional_put: Some("etag".to_string()),
+                allow_http: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL"),
+            Some(&"https://s3.example.com".to_string())
+        );
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+        // Other fields are empty so should not be in the map
+        assert!(!opts.contains_key("AWS_REGION"));
+    }
+
+    // Test resolve_storage_options with S3 location and allow_http true
+    #[test]
+    fn test_resolve_storage_options_s3_allow_http() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "http://localhost:9000".to_string(),
+                region: String::new(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                conditional_put: None,
+                allow_http: Some(true),
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL"),
+            Some(&"http://localhost:9000".to_string())
+        );
+        assert_eq!(opts.get("AWS_ALLOW_HTTP"), Some(&"true".to_string()));
     }
 }
