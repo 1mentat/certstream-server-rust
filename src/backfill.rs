@@ -8,7 +8,8 @@ use crate::zerobus_sink::{cert_record_descriptor_proto, proto};
 use databricks_zerobus_ingest_sdk::{StreamConfigurationOptions, TableProperties, ZerobusSdk};
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, DeltaTableError};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, DeltaTableError, ObjectStore as _, Path};
+use futures::{StreamExt, TryStreamExt};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use prost::Message;
@@ -955,6 +956,74 @@ pub async fn run_backfill(
     }
 }
 
+/// Remove all objects under a staging path. For local paths, uses std::fs::remove_dir_all.
+/// For S3 paths, lists and deletes all objects under the prefix via object_store APIs.
+async fn cleanup_staging(staging_path: &str, storage_options: &HashMap<String, String>) {
+    if staging_path.starts_with("s3://") {
+        // S3 cleanup: list all objects and delete them
+        match DeltaTableBuilder::from_uri(staging_path)
+            .with_storage_options(storage_options.clone())
+            .build()
+        {
+            Ok(table) => {
+                let store = table.object_store();
+                // DeltaTableBuilder::build() returns a table whose object_store() is
+                // already scoped to the table prefix within the S3 bucket.
+                // Passing None lists all objects under that prefix.
+                let objects: Vec<Path> = match store
+                    .list(None)
+                    .map_ok(|meta| meta.location)
+                    .try_collect()
+                    .await
+                {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        warn!(error = %e, staging_path = %staging_path, "failed to list staging objects for cleanup");
+                        return;
+                    }
+                };
+
+                if objects.is_empty() {
+                    info!(staging_path = %staging_path, "no staging objects to clean up");
+                    return;
+                }
+
+                let count = objects.len();
+                let path_stream = futures::stream::iter(objects.into_iter().map(Ok));
+                let results: Vec<_> = store
+                    .delete_stream(Box::pin(path_stream))
+                    .collect::<Vec<_>>()
+                    .await;
+
+                let errors: Vec<_> = results.iter().filter(|r: &&Result<_, _>| r.is_err()).collect();
+                if errors.is_empty() {
+                    info!(staging_path = %staging_path, objects_deleted = count, "S3 staging objects deleted");
+                } else {
+                    warn!(
+                        staging_path = %staging_path,
+                        errors = errors.len(),
+                        total = count,
+                        "some S3 staging objects failed to delete"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, staging_path = %staging_path, "failed to build table for staging cleanup");
+            }
+        }
+    } else {
+        // Local cleanup
+        match std::fs::remove_dir_all(staging_path) {
+            Ok(_) => {
+                info!(staging_path = %staging_path, "staging directory deleted");
+            }
+            Err(e) => {
+                warn!(error = %e, staging_path = %staging_path, "failed to delete staging directory");
+            }
+        }
+    }
+}
+
 /// Merge mode: merges staging table into main table via Delta MERGE INTO deduplication.
 ///
 /// Reads all staging records as RecordBatches, converts each to a DataFrame, and merges
@@ -980,8 +1049,30 @@ pub async fn run_merge(
 
     let schema = delta_schema();
 
+    // Parse URIs and resolve storage options for both main and staging paths.
+    // Bare paths (without scheme) are treated as local filesystem paths.
+    let main_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(_) => {
+            // Treat as local path if URI parsing fails (backward compatibility with bare paths)
+            HashMap::new()
+        }
+    };
+
+    let staging_storage_options = match parse_table_uri(&staging_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(_) => {
+            // Treat as local path if URI parsing fails (backward compatibility with bare paths)
+            HashMap::new()
+        }
+    };
+
     // Open staging table
-    let staging_table = match deltalake::open_table(&staging_path).await {
+    let staging_table = match DeltaTableBuilder::from_uri(&staging_path)
+        .with_storage_options(staging_storage_options.clone())
+        .load()
+        .await
+    {
         Ok(t) => t,
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             info!(staging_path = %staging_path, "staging table does not exist, nothing to merge");
@@ -994,7 +1085,7 @@ pub async fn run_merge(
     };
 
     // Open or create main table
-    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema, HashMap::new()).await {
+    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema, main_storage_options.clone()).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "failed to open main table");
@@ -1142,16 +1233,8 @@ pub async fn run_merge(
         "merge complete"
     );
 
-    // Delete staging directory on success (AC3.4)
-    match std::fs::remove_dir_all(&staging_path) {
-        Ok(_) => {
-            info!(staging_path = %staging_path, "staging directory deleted");
-        }
-        Err(e) => {
-            warn!(error = %e, staging_path = %staging_path, "failed to delete staging directory");
-            // Non-fatal — merge succeeded, staging cleanup failed
-        }
-    }
+    // Delete staging directory/objects on success (AC3.4)
+    cleanup_staging(&staging_path, &staging_storage_options).await;
 
     0
 }
