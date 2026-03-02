@@ -2570,6 +2570,7 @@ mod tests {
                 batch_size: 100,
                 flush_interval_secs: 60,
                 compression_level: 9,
+                offline_batch_size: 100000,
             },
             query_api: crate::config::QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
