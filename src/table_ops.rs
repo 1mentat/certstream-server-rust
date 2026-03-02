@@ -1087,6 +1087,7 @@ mod tests {
                 batch_size: 1,
                 flush_interval_secs: 60,
                 compression_level: 9,
+                heavy_column_compression_level: 15,
                 offline_batch_size: 100000,
             },
             query_api: Default::default(),
@@ -1122,7 +1123,7 @@ mod tests {
             subject_aggregated: leaf.subject.aggregated.as_deref().unwrap_or("").to_string(),
             issuer_aggregated: leaf.issuer.aggregated.as_deref().unwrap_or("").to_string(),
             all_domains: leaf.all_domains.to_vec(),
-            as_der: STANDARD.encode(der_bytes),
+            as_der: der_bytes.to_vec(),
             chain: vec![],
         }
     }
@@ -1254,8 +1255,8 @@ mod tests {
         let (_, leaf) = create_test_cert();
         let mut record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &[0xFF], &leaf);
 
-        // Set invalid base64 in as_der field
-        record.as_der = "not_valid_base64!!!".to_string();
+        // Set invalid/garbage bytes in as_der field (not a valid DER certificate)
+        record.as_der = b"not_valid_der!!!".to_vec();
 
         write_test_records(test_dir, vec![record]).await;
 
@@ -1279,7 +1280,7 @@ mod tests {
         let mut record = create_record_from_leaf(1, "https://ct.example.com/log1".to_string(), "2026-02-27".to_string(), &[0xFF], &leaf);
 
         // Set garbage bytes that parse_certificate will reject
-        record.as_der = STANDARD.encode(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        record.as_der = vec![0xFF, 0xFF, 0xFF, 0xFF];
 
         write_test_records(test_dir, vec![record]).await;
 

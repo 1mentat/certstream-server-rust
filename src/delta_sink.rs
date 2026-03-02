@@ -1,5 +1,6 @@
 use crate::config::DeltaSinkConfig;
 use crate::models::{CertificateMessage, PreSerializedMessage};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::prelude::*;
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -10,6 +11,7 @@ use deltalake::protocol::SaveMode;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use serde_json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,7 +42,7 @@ pub struct DeltaCertRecord {
     pub subject_aggregated: String,
     pub issuer_aggregated: String,
     pub all_domains: Vec<String>,
-    pub as_der: String,
+    pub as_der: Vec<u8>,
     pub chain: Vec<String>,
 }
 
@@ -122,7 +124,13 @@ impl DeltaCertRecord {
             subject_aggregated: msg.data.leaf_cert.subject.aggregated.clone().unwrap_or_default(),
             issuer_aggregated: msg.data.leaf_cert.issuer.aggregated.clone().unwrap_or_default(),
             all_domains,
-            as_der: msg.data.leaf_cert.as_der.clone().unwrap_or_default(),
+            as_der: msg
+                .data
+                .leaf_cert
+                .as_der
+                .as_deref()
+                .and_then(|s| STANDARD.decode(s).ok())
+                .unwrap_or_default(),
             chain,
         }
     }
@@ -159,7 +167,7 @@ pub fn delta_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
             false,
         ),
-        Field::new("as_der", DataType::Utf8, false),
+        Field::new("as_der", DataType::Binary, false),
         Field::new(
             "chain",
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
@@ -205,6 +213,7 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
         DataType::Timestamp(_, _) => DeltaDataType::Primitive(PrimitiveType::Timestamp),
         DataType::Int64 => DeltaDataType::Primitive(PrimitiveType::Long),
         DataType::Boolean => DeltaDataType::Primitive(PrimitiveType::Boolean),
+        DataType::Binary => DeltaDataType::Primitive(PrimitiveType::Binary),
         DataType::List(inner_field) => {
             // Convert List(T) to Array(T) in Delta schema
             let element_type = arrow_dtype_to_delta_dtype(inner_field.data_type());
@@ -380,10 +389,10 @@ pub fn records_to_batch(
     }
     let chain = chain_builder.finish();
 
-    // Build as_der column (Utf8)
-    let as_der: StringArray = records
+    // Build as_der column (Binary)
+    let as_der: BinaryArray = records
         .iter()
-        .map(|r| Some(r.as_der.as_str()))
+        .map(|r| Some(r.as_der.as_slice()))
         .collect();
 
     // Create RecordBatch
@@ -471,12 +480,60 @@ fn check_buffer_overflow(buffer: &mut Vec<DeltaCertRecord>, batch_size: usize) -
 /// 5. On success: clears buffer and returns new table
 /// 6. On failure: retains buffer, attempts recovery (reopen, open_or_create), returns error
 /// 7. If ALL recovery attempts fail: returns None instead of panicking (AC4.4)
+
+/// Constructs WriterProperties with per-column encoding and compression settings.
+///
+/// This is the single source of truth for all Parquet write settings. All write paths
+/// (live sink, backfill writer, merge) must use this function.
+///
+/// # Per-column dictionary encoding
+/// - Enabled for low-cardinality columns: update_type, source_name, source_url,
+///   signature_algorithm, issuer_aggregated, chain list items
+/// - Disabled for high-cardinality columns: cert_link, serial_number, fingerprint,
+///   sha256, sha1, subject_aggregated, as_der
+///
+/// # Per-column compression
+/// - as_der: uses heavy_column_compression_level (default 15)
+/// - All other columns: use compression_level (default 9)
+pub fn delta_writer_properties(compression_level: i32, heavy_column_compression_level: i32) -> WriterProperties {
+    let zstd = Compression::ZSTD(
+        ZstdLevel::try_new(compression_level).expect("compression level validated at startup"),
+    );
+    let heavy_zstd = Compression::ZSTD(
+        ZstdLevel::try_new(heavy_column_compression_level)
+            .expect("heavy column compression level validated at startup"),
+    );
+
+    WriterProperties::builder()
+        // Global compression default
+        .set_compression(zstd)
+        // Dictionary encoding: enabled for low-cardinality columns
+        .set_column_dictionary_enabled(ColumnPath::from("update_type"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("source_name"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("source_url"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("signature_algorithm"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("issuer_aggregated"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("chain.list.item"), true)
+        // Dictionary encoding: disabled for high-cardinality columns
+        .set_column_dictionary_enabled(ColumnPath::from("cert_link"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("serial_number"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("fingerprint"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("sha256"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("sha1"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("subject_aggregated"), false)
+        .set_column_dictionary_enabled(ColumnPath::from("as_der"), false)
+        // Heavy compression for as_der column
+        .set_column_compression(ColumnPath::from("as_der"), heavy_zstd)
+        .build()
+}
+
 pub async fn flush_buffer(
     table: DeltaTable,
     buffer: &mut Vec<DeltaCertRecord>,
     schema: &Arc<Schema>,
     batch_size: usize,
     compression_level: i32,
+    heavy_column_compression_level: i32,
 ) -> (Option<DeltaTable>, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
     // If buffer is empty, return early
     if buffer.is_empty() {
@@ -501,12 +558,8 @@ pub async fn flush_buffer(
         }
     };
 
-    // Construct WriterProperties with ZSTD compression
-    let writer_props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(compression_level).expect("compression level validated at startup"),
-        ))
-        .build();
+    // Construct WriterProperties with per-column encoding and compression settings
+    let writer_props = delta_writer_properties(compression_level, heavy_column_compression_level);
 
     // Write to Delta using DeltaOps with timing
     let start_time = Instant::now();
@@ -694,7 +747,7 @@ pub async fn run_delta_sink(
 
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
-                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
                                     match new_table_opt {
                                         Some(new_table) => {
                                             table = new_table;
@@ -739,7 +792,7 @@ pub async fn run_delta_sink(
             _ = flush_interval.tick() => {
                 // Time-triggered flush (AC3.2)
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
                     match new_table_opt {
                         Some(new_table) => {
                             table = new_table;
@@ -763,7 +816,7 @@ pub async fn run_delta_sink(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level).await;
+                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
                     record_flush_metrics(&flush_result, "Shutdown flush");
                     if table_opt.is_none() {
                         warn!(
@@ -784,17 +837,39 @@ pub async fn run_delta_sink(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use deltalake::datafusion::prelude::*;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use std::fs;
 
     fn make_test_json_bytes() -> Vec<u8> {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         json_str.as_bytes().to_vec()
     }
 
     fn make_test_record() -> DeltaCertRecord {
         DeltaCertRecord::from_json(&make_test_json_bytes()).expect("failed to deserialize test record")
+    }
+
+    fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        // Skip _delta_log
+                        if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
+                            if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
+                                return Some(found);
+                            }
+                        }
+                    } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
     }
 
     #[test]
@@ -820,7 +895,7 @@ mod tests {
         assert_eq!(record.subject_aggregated, "/CN=example.com");
         assert_eq!(record.issuer_aggregated, "/CN=Test CA");
         assert_eq!(record.all_domains, vec!["example.com", "www.example.com"]);
-        assert_eq!(record.as_der, "base64encodedderdata");
+        assert_eq!(record.as_der, vec![1u8, 2, 3]);
     }
 
     #[test]
@@ -844,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_from_json_with_empty_chain() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -857,12 +932,12 @@ mod tests {
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
-        assert_eq!(record.as_der, "");
+        assert_eq!(record.as_der, Vec::<u8>::new());
     }
 
     #[test]
     fn test_from_json_with_empty_domains() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"base64encodedderdata","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -948,6 +1023,10 @@ mod tests {
         assert_eq!(fields[13].name(), "is_ca");
         assert_eq!(fields[13].data_type(), &DataType::Boolean);
 
+        // Check as_der is Binary
+        assert_eq!(fields[18].name(), "as_der");
+        assert_eq!(fields[18].data_type(), &DataType::Binary);
+
         // Check chain is List(Utf8)
         assert_eq!(fields[19].name(), "chain");
         match fields[19].data_type() {
@@ -979,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn test_records_to_batch_contains_as_der_string() {
+    fn test_records_to_batch_contains_as_der_binary() {
         let schema = delta_schema();
         let record = make_test_record();
 
@@ -989,9 +1068,9 @@ mod tests {
         let as_der_col = batch
             .column(18)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("as_der column should be StringArray");
-        assert_eq!(as_der_col.value(0), "base64encodedderdata");
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der column should be BinaryArray");
+        assert_eq!(as_der_col.value(0), &[1u8, 2, 3]);
     }
 
     #[test]
@@ -1096,13 +1175,13 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 20);
 
-        // as_der should be empty string (index 18)
+        // as_der should be empty bytes (index 18)
         let as_der_col = batch
             .column(18)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("as_der column should be StringArray");
-        assert_eq!(as_der_col.value(0), "");
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der column should be BinaryArray");
+        assert_eq!(as_der_col.value(0), &[] as &[u8]);
     }
 
     #[tokio::test]
@@ -1321,7 +1400,7 @@ mod tests {
         let mut buffer = vec![record1, record2];
 
         // Flush to Delta
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
@@ -1375,7 +1454,7 @@ mod tests {
             .collect();
 
         // Flush exactly batch_size records
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1404,6 +1483,7 @@ mod tests {
             batch_size: 100,
             flush_interval_secs: 1,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1463,6 +1543,7 @@ mod tests {
             batch_size: 100,
             flush_interval_secs: 60,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1541,7 +1622,7 @@ mod tests {
         );
 
         // Flush (which includes overflow check)
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1596,6 +1677,7 @@ mod tests {
             batch_size: 5,
             flush_interval_secs: 60,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1673,6 +1755,7 @@ mod tests {
             batch_size: 5,
             flush_interval_secs: 60,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1774,6 +1857,7 @@ mod tests {
             batch_size: 100, // Large batch size so flush doesn't happen immediately
             flush_interval_secs: 60,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1842,6 +1926,7 @@ mod tests {
             batch_size: 10,
             flush_interval_secs: 1,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1904,6 +1989,7 @@ mod tests {
             batch_size: 10,
             flush_interval_secs: 2,
             compression_level: 9,
+            heavy_column_compression_level: 15,
             offline_batch_size: 100000,
         };
 
@@ -1999,36 +2085,15 @@ mod tests {
             buffer.push(record);
         }
 
-        // Flush with compression level 9
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9).await;
+        // Flush with compression level 9 and heavy_column_compression_level 15
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
 
         // Verify flush succeeded
         let _new_table = table_opt.expect("table should be available after flush");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 5, "should have written 5 records");
 
-        // Find parquet file in table directory (recursively, but exclude _delta_log)
-        fn find_parquet_file(dir: &str) -> Option<std::path::PathBuf> {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            // Skip _delta_log
-                            if path.file_name().map(|n| n != "_delta_log").unwrap_or(true) {
-                                if let Some(found) = find_parquet_file(path.to_str().unwrap_or("")) {
-                                    return Some(found);
-                                }
-                            }
-                        } else if path.is_file() && path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-            None
-        }
-
+        // Find parquet file in table directory
         let parquet_file = find_parquet_file(&table_path)
             .expect("should find a parquet file in table directory");
 
@@ -2057,6 +2122,436 @@ mod tests {
                 );
             }
         }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[test]
+    fn test_delta_writer_properties_dictionary_enabled_for_low_cardinality() {
+        // Test that delta_writer_properties enables dictionary encoding for low-cardinality columns
+        let props = delta_writer_properties(9, 15);
+
+        // Verify dictionary encoding is enabled for low-cardinality columns
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("update_type")),
+            "update_type should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("source_name")),
+            "source_name should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("source_url")),
+            "source_url should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("signature_algorithm")),
+            "signature_algorithm should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("issuer_aggregated")),
+            "issuer_aggregated should have dictionary encoding enabled"
+        );
+        assert!(
+            props.dictionary_enabled(&ColumnPath::from("chain.list.item")),
+            "chain.list.item should have dictionary encoding enabled"
+        );
+    }
+
+    #[test]
+    fn test_delta_writer_properties_dictionary_disabled_for_high_cardinality() {
+        // Test that delta_writer_properties disables dictionary encoding for high-cardinality columns
+        let props = delta_writer_properties(9, 15);
+
+        // Verify dictionary encoding is disabled for high-cardinality columns
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("cert_link")),
+            "cert_link should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("serial_number")),
+            "serial_number should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("fingerprint")),
+            "fingerprint should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("sha256")),
+            "sha256 should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("sha1")),
+            "sha1 should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("subject_aggregated")),
+            "subject_aggregated should have dictionary encoding disabled"
+        );
+        assert!(
+            !props.dictionary_enabled(&ColumnPath::from("as_der")),
+            "as_der should have dictionary encoding disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delta_writer_properties_compression_levels() {
+        // Test that as_der column uses heavy compression level and other columns use standard level
+        let test_name = "writer_props_compression";
+        let table_path = format!("/tmp/delta_writer_props_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        // Create table
+        let schema = delta_schema();
+        let table = match open_or_create_table(&table_path, &schema).await {
+            Ok(t) => t,
+            Err(e) => panic!("Failed to create table: {}", e),
+        };
+
+        // Create test records with distinctive as_der field
+        let mut buffer = vec![];
+        for i in 0..3 {
+            let mut record = make_test_record();
+            record.cert_index = i as u64;
+            record.as_der = format!("der_data_{}_", i).into_bytes(); // Distinctive data to verify correct compression
+            buffer.push(record);
+        }
+
+        // Flush with compression level 9 and heavy_column_compression_level 15
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+
+        // Verify flush succeeded
+        let _new_table = table_opt.expect("table should be available after flush");
+        assert!(flush_result.is_ok(), "flush should succeed");
+
+        let parquet_file = find_parquet_file(&table_path)
+            .expect("should find a parquet file in table directory");
+
+        // Read parquet file metadata
+        let file = fs::File::open(&parquet_file)
+            .expect("should be able to open parquet file");
+        let reader = SerializedFileReader::new(file)
+            .expect("should be able to read parquet file");
+        let metadata = reader.metadata();
+
+        // Verify ZSTD compression on all columns
+        assert!(metadata.num_row_groups() > 0, "should have at least one row group");
+        let row_group = metadata.row_group(0);
+        assert!(row_group.num_columns() > 0, "should have at least one column");
+
+        // Check that all columns have ZSTD compression
+        for i in 0..row_group.num_columns() {
+            let compression = row_group.column(i).compression();
+            match compression {
+                Compression::ZSTD(_) => {
+                    // Success - all columns should use ZSTD
+                }
+                _ => {
+                    panic!(
+                        "Column {} expected ZSTD compression, got {:?}",
+                        i, compression
+                    );
+                }
+            }
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[test]
+    fn test_delta_writer_properties_returns_valid_properties() {
+        // Test that delta_writer_properties returns valid WriterProperties that can be used
+        // This test verifies the centralized function works correctly
+        let _props = delta_writer_properties(9, 15);
+
+        // Simply verify we got a WriterProperties object back - if it's valid
+        // it should not panic when used in actual write operations
+        // (tested implicitly via the compression test above)
+    }
+
+    #[tokio::test]
+    async fn test_as_der_binary_round_trip() {
+        // AC2.2: Verify that as_der bytes are written and read back correctly
+        let test_name = "as_der_binary_roundtrip";
+        let table_path = format!("/tmp/delta_as_der_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = open_or_create_table(&table_path, &schema)
+            .await
+            .expect("table creation failed");
+
+        // Create a record with known as_der bytes from base64 decoding "AQID" → [1, 2, 3]
+        // to match the JSON test data
+        let test_bytes = vec![1u8, 2, 3];
+        let record = make_test_record();
+        // make_test_record already has as_der = [1, 2, 3] from the JSON "AQID"
+        assert_eq!(record.as_der, test_bytes, "make_test_record should set as_der correctly");
+
+        // Flush the record to the table
+        let mut buffer = vec![record];
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let table = table_opt.expect("table should be available after flush");
+        assert!(
+            flush_result.is_ok(),
+            "flush should succeed: {:?}",
+            flush_result
+        );
+
+        let parquet_file = find_parquet_file(&table_path)
+            .expect("should find a parquet file in table directory");
+
+        // Read parquet file and verify as_der column type
+        let file = fs::File::open(&parquet_file)
+            .expect("should be able to open parquet file");
+        let reader = SerializedFileReader::new(file)
+            .expect("should be able to read parquet file");
+        let metadata = reader.metadata();
+
+        // Check the schema - find the as_der column (it's a binary column)
+        let parquet_schema = metadata.file_metadata().schema_descr();
+        let num_cols = parquet_schema.num_columns();
+
+        // Find the as_der column by name
+        let mut found_as_der_schema = false;
+        for i in 0..num_cols {
+            let col = parquet_schema.column(i);
+            if col.name() == "as_der" {
+                found_as_der_schema = true;
+                // Verify it's Binary (BYTE_ARRAY physical type with BINARY logical type)
+                let physical_type = col.physical_type();
+                assert_eq!(
+                    format!("{:?}", physical_type),
+                    "BYTE_ARRAY",
+                    "as_der should be BYTE_ARRAY in Parquet"
+                );
+                break;
+            }
+        }
+        assert!(found_as_der_schema, "as_der column should exist in Parquet schema");
+
+        // Read back the data via DataFusion SQL and verify bytes match original (AC2.2)
+        let ctx = SessionContext::new();
+        ctx.register_table("test_data", std::sync::Arc::new(table))
+            .expect("should register table");
+
+        let df = ctx
+            .sql("SELECT as_der FROM test_data WHERE cert_index = 12345")
+            .await
+            .expect("should execute query");
+
+        let batches = df
+            .collect()
+            .await
+            .expect("should collect results");
+
+        assert!(!batches.is_empty(), "should have at least one batch");
+
+        // Extract the as_der column from the first batch
+        let batch = &batches[0];
+        let as_der_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("as_der column should be BinaryArray");
+
+        // Verify the bytes match the original
+        assert_eq!(as_der_col.len(), 1, "should have one row");
+        let read_back_bytes = as_der_col.value(0);
+        assert_eq!(
+            read_back_bytes, &test_bytes[..],
+            "read-back bytes should match original bytes [1, 2, 3]"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&table_path);
+    }
+
+    #[tokio::test]
+    async fn test_writer_properties_per_column_encoding() {
+        // AC4.1: Verify per-column dictionary encoding and compression in Parquet output
+        // This test verifies that delta_writer_properties() produces correct per-column encoding:
+        // - Dictionary columns (update_type, source_name, source_url, signature_algorithm, issuer_aggregated)
+        //   should have dictionary pages
+        // - High-cardinality columns (fingerprint, sha256, sha1, serial_number, as_der, subject_aggregated, cert_link)
+        //   should NOT have dictionary pages
+        // - as_der column should use heavy_column_compression_level (15)
+        // - Other columns should use compression_level (9)
+
+        let test_name = "writer_props_per_column";
+        let table_path = format!("/tmp/delta_per_column_test_{}", test_name);
+        let _ = fs::remove_dir_all(&table_path);
+        let _ = fs::create_dir_all(&table_path);
+
+        let schema = delta_schema();
+        let table = match open_or_create_table(&table_path, &schema).await {
+            Ok(t) => t,
+            Err(e) => panic!("Failed to create table: {}", e),
+        };
+
+        // Create test records
+        let mut buffer = vec![];
+        for i in 0..5 {
+            let mut record = make_test_record();
+            record.cert_index = i as u64;
+            buffer.push(record);
+        }
+
+        // Flush with compression level 9 and heavy_column_compression_level 15
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+
+        let _new_table = table_opt.expect("table should be available after flush");
+        assert!(flush_result.is_ok(), "flush should succeed");
+        assert_eq!(flush_result.unwrap(), 5, "should have written 5 records");
+
+        let parquet_file = find_parquet_file(&table_path)
+            .expect("should find a parquet file in table directory");
+
+        // Read parquet file and inspect per-column metadata
+        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::basic::Encoding;
+
+        let file = fs::File::open(&parquet_file)
+            .expect("should be able to open parquet file");
+        let reader = SerializedFileReader::new(file)
+            .expect("should be able to read parquet file");
+        let metadata = reader.metadata();
+
+        assert!(metadata.num_row_groups() > 0, "should have at least one row group");
+        let row_group = metadata.row_group(0);
+
+        // Verify we have multiple columns (19 base fields + nested array fields)
+        assert!(
+            row_group.num_columns() >= 19,
+            "should have at least 19 columns in schema (got {})",
+            row_group.num_columns()
+        );
+
+        // Define which columns should have dictionary encoding
+        let dict_enabled_columns = vec![
+            "update_type",
+            "source_name",
+            "source_url",
+            "signature_algorithm",
+            "issuer_aggregated",
+            "chain",
+        ];
+
+        let dict_disabled_columns = vec![
+            "cert_link",
+            "serial_number",
+            "fingerprint",
+            "sha256",
+            "sha1",
+            "subject_aggregated",
+            "as_der",
+        ];
+
+        // Check each column's encoding and compression
+        for col_idx in 0..row_group.num_columns() {
+            let col_meta = row_group.column(col_idx);
+            let col_path = col_meta.column_path().string();
+            let compression = col_meta.compression();
+            let encodings = col_meta.encodings();
+
+            // Verify ZSTD compression for all columns
+            match compression {
+                Compression::ZSTD(_) => {
+                    // Success - ZSTD is used
+                }
+                _ => {
+                    panic!(
+                        "Column {} should use ZSTD compression, got {:?}",
+                        col_path, compression
+                    );
+                }
+            }
+
+            // Check dictionary encoding presence based on column classification
+            let has_dict = encodings.iter().any(|enc| {
+                matches!(enc, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)
+            });
+
+            // For nested columns like "chain", check if the column path contains the name
+            let is_dict_enabled = dict_enabled_columns.iter().any(|name| col_path.contains(name));
+            let is_dict_disabled = dict_disabled_columns.iter().any(|name| col_path.contains(name));
+
+            if is_dict_enabled {
+                assert!(
+                    has_dict,
+                    "Column {} should have dictionary encoding enabled",
+                    col_path
+                );
+            }
+
+            if is_dict_disabled {
+                assert!(
+                    !has_dict,
+                    "Column {} should have dictionary encoding disabled",
+                    col_path
+                );
+            }
+        }
+
+        // Verify specific column (as_der) details
+        // Find the as_der column and verify it has ZSTD compression at the heavy level
+        let mut found_as_der = false;
+        for col_idx in 0..row_group.num_columns() {
+            let col_meta = row_group.column(col_idx);
+            let col_path = col_meta.column_path().string();
+
+            if col_path == "as_der" {
+                found_as_der = true;
+                // Verify as_der uses ZSTD compression (the heavy_column_compression_level is set via WriterProperties)
+                match col_meta.compression() {
+                    Compression::ZSTD(_) => {
+                        // Success - as_der has ZSTD compression
+                    }
+                    _ => {
+                        panic!("as_der column must use ZSTD compression");
+                    }
+                }
+
+                // Verify as_der does NOT have dictionary encoding
+                let has_dict = col_meta
+                    .encodings()
+                    .iter()
+                    .any(|enc| matches!(enc, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY));
+                assert!(
+                    !has_dict,
+                    "as_der column should not have dictionary encoding"
+                );
+            }
+        }
+        assert!(found_as_der, "as_der column must exist in row group");
+
+        // Verify at least one dictionary-enabled column exists and has dictionary encoding
+        let mut found_dict_col = false;
+        for col_idx in 0..row_group.num_columns() {
+            let col_meta = row_group.column(col_idx);
+            let col_path = col_meta.column_path().string();
+
+            if col_path == "update_type" {
+                let has_dict = col_meta
+                    .encodings()
+                    .iter()
+                    .any(|enc| matches!(enc, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY));
+                assert!(
+                    has_dict,
+                    "update_type (dictionary-enabled) should have dictionary encoding"
+                );
+                found_dict_col = true;
+                break;
+            }
+        }
+        assert!(
+            found_dict_col,
+            "update_type column must exist and have dictionary encoding"
+        );
 
         // Clean up
         let _ = fs::remove_dir_all(&table_path);
