@@ -62,7 +62,7 @@ The delta_sink and zerobus_sink are spawned as optional tokio tasks and do not a
 
 In Delta Lake storage, the `as_der` column is stored as raw binary bytes (not base64-encoded). The WriterProperties builder applies dictionary encoding to low-cardinality columns (update_type, source_name, source_url, signature_algorithm, issuer_aggregated) and skips it for high-cardinality columns (fingerprint, sha256, sha1, serial_number, as_der, subject_aggregated, cert_link), with per-column ZSTD compression using `compression_level` for most columns and `heavy_column_compression_level` for the `as_der` column.
 
-The binary has four execution modes selected in main.rs:
+The binary has six execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
 2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
 3. **Merge mode** (`--merge --staging-path <PATH>`): merges a staging Delta table into the main table using Delta MERGE INTO with deduplication, then deletes the staging directory on success
@@ -173,7 +173,7 @@ The binary has four execution modes selected in main.rs:
 - **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
 - **Source table**: reads from `source_path` parameter; defaults to `config.delta_sink.table_path` when `--source` is not provided; if source table cannot be opened, exits with code 1
 - **Output table**: created at `output_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
-- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially; within each partition, data is streamed via `execute_stream()` (one RecordBatch at a time) to avoid OOM on large partitions
+- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially; within each partition, data is streamed via `execute_stream()` (one RecordBatch at a time) to avoid OOM on large partitions; batches are accumulated up to `offline_batch_size` rows before each Delta commit
 - **Partition filtering**: when `--from` is provided, partitions with `seen_date < from` are skipped; when `--to` is provided, partitions with `seen_date > to` are skipped; filters are inclusive and applied via lexicographic string comparison
 - **as_der conversion**: base64-decodes each Utf8 string to raw bytes; decode failures produce null values and are logged as warnings (non-fatal)
 - **Column alignment**: source columns are matched by name (not index) and cast to target types if needed, handling DataFusion column reordering
