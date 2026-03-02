@@ -471,7 +471,9 @@ async fn run_writer(
 
     // Only create local directories; S3 paths don't need this
     if !table_path.starts_with("s3://") {
-        if let Err(e) = std::fs::create_dir_all(&table_path) {
+        // Strip file:// prefix if present for actual filesystem operations
+        let local_path = table_path.strip_prefix("file://").unwrap_or(&table_path);
+        if let Err(e) = std::fs::create_dir_all(local_path) {
             warn!(error = %e, table_path = %table_path, "Failed to create table directory");
             return WriterResult {
                 total_records_written: 0,
@@ -1012,8 +1014,9 @@ async fn cleanup_staging(staging_path: &str, storage_options: &HashMap<String, S
             }
         }
     } else {
-        // Local cleanup
-        match std::fs::remove_dir_all(staging_path) {
+        // Local cleanup — strip file:// prefix if present
+        let local_path = staging_path.strip_prefix("file://").unwrap_or(staging_path);
+        match std::fs::remove_dir_all(local_path) {
             Ok(_) => {
                 info!(staging_path = %staging_path, "staging directory deleted");
             }
@@ -1050,20 +1053,19 @@ pub async fn run_merge(
     let schema = delta_schema();
 
     // Parse URIs and resolve storage options for both main and staging paths.
-    // Bare paths (without scheme) are treated as local filesystem paths.
     let main_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
         Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(_) => {
-            // Treat as local path if URI parsing fails (backward compatibility with bare paths)
-            HashMap::new()
+        Err(e) => {
+            error!(error = %e, "Invalid delta_sink.table_path URI");
+            return 1;
         }
     };
 
     let staging_storage_options = match parse_table_uri(&staging_path) {
         Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(_) => {
-            // Treat as local path if URI parsing fails (backward compatibility with bare paths)
-            HashMap::new()
+        Err(e) => {
+            error!(error = %e, "Invalid staging path URI");
+            return 1;
         }
     };
 
@@ -2701,12 +2703,14 @@ mod tests {
         // Verifies staging-backfill.AC3.1: `--merge --staging-path` inserts staging records
         // not present in main (matched on `source_url` + `cert_index`)
         let test_name = "ac3_1_merge_inserts";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -2778,12 +2782,14 @@ mod tests {
         // Verifies staging-backfill.AC3.2: Records already in main with matching
         // (source_url, cert_index) are skipped (not duplicated)
         let test_name = "ac3_2_merge_skips";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -2855,12 +2861,14 @@ mod tests {
         // Verifies staging-backfill.AC3.3: Merge is idempotent — running it twice
         // with same staging data produces identical main table
         let test_name = "ac3_3_merge_idempotent";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -2901,7 +2909,8 @@ mod tests {
         assert_eq!(exit_code, 0, "First merge should succeed");
 
         // Verify staging was deleted after first merge (AC3.4)
-        assert!(!std::path::Path::new(&staging_path).exists(), "Staging should be deleted");
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        assert!(!std::path::Path::new(staging_local).exists(), "Staging should be deleted");
 
         // Get count after first merge
         let main_table = deltalake::open_table(&main_path)
@@ -2924,7 +2933,8 @@ mod tests {
         assert_eq!(count_after_first, 4, "Should have 4 records after first merge");
 
         // Recreate staging with same data [12, 13]
-        let _ = fs::create_dir_all(&staging_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::create_dir_all(staging_local);
         let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
@@ -2972,12 +2982,14 @@ mod tests {
     async fn test_ac3_4_staging_directory_deleted_on_success() {
         // Verifies staging-backfill.AC3.4: Staging directory is deleted after successful merge
         let test_name = "ac3_4_staging_deleted";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -3018,24 +3030,28 @@ mod tests {
         assert_eq!(exit_code, 0, "Merge should succeed");
 
         // Verify staging directory no longer exists
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
         assert!(
-            !std::path::Path::new(&staging_path).exists(),
+            !std::path::Path::new(staging_local).exists(),
             "Staging directory should be deleted after successful merge"
         );
 
-        let _ = fs::remove_dir_all(&main_path);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let _ = fs::remove_dir_all(main_local);
     }
 
     #[tokio::test]
     async fn test_ac3_5_merge_returns_zero_and_logs_metrics() {
         // Verifies staging-backfill.AC3.5: Merge returns 0 and logs metrics
         let test_name = "ac3_5_merge_metrics";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -3088,11 +3104,13 @@ mod tests {
     async fn test_ac4_1_missing_staging_table_exits_zero() {
         // Verifies staging-backfill.AC4.1: Missing staging table exits 0 (nothing to merge)
         let test_name = "ac4_1_missing_staging";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
         // Do NOT create staging_path — it doesn't exist
 
         let schema = delta_schema();
@@ -3114,12 +3132,14 @@ mod tests {
     async fn test_ac4_1_empty_staging_table_exits_zero() {
         // Verifies staging-backfill.AC4.1: Empty staging table exits 0 (nothing to merge)
         let test_name = "ac4_1_empty_staging";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -3139,21 +3159,25 @@ mod tests {
 
         assert_eq!(exit_code, 0, "Empty staging table should exit with code 0");
 
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
     }
 
     #[tokio::test]
     async fn test_ac4_2_missing_main_table_auto_created() {
         // Verifies staging-backfill.AC4.2: Missing main table is auto-created
         let test_name = "ac4_2_missing_main";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(staging_local);
         // Create the main_path directory but leave it empty (no _delta_log yet)
-        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(main_local);
 
         let schema = delta_schema();
 
@@ -3200,20 +3224,24 @@ mod tests {
             .expect("count should be Int64");
         assert_eq!(count_arr.value(0), 3, "Main table should have 3 records from staging");
 
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
     }
 
     #[tokio::test]
     async fn test_ac4_4_cancellation_preserves_staging() {
         // Verifies staging-backfill.AC4.4: Process interruption (SIGINT) leaves staging intact
         let test_name = "ac4_4_cancellation";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
@@ -3259,8 +3287,9 @@ mod tests {
         assert_eq!(exit_code, 1, "Merge should exit with code 1 when cancelled");
 
         // Verify staging directory still exists (was NOT deleted)
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
         assert!(
-            std::path::Path::new(&staging_path).exists(),
+            std::path::Path::new(staging_local).exists(),
             "Staging directory should still exist after cancellation"
         );
 
