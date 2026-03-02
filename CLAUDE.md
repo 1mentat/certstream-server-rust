@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-02-26
-Last context update: 2026-02-26
+Last verified: 2026-03-02
+Last context update: 2026-03-02
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -142,12 +142,13 @@ The binary has three execution modes selected in main.rs:
 ## Merge Contracts
 - **CLI flags**: `--merge --staging-path <PATH>` activates merge mode; `--merge` without `--staging-path` exits with error
 - **Entry point**: `backfill::run_merge(config, staging_path, shutdown)` called from main, returns exit code (i32)
+- **Storage options**: `run_merge()` calls `parse_table_uri()` on both `config.delta_sink.table_path` and `staging_path`, then calls `resolve_storage_options()` for each to extract S3 credentials and other backend configuration; storage options are passed to table open calls. Bare paths (without URI scheme) are treated as local filesystem with empty storage options for backward compatibility.
 - **Merge predicate**: `target.source_url = source.source_url AND target.cert_index = source.cert_index` (deduplication key)
 - **Merge behavior**: uses `DeltaOps::merge()` with `when_not_matched_insert` only (no updates, no deletes); matched source rows are silently skipped
 - **Batch-by-batch**: staging records are read via DataFusion SQL, then each RecordBatch is merged individually into the main table
 - **Missing staging table**: if staging table does not exist (NotATable or InvalidTableLocation), exits with code 0 (not an error)
 - **Empty staging table**: if all batches have zero rows, exits with code 0
-- **Staging cleanup**: on successful merge, the staging directory is deleted via `remove_dir_all`; cleanup failure is non-fatal (logged as warning)
+- **Staging cleanup**: on successful merge, the staging directory/objects are deleted. For S3 paths (s3://...), uses `object_store` APIs to list and delete all objects under the prefix via `DeltaTableBuilder::from_uri()`. For local paths, uses `std::fs::remove_dir_all()`. Cleanup failure is non-fatal (logged as warning).
 - **Error handling**: any failure during merge leaves staging intact for retry and exits with code 1
 - **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (staging left intact)
 
