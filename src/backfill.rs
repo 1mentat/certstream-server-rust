@@ -1,4 +1,4 @@
-use crate::config::{Config, ZerobusSinkConfig};
+use crate::config::{Config, ZerobusSinkConfig, parse_table_uri, resolve_storage_options};
 use crate::ct::fetch;
 use crate::ct::{fetch_log_list, CtLog, LogType};
 use crate::delta_sink::{delta_schema, DeltaCertRecord, flush_buffer, open_or_create_table};
@@ -8,7 +8,7 @@ use crate::zerobus_sink::{cert_record_descriptor_proto, proto};
 use databricks_zerobus_ingest_sdk::{StreamConfigurationOptions, TableProperties, ZerobusSdk};
 use deltalake::arrow::array::*;
 use deltalake::datafusion::prelude::*;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, DeltaTableError};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use prost::Message;
@@ -279,10 +279,11 @@ async fn detect_gaps_from_context(
 /// tables are registered and a UNION ALL view is created.
 ///
 /// # Arguments
-/// * `table_path` - Path to the main delta table
-/// * `staging_path` - Optional path to the staging delta table; if provided and exists, will be unioned with main
+/// * `table_path` - URI to the main delta table
+/// * `staging_path` - Optional URI to the staging delta table; if provided and exists, will be unioned with main
 /// * `logs` - Vec of (source_url, ceiling) pairs for active logs
 /// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
+/// * `storage_options` - HashMap of storage configuration options for S3 and other backends
 ///
 /// # Returns
 /// * Vec of BackfillWorkItem ranges to fetch
@@ -291,14 +292,27 @@ pub async fn detect_gaps(
     staging_path: Option<&str>,
     logs: &[(String, u64)],
     backfill_from: Option<u64>,
+    storage_options: &HashMap<String, String>,
 ) -> Result<Vec<BackfillWorkItem>, Box<dyn Error>> {
     // Try to open the main delta table; if it doesn't exist, try staging if provided
-    let table = match deltalake::open_table(table_path).await {
+    let table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(table_path)?
+            .with_storage_options(storage_options.clone())
+            .load()
+            .await
+    })().await
+    {
         Ok(t) => t,
         Err(_e @ DeltaTableError::NotATable(_)) | Err(_e @ DeltaTableError::InvalidTableLocation(_)) => {
             // Main table doesn't exist — try staging if provided
             if let Some(staging) = staging_path {
-                if let Ok(staging_table) = deltalake::open_table(staging).await {
+                if let Ok(staging_table) = (|| async {
+                    DeltaTableBuilder::from_valid_uri(staging)?
+                        .with_storage_options(storage_options.clone())
+                        .load()
+                        .await
+                })().await
+                {
                     let ctx = SessionContext::new();
                     ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
                     ctx.sql(
@@ -338,7 +352,13 @@ pub async fn detect_gaps(
 
     // Register UNION ALL view if staging table exists
     let has_staging = if let Some(staging) = staging_path {
-        match deltalake::open_table(staging).await {
+        match (|| async {
+            DeltaTableBuilder::from_valid_uri(staging)?
+                .with_storage_options(storage_options.clone())
+                .load()
+                .await
+        })().await
+        {
             Ok(staging_table) => {
                 ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
                 ctx.sql(
@@ -427,9 +447,11 @@ fn handle_flush(
 /// 4. Graceful shutdown signal
 ///
 /// # Arguments
-/// * `table_path` - Path to the Delta table
+/// * `table_path` - URI to the Delta table
 /// * `batch_size` - Maximum records per batch before flushing
 /// * `flush_interval_secs` - Maximum time between flushes in seconds
+/// * `compression_level` - ZSTD compression level for Delta writes
+/// * `storage_options` - HashMap of storage configuration options for S3 and other backends
 /// * `rx` - mpsc receiver for DeltaCertRecord from fetchers
 /// * `shutdown` - CancellationToken for graceful shutdown
 ///
@@ -440,22 +462,25 @@ async fn run_writer(
     batch_size: usize,
     flush_interval_secs: u64,
     compression_level: i32,
+    storage_options: HashMap<String, String>,
     mut rx: mpsc::Receiver<DeltaCertRecord>,
     shutdown: CancellationToken,
 ) -> WriterResult {
     let schema = delta_schema();
 
-    // Ensure the table directory exists
-    if let Err(e) = std::fs::create_dir_all(&table_path) {
-        warn!(error = %e, table_path = %table_path, "Failed to create table directory");
-        return WriterResult {
-            total_records_written: 0,
-            write_errors: 1,
-        };
+    // Only create local directories; S3 paths don't need this
+    if !table_path.starts_with("s3://") {
+        if let Err(e) = std::fs::create_dir_all(&table_path) {
+            warn!(error = %e, table_path = %table_path, "Failed to create table directory");
+            return WriterResult {
+                total_records_written: 0,
+                write_errors: 1,
+            };
+        }
     }
 
     // Open or create the delta table
-    let mut table = match open_or_create_table(&table_path, &schema, HashMap::new()).await {
+    let mut table = match open_or_create_table(&table_path, &schema, storage_options.clone()).await {
         Ok(t) => {
             info!(table_path = %table_path, "Delta table opened/created for writing");
             t
@@ -487,7 +512,7 @@ async fn run_writer(
 
                         // Flush if buffer reaches batch_size threshold
                         if buffer.len() >= batch_size {
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &storage_options).await;
                             let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "batch size trigger");
                             if should_break {
                                 break;
@@ -502,7 +527,7 @@ async fn run_writer(
                                 records_in_buffer = buffer.len(),
                                 "Channel closed, flushing remaining buffer"
                             );
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &storage_options).await;
                             let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "channel close");
                         }
                         break;
@@ -512,7 +537,7 @@ async fn run_writer(
             _ = flush_timer.tick() => {
                 // Time-triggered flush
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &storage_options).await;
                     let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "time trigger");
                     if should_break {
                         break;
@@ -527,7 +552,7 @@ async fn run_writer(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &HashMap::new()).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, &storage_options).await;
                     let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "shutdown");
                 }
                 break;
@@ -697,6 +722,15 @@ pub async fn run_backfill(
         info!(logs_filter = %logs_filter, "backfill_logs filter");
     }
 
+    // Parse URIs and resolve storage options
+    let storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, "Invalid delta_sink.table_path URI");
+            return 1;
+        }
+    };
+
     // Step 1: Log discovery
     let client = reqwest::Client::new();
     let mut logs = match fetch_log_list(&client, &config.ct_logs_url, config.custom_logs.clone()).await {
@@ -772,7 +806,7 @@ pub async fn run_backfill(
     } else {
         // Delta sink: use gap detection to find internal gaps
         let staging_path_ref = staging_path.as_deref();
-        match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from).await {
+        match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from, &storage_options).await {
             Ok(items) => items,
             Err(e) => {
                 warn!("gap detection failed: {}", e);
@@ -852,8 +886,9 @@ pub async fn run_backfill(
         let flush_interval_secs = config.delta_sink.flush_interval_secs;
         let compression_level = config.delta_sink.compression_level;
         let shutdown_clone = shutdown.clone();
+        let storage_options_clone = storage_options.clone();
         tokio::spawn(async move {
-            run_writer(table_path, batch_size, flush_interval_secs, compression_level, rx, shutdown_clone).await
+            run_writer(table_path, batch_size, flush_interval_secs, compression_level, storage_options_clone, rx, shutdown_clone).await
         })
     };
 
@@ -1381,7 +1416,7 @@ mod tests {
         // Call detect_gaps in catch-up mode (no --from)
         // Second tuple element is ceiling (was tree_size)
         let logs = vec![("https://log.example.com".to_string(), 200)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1423,7 +1458,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=22 (no frontier gap generated)
         let logs = vec![("https://log.example.com".to_string(), 22)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1472,7 +1507,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=10
         let logs = vec![("https://log.example.com".to_string(), 10)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1512,7 +1547,7 @@ mod tests {
             ("https://log-a.example.com".to_string(), 10),
             ("https://log-b.example.com".to_string(), 10),
         ];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1561,7 +1596,7 @@ mod tests {
 
         // Call detect_gaps with --from 0, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1602,7 +1637,7 @@ mod tests {
 
         // Call detect_gaps with --from 40, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(40))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(40), &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1625,7 +1660,7 @@ mod tests {
 
         // Call detect_gaps in historical mode with --from 0
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1648,7 +1683,7 @@ mod tests {
 
         // Call detect_gaps in catch-up mode
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1678,7 +1713,7 @@ mod tests {
 
         // Simulate gap detection in catch-up mode with an empty table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -1795,7 +1830,7 @@ mod tests {
         // Spawn writer
         let table_path_clone = table_path.clone();
         let writer_task = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, 9, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send 2 records (should trigger batch flush)
@@ -1837,7 +1872,7 @@ mod tests {
         // Spawn writer task with batch_size = 3 to trigger flush on channel close
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 3, 60, 9, rx, shutdown).await
+            run_writer(table_path_clone, 3, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send records
@@ -1905,7 +1940,7 @@ mod tests {
         // Spawn writer task with small batch size to trigger flush
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, 9, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send records
@@ -1949,7 +1984,7 @@ mod tests {
 
         // Use invalid path to trigger table creation failure
         let writer_handle = tokio::spawn(async move {
-            run_writer("/invalid/path/that/cannot/be/created".to_string(), 10, 60, 9, rx, shutdown).await
+            run_writer("/invalid/path/that/cannot/be/created".to_string(), 10, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send one record
@@ -2011,7 +2046,7 @@ mod tests {
         // Spawn writer task
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 10, 60, 9, rx, shutdown).await
+            run_writer(table_path_clone, 10, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Wait for fetchers
@@ -2049,7 +2084,7 @@ mod tests {
         // Spawn writer
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, 9, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send records to trigger flushes
@@ -2084,7 +2119,7 @@ mod tests {
         // Spawn writer with batch_size=3
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, batch_size, 60, 9, rx, shutdown).await
+            run_writer(table_path_clone, batch_size, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send exactly batch_size records to trigger flush
@@ -2141,7 +2176,7 @@ mod tests {
         // ceiling=50 is below min_index=100; irrelevant in catch-up mode
         // but verifies AC3.3 is satisfied
         let logs = vec![("https://log.example.com".to_string(), 50)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2181,7 +2216,7 @@ mod tests {
 
         // ceiling=1000 (well above max_index=16)
         let logs = vec![("https://log.example.com".to_string(), 1000)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2202,7 +2237,7 @@ mod tests {
 
         // No table — historical mode with no delta table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2230,7 +2265,7 @@ mod tests {
 
         let staging_path_clone = staging_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(staging_path_clone, 3, 60, 9, rx, shutdown).await
+            run_writer(staging_path_clone, 3, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send a few records
@@ -2353,7 +2388,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=20 and staging_path
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2397,7 +2432,7 @@ mod tests {
 
         // First call with empty staging: should detect gap [11, 14]
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2422,7 +2457,7 @@ mod tests {
             .expect("staging write failed");
 
         // Second call with staging populated: should detect smaller gap [13, 14]
-        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2482,7 +2517,7 @@ mod tests {
 
         // Call with ceiling=20: verify no work items generated beyond index 19
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -2527,7 +2562,7 @@ mod tests {
 
         // Call with nonexistent staging path
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None)
+        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps failed");
 
@@ -3210,7 +3245,7 @@ mod tests {
 
         let staging_path_clone = staging_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(staging_path_clone, 3, 60, 9, rx, shutdown).await
+            run_writer(staging_path_clone, 3, 60, 9, HashMap::new(), rx, shutdown).await
         });
 
         // Send records to staging
@@ -3327,7 +3362,7 @@ mod tests {
         // Data combined: [10, 11, 12, 13, 15, 16]
         // Gap: [14] (index 14 is missing)
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps catch-up failed");
 
@@ -3348,7 +3383,7 @@ mod tests {
         // Should start from 0 (--from 0) and fill to ceiling=20
         // Data union: [10, 11, 12, 13, 15, 16]
         // Gaps: [0-9] (pre-existing), [14] (internal)
-        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0))
+        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0), &HashMap::new())
             .await
             .expect("detect_gaps historical failed");
 
