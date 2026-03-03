@@ -298,6 +298,10 @@ pub struct DeltaSinkConfig {
     pub flush_interval_secs: u64,
     #[serde(default = "default_delta_sink_compression_level")]
     pub compression_level: i32,
+    #[serde(default = "default_delta_sink_heavy_column_compression_level")]
+    pub heavy_column_compression_level: i32,
+    #[serde(default = "default_delta_sink_offline_batch_size")]
+    pub offline_batch_size: usize,
 }
 
 impl Default for DeltaSinkConfig {
@@ -308,6 +312,8 @@ impl Default for DeltaSinkConfig {
             batch_size: default_delta_sink_batch_size(),
             flush_interval_secs: default_delta_sink_flush_interval_secs(),
             compression_level: default_delta_sink_compression_level(),
+            heavy_column_compression_level: default_delta_sink_heavy_column_compression_level(),
+            offline_batch_size: default_delta_sink_offline_batch_size(),
         }
     }
 }
@@ -326,6 +332,14 @@ fn default_delta_sink_flush_interval_secs() -> u64 {
 
 fn default_delta_sink_compression_level() -> i32 {
     9
+}
+
+fn default_delta_sink_heavy_column_compression_level() -> i32 {
+    15
+}
+
+fn default_delta_sink_offline_batch_size() -> usize {
+    100000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -748,6 +762,12 @@ impl Config {
         if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_COMPRESSION_LEVEL") {
             delta_sink.compression_level = v.parse().unwrap_or(delta_sink.compression_level);
         }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_HEAVY_COLUMN_COMPRESSION_LEVEL") {
+            delta_sink.heavy_column_compression_level = v.parse().unwrap_or(delta_sink.heavy_column_compression_level);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_DELTA_SINK_OFFLINE_BATCH_SIZE") {
+            delta_sink.offline_batch_size = v.parse().unwrap_or(delta_sink.offline_batch_size);
+        }
 
         let mut query_api = yaml_config.query_api.unwrap_or_default();
         if let Ok(v) = env::var("CERTSTREAM_QUERY_API_ENABLED") {
@@ -1029,6 +1049,15 @@ impl Config {
                 message: format!(
                     "Compression level {} is invalid. Must be between 1 and 22",
                     self.delta_sink.compression_level
+                ),
+            });
+        }
+        if ZstdLevel::try_new(self.delta_sink.heavy_column_compression_level).is_err() {
+            errors.push(ConfigValidationError {
+                field: "delta_sink.heavy_column_compression_level".to_string(),
+                message: format!(
+                    "Heavy column compression level {} is invalid. Must be between 1 and 22",
+                    self.delta_sink.heavy_column_compression_level
                 ),
             });
         }
@@ -2322,5 +2351,109 @@ s3:
                 .any(|e| e.field == "storage.s3.secret_access_key"),
             "error should be on storage.s3.secret_access_key field"
         );
+    }
+
+    #[test]
+    fn test_delta_sink_config_default_heavy_column_compression_level() {
+        // Verifies delta-encoding-opt.AC4.1: Default heavy_column_compression_level = 15
+        let config = DeltaSinkConfig::default();
+        assert_eq!(config.heavy_column_compression_level, 15);
+    }
+
+    #[test]
+    fn test_delta_sink_config_deserialize_heavy_column_compression_level_custom() {
+        // Verifies delta-encoding-opt.AC4.1: Custom heavy_column_compression_level is preserved
+        let yaml = r#"
+enabled: true
+table_path: "./data/test"
+batch_size: 1000
+flush_interval_secs: 30
+compression_level: 9
+heavy_column_compression_level: 20
+"#;
+        let config: DeltaSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.heavy_column_compression_level, 20);
+    }
+
+    #[test]
+    fn test_delta_sink_config_deserialize_heavy_column_compression_level_defaults_to_15() {
+        // Verifies delta-encoding-opt.AC4.1: Omitted heavy_column_compression_level defaults to 15
+        let yaml = r#"
+enabled: true
+table_path: "./data/test"
+batch_size: 1000
+flush_interval_secs: 30
+compression_level: 9
+"#;
+        let config: DeltaSinkConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.heavy_column_compression_level, 15);
+    }
+
+    #[test]
+    fn test_validate_heavy_column_compression_level_zero() {
+        // Verifies delta-encoding-opt.AC4.2: Config with heavy_column_compression_level = 0 fails
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                heavy_column_compression_level: 0,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "delta_sink.heavy_column_compression_level"));
+    }
+
+    #[test]
+    fn test_validate_heavy_column_compression_level_too_high() {
+        // Verifies delta-encoding-opt.AC4.2: Config with heavy_column_compression_level = 23 fails
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                heavy_column_compression_level: 23,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "delta_sink.heavy_column_compression_level"));
+    }
+
+    #[test]
+    fn test_validate_heavy_column_compression_level_valid_min() {
+        // Verifies delta-encoding-opt.AC4.2: Config with heavy_column_compression_level = 1 passes
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                heavy_column_compression_level: 1,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_heavy_column_compression_level_valid_max() {
+        // Verifies delta-encoding-opt.AC4.2: Config with heavy_column_compression_level = 22 (max) passes
+        let config = Config {
+            delta_sink: DeltaSinkConfig {
+                heavy_column_compression_level: 22,
+                ..DeltaSinkConfig::default()
+            },
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_heavy_column_compression_level_default() {
+        // Verifies delta-encoding-opt.AC4.1: Default heavy_column_compression_level = 15 passes
+        let config = Config {
+            delta_sink: DeltaSinkConfig::default(),
+            ..test_config()
+        };
+        assert!(config.validate().is_ok());
     }
 }

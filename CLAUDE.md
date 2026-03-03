@@ -116,7 +116,7 @@ The binary has six execution modes selected in main.rs:
 - **Wire format**: Protobuf `CertRecord` (20 fields mirroring `DeltaCertRecord`), compiled from `proto/cert_record.proto` via `build.rs`
 - **Conversion**: `proto::CertRecord::from_delta_cert(&DeltaCertRecord)` maps all 20 fields
 - **Descriptor**: `cert_record_descriptor_proto()` returns `DescriptorProto` from compiled file descriptor set for SDK `TableProperties`
-- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` -> encodes to protobuf bytes -> ingests via ZeroBus SDK
+- **Data flow**: receives `PreSerializedMessage` from broadcast -> deserializes JSON to `DeltaCertRecord` -> converts to `CertRecord` (base64-encoding `as_der` bytes back to string for protobuf wire format) -> encodes to protobuf bytes -> ingests via ZeroBus SDK
 - **Error handling**: retryable errors recreate the stream and retry the record once; non-retryable errors skip the record; failed stream recreation exits the sink
 - **Non-fatal startup**: if SDK or stream creation fails, task exits without crashing server
 - **Graceful shutdown**: flushes and closes the stream on CancellationToken
