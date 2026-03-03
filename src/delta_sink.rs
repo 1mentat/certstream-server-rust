@@ -2158,6 +2158,8 @@ mod s3_integration_tests {
 
     #[tokio::test]
     async fn test_s3_create_write_read_roundtrip() {
+        deltalake::aws::register_handlers(None);
+
         // AC4.1: Create Delta table on Tigris bucket
         // AC4.2: Write batch and read back with matching data
         let endpoint = match std::env::var("CERTSTREAM_TEST_S3_ENDPOINT") {
@@ -2235,6 +2237,8 @@ mod s3_integration_tests {
 
     #[tokio::test]
     async fn test_s3_conditional_put_etag() {
+        deltalake::aws::register_handlers(None);
+
         // AC4.3: Conditional put (etag) prevents concurrent write corruption
         let endpoint = match std::env::var("CERTSTREAM_TEST_S3_ENDPOINT") {
             Ok(v) => v,
