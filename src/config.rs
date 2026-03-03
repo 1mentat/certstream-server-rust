@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::net::IpAddr;
@@ -419,6 +420,130 @@ impl Default for ZerobusSinkConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct S3StorageConfig {
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub conditional_put: Option<String>,
+    #[serde(default)]
+    pub allow_http: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub s3: Option<S3StorageConfig>,
+}
+
+/// Represents the location of a table (local filesystem or S3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableLocation {
+    /// Local filesystem path.
+    Local { path: String },
+    /// S3 URI.
+    S3 { uri: String },
+}
+
+impl TableLocation {
+    /// Returns the path/URI string for use with DeltaTableBuilder::from_uri().
+    /// For Local, this returns the stripped path (no file:// prefix) because
+    /// DeltaTableBuilder::from_uri() accepts bare paths for local filesystem.
+    /// For S3, this returns the full s3:// URI.
+    pub fn as_uri(&self) -> &str {
+        match self {
+            TableLocation::Local { path } => path,
+            TableLocation::S3 { uri } => uri,
+        }
+    }
+}
+
+/// Parses a table URI and returns the corresponding TableLocation.
+///
+/// Supported schemes:
+/// - `file://` — local filesystem (absolute or relative paths)
+/// - `s3://` — S3-compatible storage
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The URI is empty
+/// - The URI uses an unsupported scheme
+/// - The URI is a bare path (suggests using `file://` prefix)
+pub fn parse_table_uri(uri: &str) -> Result<TableLocation, String> {
+    if uri.is_empty() {
+        return Err("Table path cannot be empty".to_string());
+    }
+
+    if let Some(path) = uri.strip_prefix("file://") {
+        Ok(TableLocation::Local {
+            path: path.to_string(),
+        })
+    } else if uri.starts_with("s3://") {
+        Ok(TableLocation::S3 {
+            uri: uri.to_string(),
+        })
+    } else if uri.contains("://") {
+        let scheme = uri.split("://").next().unwrap_or("");
+        Err(format!(
+            "Unsupported URI scheme '{}://'. Supported schemes: file://, s3://",
+            scheme
+        ))
+    } else {
+        Err(format!(
+            "Table path '{}' must use a URI scheme. Use 'file://{}' for local filesystem paths",
+            uri, uri
+        ))
+    }
+}
+
+/// Resolves storage options for a given TableLocation and StorageConfig.
+///
+/// Returns a HashMap of storage options suitable for use with Delta Lake or similar APIs:
+/// - For Local locations: returns an empty HashMap
+/// - For S3 locations: returns AWS-compatible options (AWS_ENDPOINT_URL, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, conditional_put, AWS_ALLOW_HTTP)
+pub fn resolve_storage_options(
+    location: &TableLocation,
+    storage: &StorageConfig,
+) -> HashMap<String, String> {
+    match location {
+        TableLocation::Local { .. } => HashMap::new(),
+        TableLocation::S3 { .. } => {
+            let mut opts = HashMap::new();
+            if let Some(ref s3) = storage.s3 {
+                if !s3.endpoint.is_empty() {
+                    opts.insert("AWS_ENDPOINT_URL".to_string(), s3.endpoint.clone());
+                }
+                if !s3.region.is_empty() {
+                    opts.insert("AWS_REGION".to_string(), s3.region.clone());
+                }
+                if !s3.access_key_id.is_empty() {
+                    opts.insert("AWS_ACCESS_KEY_ID".to_string(), s3.access_key_id.clone());
+                }
+                if !s3.secret_access_key.is_empty() {
+                    opts.insert(
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        s3.secret_access_key.clone(),
+                    );
+                }
+                if let Some(ref cp) = s3.conditional_put {
+                    opts.insert("conditional_put".to_string(), cp.clone());
+                }
+                if let Some(allow) = s3.allow_http {
+                    opts.insert("AWS_ALLOW_HTTP".to_string(), allow.to_string());
+                }
+            }
+            opts
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -444,6 +569,7 @@ pub struct Config {
     pub delta_sink: DeltaSinkConfig,
     pub query_api: QueryApiConfig,
     pub zerobus_sink: ZerobusSinkConfig,
+    pub storage: StorageConfig,
     pub config_path: Option<String>,
 }
 
@@ -480,6 +606,8 @@ struct YamlConfig {
     query_api: Option<QueryApiConfig>,
     #[serde(default)]
     zerobus_sink: Option<ZerobusSinkConfig>,
+    #[serde(default)]
+    storage: Option<StorageConfig>,
 }
 
 struct YamlConfigWithPath {
@@ -681,6 +809,44 @@ impl Config {
             zerobus_sink.max_inflight_records = v.parse().unwrap_or(zerobus_sink.max_inflight_records);
         }
 
+        let mut storage = yaml_config.storage.unwrap_or_default();
+        if let Some(ref mut s3) = storage.s3 {
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT") {
+                s3.endpoint = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_REGION") {
+                s3.region = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID") {
+                s3.access_key_id = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY") {
+                s3.secret_access_key = v;
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT") {
+                s3.conditional_put = Some(v);
+            }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP") {
+                s3.allow_http = v.parse().ok();
+            }
+        } else {
+            // If no s3 section in YAML, check if env vars want to create one.
+            // CERTSTREAM_STORAGE_S3_ENDPOINT is the trigger: if it's empty or unset,
+            // no S3 config is created even if other S3 env vars are set.
+            // This is intentional — endpoint is required for any S3 operation.
+            let endpoint = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT").unwrap_or_default();
+            if !endpoint.is_empty() {
+                storage.s3 = Some(S3StorageConfig {
+                    endpoint,
+                    region: env::var("CERTSTREAM_STORAGE_S3_REGION").unwrap_or_default(),
+                    access_key_id: env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID").unwrap_or_default(),
+                    secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+                    conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
+                    allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+                });
+            }
+        }
+
         Self {
             host,
             port,
@@ -701,6 +867,7 @@ impl Config {
             delta_sink,
             query_api,
             zerobus_sink,
+            storage,
             config_path,
         }
     }
@@ -773,6 +940,67 @@ impl Config {
                 field: "delta_sink.flush_interval_secs".to_string(),
                 message: "Flush interval must be greater than 0 when delta sink is enabled".to_string(),
             });
+        }
+
+        // Validate delta_sink.table_path is a valid URI (when delta_sink is enabled)
+        if self.delta_sink.enabled {
+            if let Err(e) = parse_table_uri(&self.delta_sink.table_path) {
+                errors.push(ConfigValidationError {
+                    field: "delta_sink.table_path".to_string(),
+                    message: e,
+                });
+            }
+        }
+
+        // Validate query_api.table_path is a valid URI (when query_api is enabled)
+        if self.query_api.enabled {
+            if let Err(e) = parse_table_uri(&self.query_api.table_path) {
+                errors.push(ConfigValidationError {
+                    field: "query_api.table_path".to_string(),
+                    message: e,
+                });
+            }
+        }
+
+        // Check S3 config presence when any S3 URI is used
+        let has_s3_uri = (self.delta_sink.enabled && self.delta_sink.table_path.starts_with("s3://"))
+            || (self.query_api.enabled && self.query_api.table_path.starts_with("s3://"));
+
+        if has_s3_uri {
+            match &self.storage.s3 {
+                None => {
+                    errors.push(ConfigValidationError {
+                        field: "storage.s3".to_string(),
+                        message: "S3 storage configuration required when using s3:// URIs. Add a [storage.s3] section to config.yaml or set CERTSTREAM_STORAGE_S3_ENDPOINT env var.".to_string(),
+                    });
+                }
+                Some(s3) => {
+                    if s3.endpoint.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.endpoint".to_string(),
+                            message: "S3 endpoint cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                    if s3.region.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.region".to_string(),
+                            message: "S3 region cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                    if s3.access_key_id.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.access_key_id".to_string(),
+                            message: "S3 access key ID cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                    if s3.secret_access_key.is_empty() {
+                        errors.push(ConfigValidationError {
+                            field: "storage.s3.secret_access_key".to_string(),
+                            message: "S3 secret access key cannot be empty when using s3:// URIs".to_string(),
+                        });
+                    }
+                }
+            }
         }
 
         if self.zerobus_sink.enabled {
@@ -903,6 +1131,7 @@ mod tests {
             delta_sink: DeltaSinkConfig::default(),
             query_api: QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
+            storage: StorageConfig::default(),
             config_path: None,
         }
     }
@@ -1563,6 +1792,565 @@ flush_interval_secs: 30
             ..test_config()
         };
         assert!(config.validate().is_ok());
+    }
+
+    // Task 2: Tests for StorageConfig defaults and deserialization
+
+    #[test]
+    fn test_storage_config_defaults() {
+        // Verifies uri-storage.AC2.2: Default StorageConfig has s3: None
+        let config = StorageConfig::default();
+        assert!(config.s3.is_none());
+    }
+
+    #[test]
+    fn test_s3_storage_config_defaults() {
+        // Verifies uri-storage.AC2.2: Default S3StorageConfig has empty strings and None options
+        let config = S3StorageConfig::default();
+        assert_eq!(config.endpoint, "");
+        assert_eq!(config.region, "");
+        assert_eq!(config.access_key_id, "");
+        assert_eq!(config.secret_access_key, "");
+        assert!(config.conditional_put.is_none());
+        assert!(config.allow_http.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_yaml_with_s3_section() {
+        // Verifies uri-storage.AC2.1: Deserialize YAML with storage.s3 section
+        let yaml = r#"
+s3:
+  endpoint: "https://s3.example.com"
+  region: "us-east-1"
+  access_key_id: "test-key-id"
+  secret_access_key: "test-secret"
+  conditional_put: "etag"
+  allow_http: false
+"#;
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.s3.is_some());
+        let s3 = config.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "us-east-1");
+        assert_eq!(s3.access_key_id, "test-key-id");
+        assert_eq!(s3.secret_access_key, "test-secret");
+        assert_eq!(s3.conditional_put, Some("etag".to_string()));
+        assert_eq!(s3.allow_http, Some(false));
+    }
+
+    #[test]
+    fn test_storage_config_yaml_partial_s3_section() {
+        // Verifies uri-storage.AC2.1: Partial S3 config with defaults
+        let yaml = r#"
+s3:
+  endpoint: "https://s3.example.com"
+  region: "us-west-2"
+"#;
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.s3.is_some());
+        let s3 = config.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "us-west-2");
+        assert_eq!(s3.access_key_id, "");
+        assert_eq!(s3.secret_access_key, "");
+        assert!(s3.conditional_put.is_none());
+        assert!(s3.allow_http.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_yaml_no_s3_section() {
+        // Verifies uri-storage.AC2.2: Config with no storage section at all
+        let yaml = "port: 8080";
+        let config: StorageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.s3.is_none());
+    }
+
+    #[test]
+    fn test_storage_config_env_var_override_endpoint() {
+        // Verifies uri-storage.AC2.5: Env var override pattern
+        unsafe {
+            env::set_var("CERTSTREAM_STORAGE_S3_ENDPOINT", "https://custom-s3.example.com");
+        }
+        let mut storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://original.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+        if let Some(ref mut s3) = storage.s3 {
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT") {
+                s3.endpoint = v;
+            }
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_STORAGE_S3_ENDPOINT");
+        }
+        assert_eq!(storage.s3.unwrap().endpoint, "https://custom-s3.example.com");
+    }
+
+    #[test]
+    fn test_storage_config_env_var_endpoint_trigger_s3_creation() {
+        // Verifies uri-storage.AC2.5: Endpoint env var triggers S3 config creation
+        unsafe {
+            env::set_var("CERTSTREAM_STORAGE_S3_ENDPOINT", "https://s3.example.com");
+            env::set_var("CERTSTREAM_STORAGE_S3_REGION", "auto");
+        }
+        let mut storage = StorageConfig::default();
+        let endpoint = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT").unwrap_or_default();
+        if !endpoint.is_empty() {
+            storage.s3 = Some(S3StorageConfig {
+                endpoint,
+                region: env::var("CERTSTREAM_STORAGE_S3_REGION").unwrap_or_default(),
+                access_key_id: env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID").unwrap_or_default(),
+                secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+                conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
+                allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+            });
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_STORAGE_S3_ENDPOINT");
+            env::remove_var("CERTSTREAM_STORAGE_S3_REGION");
+        }
+        assert!(storage.s3.is_some());
+        let s3 = storage.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "auto");
+    }
+
+    #[test]
+    fn test_storage_config_env_var_no_endpoint_no_s3_created() {
+        // Verifies: Setting CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID WITHOUT ENDPOINT doesn't create S3 config
+        unsafe {
+            env::set_var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID", "test-key");
+            env::remove_var("CERTSTREAM_STORAGE_S3_ENDPOINT"); // Make sure endpoint is not set
+        }
+        let mut storage = StorageConfig::default();
+        let endpoint = env::var("CERTSTREAM_STORAGE_S3_ENDPOINT").unwrap_or_default();
+        if !endpoint.is_empty() {
+            storage.s3 = Some(S3StorageConfig {
+                endpoint,
+                region: env::var("CERTSTREAM_STORAGE_S3_REGION").unwrap_or_default(),
+                access_key_id: env::var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID").unwrap_or_default(),
+                secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
+                conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
+                allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+            });
+        }
+        unsafe {
+            env::remove_var("CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID");
+        }
+        assert!(storage.s3.is_none());
+    }
+
+    // Task 4: Tests for parse_table_uri() and resolve_storage_options()
+    // Verifies uri-storage.AC1.1
+    #[test]
+    fn test_parse_table_uri_absolute_path() {
+        let result = parse_table_uri("file:///absolute/path");
+        assert_eq!(
+            result,
+            Ok(TableLocation::Local {
+                path: "/absolute/path".to_string()
+            })
+        );
+    }
+
+    // Verifies uri-storage.AC1.2
+    #[test]
+    fn test_parse_table_uri_relative_path() {
+        let result = parse_table_uri("file://./relative/path");
+        assert_eq!(
+            result,
+            Ok(TableLocation::Local {
+                path: "./relative/path".to_string()
+            })
+        );
+    }
+
+    // Verifies uri-storage.AC1.3
+    #[test]
+    fn test_parse_table_uri_s3() {
+        let result = parse_table_uri("s3://bucket/prefix");
+        assert_eq!(
+            result,
+            Ok(TableLocation::S3 {
+                uri: "s3://bucket/prefix".to_string()
+            })
+        );
+    }
+
+    // Verifies uri-storage.AC1.4
+    #[test]
+    fn test_parse_table_uri_bare_path() {
+        let result = parse_table_uri("./data/certstream");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("file://"));
+        assert!(err_msg.contains("./data/certstream"));
+    }
+
+    // Verifies uri-storage.AC1.5
+    #[test]
+    fn test_parse_table_uri_unsupported_scheme() {
+        let result = parse_table_uri("gcs://bucket/path");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("Unsupported URI scheme"));
+        assert!(err_msg.contains("gcs"));
+        assert!(err_msg.contains("file://"));
+        assert!(err_msg.contains("s3://"));
+    }
+
+    // Verifies uri-storage.AC1.6
+    #[test]
+    fn test_parse_table_uri_empty_string() {
+        let result = parse_table_uri("");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("cannot be empty"));
+    }
+
+    // Test resolve_storage_options with Local location
+    #[test]
+    fn test_resolve_storage_options_local() {
+        let location = TableLocation::Local {
+            path: "/tmp/data".to_string(),
+        };
+        let storage = StorageConfig::default();
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(opts.is_empty());
+    }
+
+    // Test resolve_storage_options with S3 location and full config
+    #[test]
+    fn test_resolve_storage_options_s3_full() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                conditional_put: Some("etag".to_string()),
+                allow_http: Some(false),
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL"),
+            Some(&"https://s3.example.com".to_string())
+        );
+        assert_eq!(opts.get("AWS_REGION"), Some(&"us-east-1".to_string()));
+        assert_eq!(
+            opts.get("AWS_ACCESS_KEY_ID"),
+            Some(&"AKIAIOSFODNN7EXAMPLE".to_string())
+        );
+        assert_eq!(
+            opts.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string())
+        );
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+        assert_eq!(opts.get("AWS_ALLOW_HTTP"), Some(&"false".to_string()));
+    }
+
+    // Test resolve_storage_options with S3 location but no S3 config
+    #[test]
+    fn test_resolve_storage_options_s3_no_config() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig::default(); // s3: None
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(opts.is_empty());
+    }
+
+    // Test resolve_storage_options with S3 location and conditional_put set
+    #[test]
+    fn test_resolve_storage_options_s3_conditional_put() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: String::new(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                conditional_put: Some("etag".to_string()),
+                allow_http: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL"),
+            Some(&"https://s3.example.com".to_string())
+        );
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+        // Other fields are empty so should not be in the map
+        assert!(!opts.contains_key("AWS_REGION"));
+    }
+
+    // Test resolve_storage_options with S3 location and allow_http true
+    #[test]
+    fn test_resolve_storage_options_s3_allow_http() {
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "http://localhost:9000".to_string(),
+                region: String::new(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                conditional_put: None,
+                allow_http: Some(true),
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+
+        assert_eq!(
+            opts.get("AWS_ENDPOINT_URL"),
+            Some(&"http://localhost:9000".to_string())
+        );
+        assert_eq!(opts.get("AWS_ALLOW_HTTP"), Some(&"true".to_string()));
+    }
+
+    // Test URI validation: AC2.1 - Config with S3 URI and full storage config validates OK
+    #[test]
+    fn test_validate_s3_uri_with_full_config() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with S3 URI and full config");
+    }
+
+    // Test URI validation: AC2.2 - Config with file:// URI and no S3 config validates OK
+    #[test]
+    fn test_validate_file_uri_without_s3_config() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "file://./data/certstream".to_string();
+        config.storage = StorageConfig { s3: None };
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with file:// URI without S3 config");
+    }
+
+    // Test URI validation: AC2.3 - Config with S3 URI but missing storage.s3 fails validation
+    #[test]
+    fn test_validate_s3_uri_without_storage_config() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig { s3: None };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with S3 URI but no storage config");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3"),
+            "error should be on storage.s3 field"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("S3 storage configuration required")),
+            "error message should suggest S3 configuration required"
+        );
+    }
+
+    // Test URI validation: AC2.4 - Config with S3 URI but empty endpoint fails validation
+    #[test]
+    fn test_validate_s3_uri_with_empty_endpoint() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: String::new(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty endpoint");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3.endpoint"),
+            "error should be on storage.s3.endpoint field"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("S3 endpoint cannot be empty")),
+            "error message should indicate empty endpoint"
+        );
+    }
+
+    // Test URI validation: AC2.6 - parse_table_uri validates both file:// and bare paths
+    #[test]
+    fn test_validate_staging_path_uri_format() {
+        // Valid file:// URI should succeed
+        let result = parse_table_uri("file:///tmp/staging");
+        assert!(result.is_ok(), "file:/// URI should parse successfully");
+
+        // Bare path should fail with helpful error
+        let result = parse_table_uri("/tmp/staging");
+        assert!(result.is_err(), "bare path should fail validation");
+        let error_msg = result.unwrap_err();
+        assert!(
+            error_msg.contains("must use a URI scheme"),
+            "error should suggest using URI scheme, got: {}",
+            error_msg
+        );
+    }
+
+    // Test URI validation: AC2.3/AC2.6 - Config with bare path (no scheme) fails validation
+    #[test]
+    fn test_validate_bare_path_without_scheme() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "./data/certstream".to_string();
+
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "validation should fail with bare path (no scheme)"
+        );
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "delta_sink.table_path"),
+            "error should be on delta_sink.table_path field"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must use a URI scheme")),
+            "error message should suggest using URI scheme"
+        );
+    }
+
+    // Test URI validation: query_api.table_path is validated when enabled
+    #[test]
+    fn test_validate_query_api_table_path_uri() {
+        let mut config = test_config();
+        config.query_api.enabled = true;
+        config.query_api.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig { s3: None };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with S3 URI in query_api");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3"),
+            "error should be on storage.s3 field"
+        );
+    }
+
+    // Test URI validation: S3 region requirement when using S3
+    #[test]
+    fn test_validate_s3_uri_with_empty_region() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: String::new(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty region");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "storage.s3.region"),
+            "error should be on storage.s3.region field"
+        );
+    }
+
+    // Test URI validation: S3 access_key_id requirement when using S3
+    #[test]
+    fn test_validate_s3_uri_with_empty_access_key() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: String::new(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty access key");
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "storage.s3.access_key_id"),
+            "error should be on storage.s3.access_key_id field"
+        );
+    }
+
+    // Test URI validation: S3 secret_access_key requirement when using S3
+    #[test]
+    fn test_validate_s3_uri_with_empty_secret_key() {
+        let mut config = test_config();
+        config.delta_sink.enabled = true;
+        config.delta_sink.table_path = "s3://bucket/path".to_string();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: String::new(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty secret key");
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "storage.s3.secret_access_key"),
+            "error should be on storage.s3.secret_access_key field"
+        );
     }
 
     #[test]

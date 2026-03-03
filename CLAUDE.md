@@ -21,15 +21,15 @@ Last context update: 2026-03-02
 - `cargo run -- --backfill` - Run delta backfill mode (catch-up gaps)
 - `cargo run -- --backfill --from 0` - Run historical backfill from index 0
 - `cargo run -- --backfill --logs "google"` - Backfill only logs matching filter
-- `cargo run -- --backfill --staging-path /tmp/staging` - Backfill into staging table
+- `cargo run -- --backfill --staging-path file:///tmp/staging` - Backfill into staging table
 - `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
-- `cargo run -- --merge --staging-path /tmp/staging` - Merge staging into main table
-- `cargo run -- --migrate --output <PATH>` - Migrate Delta table to new schema
-- `cargo run -- --migrate --output <PATH> --source <SRC> --from <DATE> --to <DATE>` - Migrate with source and date filters
+- `cargo run -- --merge --staging-path file:///tmp/staging` - Merge staging into main table
+- `cargo run -- --migrate --output file:///tmp/output` - Migrate Delta table to new schema
+- `cargo run -- --migrate --output file:///tmp/output --source file:///tmp/source --from 2026-02-01 --to 2026-02-28` - Migrate with source and date filters
 - `cargo run -- --reparse-audit` - Audit stored certs against current parsing code
 - `cargo run -- --reparse-audit --from-date 2026-02-01 --to-date 2026-02-28` - Audit with date filter
-- `cargo run -- --extract-metadata --output /tmp/metadata` - Extract metadata-only Delta table
-- `cargo run -- --extract-metadata --output /tmp/metadata --from-date 2026-02-01` - Extract with date filter
+- `cargo run -- --extract-metadata --output file:///tmp/metadata` - Extract metadata-only Delta table
+- `cargo run -- --extract-metadata --output file:///tmp/metadata --from-date 2026-02-01` - Extract with date filter
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
@@ -75,6 +75,19 @@ The binary has six execution modes selected in main.rs:
 - Env var pattern: `CERTSTREAM_<SECTION>_<FIELD>` (e.g., `CERTSTREAM_DELTA_SINK_ENABLED`)
 - All optional features use an `enabled: bool` field (default false)
 - Graceful shutdown via CancellationToken propagated to all tasks
+- **Table paths require URI scheme**: all `table_path` and `staging_path` values must use `file://` for local filesystem or `s3://` for S3-compatible storage; bare paths are rejected by `parse_table_uri()` at config validation and CLI dispatch
+- **Defense-in-depth URI handling**: production code uses `DeltaTableBuilder::from_valid_uri()` which returns a Result, rather than `from_uri()` which panics on invalid URIs
+
+## Storage Config Contracts
+- **Config**: `StorageConfig { s3: Option<S3StorageConfig> }` — top-level config section for storage backend credentials
+- **S3StorageConfig**: `{ endpoint, region, access_key_id, secret_access_key, conditional_put: Option<String>, allow_http: Option<bool> }`
+- **Env vars**: `CERTSTREAM_STORAGE_S3_ENDPOINT`, `CERTSTREAM_STORAGE_S3_REGION`, `CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID`, `CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY`, `CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT`, `CERTSTREAM_STORAGE_S3_ALLOW_HTTP`
+- **Env var trigger**: if no `storage.s3` section in YAML, `CERTSTREAM_STORAGE_S3_ENDPOINT` being non-empty triggers creation of S3 config from env vars; if endpoint is empty/unset, no S3 config is created even if other S3 env vars are set
+- **TableLocation enum**: `Local { path }` or `S3 { uri }`; `as_uri()` returns the string for `DeltaTableBuilder::from_uri()` (stripped path for Local, full `s3://` URI for S3)
+- **`parse_table_uri(uri)`**: parses `file://` to `Local`, `s3://` to `S3`; rejects empty URIs, unsupported schemes, and bare paths (suggests `file://` prefix)
+- **`resolve_storage_options(location, storage)`**: returns `HashMap<String, String>` — empty for Local, AWS-compatible options (`AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `conditional_put`, `AWS_ALLOW_HTTP`) for S3
+- **Validation (when S3 URIs used)**: `storage.s3` must be present; `endpoint`, `region`, `access_key_id`, `secret_access_key` must be non-empty; validated during `Config::validate()`
+- **Validation scope**: `delta_sink.table_path` validated when delta_sink enabled; `query_api.table_path` validated when query_api enabled; `--staging-path` validated at CLI dispatch in main.rs (both backfill and merge modes)
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
@@ -128,7 +141,8 @@ The binary has six execution modes selected in main.rs:
 - **Query timeout**: DataFusion execution wrapped in `tokio::time::timeout`; exceeded returns 504
 - **Response fields**: `version`, `results[]` (cert_index, fingerprint, sha256, serial_number, subject, issuer, not_before, not_after, all_domains, source_name, seen, is_ca), `next_cursor`, `has_more`
 - **Heavy fields excluded**: as_der, chain, cert_link, source_url, update_type, signature_algorithm not returned
-- **Startup validation**: warns if table_path does not exist (non-fatal; queries return 503 until data written)
+- **Storage options**: `QueryApiState` holds `storage_options: HashMap<String, String>` resolved from `parse_table_uri()` and `resolve_storage_options()` at startup; passed to `DeltaTableBuilder` for all table opens (latest and versioned)
+- **Startup validation**: for local paths, warns if table_path does not exist (non-fatal; queries return 503 until data written); for S3 paths, skips local filesystem check
 - **Metrics**: `certstream_query_requests` (counter, labeled by status), `certstream_query_duration_seconds` (histogram), `certstream_query_results_count` (histogram)
 - **Reads from**: same Delta table written by delta_sink and backfill
 

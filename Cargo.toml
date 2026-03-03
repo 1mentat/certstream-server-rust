@@ -48,7 +48,7 @@ arc-swap = "1.7"
 tokio-util = { version = "0.7.18", features = ["full"] }
 futures = "0.3.31"
 flate2 = "1.0"
-deltalake = { version = "0.25", features = ["datafusion"] }
+deltalake = { version = "0.25", features = ["datafusion", "s3"] }
 prost = "0.13"
 prost-types = "0.13"
 databricks-zerobus-ingest-sdk = "0.1"
@@ -56,6 +56,7 @@ parquet = "54"
 
 [dev-dependencies]
 rcgen = "0.13"
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 prost-build = "0.13"

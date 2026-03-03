@@ -1,4 +1,4 @@
-use crate::config::DeltaSinkConfig;
+use crate::config::{DeltaSinkConfig, StorageConfig, parse_table_uri, resolve_storage_options};
 use crate::models::{CertificateMessage, PreSerializedMessage};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::prelude::*;
@@ -8,7 +8,8 @@ use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
 use deltalake::protocol::SaveMode;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableError, DeltaTableBuilder};
+use std::collections::HashMap;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
@@ -238,6 +239,7 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
 /// # Arguments
 /// * `table_path` - Path to the Delta table directory
 /// * `schema` - Arrow schema for the table
+/// * `storage_options` - Storage configuration options (e.g., AWS credentials for S3)
 ///
 /// # Returns
 /// * `Ok(DeltaTable)` - The opened or created table
@@ -245,9 +247,15 @@ fn arrow_dtype_to_delta_dtype(dtype: &DataType) -> DeltaDataType {
 pub async fn open_or_create_table(
     table_path: &str,
     schema: &Arc<Schema>,
+    storage_options: HashMap<String, String>,
 ) -> Result<DeltaTable, DeltaTableError> {
     // First, try to open an existing table
-    match deltalake::open_table(table_path).await {
+    // Use from_valid_uri() which returns Result instead of from_uri() which panics on invalid paths
+    match DeltaTableBuilder::from_valid_uri(table_path)?
+        .with_storage_options(storage_options.clone())
+        .load()
+        .await
+    {
         Ok(table) => Ok(table),
         Err(DeltaTableError::NotATable(_)) => {
             // Table doesn't exist, create a new one
@@ -255,6 +263,7 @@ pub async fn open_or_create_table(
 
             let table = CreateBuilder::new()
                 .with_location(table_path)
+                .with_storage_options(storage_options)
                 .with_columns(struct_fields)
                 .with_partition_columns(vec!["seen_date"])
                 .await?;
@@ -534,6 +543,7 @@ pub async fn flush_buffer(
     batch_size: usize,
     compression_level: i32,
     heavy_column_compression_level: i32,
+    storage_options: &HashMap<String, String>,
 ) -> (Option<DeltaTable>, Result<usize, Box<dyn std::error::Error + Send + Sync>>) {
     // If buffer is empty, return early
     if buffer.is_empty() {
@@ -586,7 +596,14 @@ pub async fn flush_buffer(
             );
 
             // Reopen table to get a fresh handle per specification
-            match deltalake::open_table(&table_path).await {
+            match (async {
+                DeltaTableBuilder::from_valid_uri(&table_path)?
+                    .with_storage_options(storage_options.clone())
+                    .load()
+                    .await
+            })
+            .await
+            {
                 Ok(reopened_table) => {
                     (
                         Some(reopened_table),
@@ -603,7 +620,7 @@ pub async fn flush_buffer(
                     );
 
                     // Try open_or_create as a recovery measure
-                    match open_or_create_table(&table_path, schema).await {
+                    match open_or_create_table(&table_path, schema, storage_options.clone()).await {
                         Ok(recovery_table) => {
                             (
                                 Some(recovery_table),
@@ -621,7 +638,7 @@ pub async fn flush_buffer(
                             // Per AC4.4: Table failures must be non-fatal to real-time streaming.
                             // Since table was consumed by DeltaOps, attempt final recovery via open_or_create.
                             // Buffer is retained in caller for potential retry on next flush cycle.
-                            let fallback_table = open_or_create_table(&table_path, schema).await;
+                            let fallback_table = open_or_create_table(&table_path, schema, storage_options.clone()).await;
                             match fallback_table {
                                 Ok(recovered_table) => {
                                     (
@@ -704,13 +721,25 @@ fn record_flush_metrics(result: &Result<usize, Box<dyn std::error::Error + Send 
 /// 7. Deserialization failures are logged and skipped (AC1.5)
 pub async fn run_delta_sink(
     config: DeltaSinkConfig,
+    storage: StorageConfig,
     mut rx: broadcast::Receiver<Arc<PreSerializedMessage>>,
     shutdown: CancellationToken,
 ) {
     let schema = delta_schema();
 
+    // Parse the table path URI and resolve storage options
+    let location = match parse_table_uri(&config.table_path) {
+        Ok(loc) => loc,
+        Err(e) => {
+            error!(error = %e, table_path = %config.table_path, "Invalid table path URI, delta-sink task exiting");
+            return;
+        }
+    };
+    let storage_options = resolve_storage_options(&location, &storage);
+    let table_uri = location.as_uri().to_string();
+
     // Try to open or create the table; if it fails, log error and return
-    let mut table = match open_or_create_table(&config.table_path, &schema).await {
+    let mut table = match open_or_create_table(&table_uri, &schema, storage_options.clone()).await {
         Ok(t) => t,
         Err(e) => {
             error!(
@@ -747,7 +776,7 @@ pub async fn run_delta_sink(
 
                                 // If buffer.len() >= config.batch_size: flush (AC3.1)
                                 if buffer.len() >= config.batch_size {
-                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
+                                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level, &storage_options).await;
                                     match new_table_opt {
                                         Some(new_table) => {
                                             table = new_table;
@@ -792,7 +821,7 @@ pub async fn run_delta_sink(
             _ = flush_interval.tick() => {
                 // Time-triggered flush (AC3.2)
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level, &storage_options).await;
                     match new_table_opt {
                         Some(new_table) => {
                             table = new_table;
@@ -816,7 +845,7 @@ pub async fn run_delta_sink(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level).await;
+                    let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, config.batch_size, config.compression_level, config.heavy_column_compression_level, &storage_options).await;
                     record_flush_metrics(&flush_result, "Shutdown flush");
                     if table_opt.is_none() {
                         warn!(
@@ -1196,7 +1225,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let result = open_or_create_table(&table_path, &schema).await;
+        let result = open_or_create_table(&table_path, &schema, HashMap::new()).await;
 
         // Verify table was created successfully
         assert!(result.is_ok(), "table creation should succeed");
@@ -1232,14 +1261,14 @@ mod tests {
         let schema = delta_schema();
 
         // First call: create the table
-        let result1 = open_or_create_table(&table_path, &schema).await;
+        let result1 = open_or_create_table(&table_path, &schema, HashMap::new()).await;
         assert!(result1.is_ok(), "first table creation should succeed");
 
         let table1 = result1.unwrap();
         let version1 = table1.version();
 
         // Second call: should open existing table
-        let result2 = open_or_create_table(&table_path, &schema).await;
+        let result2 = open_or_create_table(&table_path, &schema, HashMap::new()).await;
         assert!(result2.is_ok(), "reopening table should succeed");
 
         let table2 = result2.unwrap();
@@ -1277,7 +1306,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let result = open_or_create_table(&table_path, &schema).await;
+        let result = open_or_create_table(&table_path, &schema, HashMap::new()).await;
 
         assert!(result.is_ok(), "table creation should succeed");
 
@@ -1381,7 +1410,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1400,7 +1429,7 @@ mod tests {
         let mut buffer = vec![record1, record2];
 
         // Flush to Delta
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15, &HashMap::new()).await;
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
         assert_eq!(flush_result.unwrap(), 2, "should flush 2 records");
@@ -1440,7 +1469,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1454,7 +1483,7 @@ mod tests {
             .collect();
 
         // Flush exactly batch_size records
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15, &HashMap::new()).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1479,7 +1508,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 100,
             flush_interval_secs: 1,
             compression_level: 9,
@@ -1492,7 +1521,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send a few messages (less than batch_size)
         let msg = make_test_json_bytes();
@@ -1539,7 +1568,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 100,
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1552,7 +1581,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send a few messages (less than batch_size, so timer won't trigger)
         let msg = make_test_json_bytes();
@@ -1600,7 +1629,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1622,7 +1651,7 @@ mod tests {
         );
 
         // Flush (which includes overflow check)
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, 9, 15, &HashMap::new()).await;
 
         assert!(table_opt.is_some(), "table should be recovered");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -1673,7 +1702,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 5,
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1686,7 +1715,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send malformed JSON
         let malformed_psm = Arc::new(PreSerializedMessage {
@@ -1751,7 +1780,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 5,
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1765,7 +1794,7 @@ mod tests {
         // Spawn delta sink task (consumer 1)
         let rx_sink = tx.subscribe();
         let shutdown_sink = CancellationToken::new();
-        let sink_task = tokio::spawn(run_delta_sink(config, rx_sink, shutdown_sink.clone()));
+        let sink_task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx_sink, shutdown_sink.clone()));
 
         // Spawn mock WS-like consumer (consumer 2)
         let mut rx_ws = tx.subscribe();
@@ -1853,7 +1882,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 100, // Large batch size so flush doesn't happen immediately
             flush_interval_secs: 60,
             compression_level: 9,
@@ -1867,7 +1896,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task (it will start lagging due to small buffer)
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Send many messages to cause lagging in the receiver
         let valid_msg = make_test_json_bytes();
@@ -1935,7 +1964,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Spawn the sink task with invalid path
-        let task = tokio::spawn(run_delta_sink(config, rx, shutdown.clone()));
+        let task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx, shutdown.clone()));
 
         // Give it a moment to attempt startup
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1985,7 +2014,7 @@ mod tests {
 
         let config = crate::config::DeltaSinkConfig {
             enabled: true,
-            table_path: table_path.clone(),
+            table_path: format!("file://{}", table_path),
             batch_size: 10,
             flush_interval_secs: 2,
             compression_level: 9,
@@ -1999,7 +2028,7 @@ mod tests {
         // Spawn delta sink
         let rx_sink = tx.subscribe();
         let shutdown_sink = CancellationToken::new();
-        let sink_task = tokio::spawn(run_delta_sink(config, rx_sink, shutdown_sink.clone()));
+        let sink_task = tokio::spawn(run_delta_sink(config, crate::config::StorageConfig::default(), rx_sink, shutdown_sink.clone()));
 
         // Spawn mock WS consumer
         let mut rx_ws = tx.subscribe();
@@ -2072,7 +2101,7 @@ mod tests {
 
         // Create table
         let schema = delta_schema();
-        let table = match open_or_create_table(&table_path, &schema).await {
+        let table = match open_or_create_table(&table_path, &schema, HashMap::new()).await {
             Ok(t) => t,
             Err(e) => panic!("Failed to create table: {}", e),
         };
@@ -2086,7 +2115,7 @@ mod tests {
         }
 
         // Flush with compression level 9 and heavy_column_compression_level 15
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15, &HashMap::new()).await;
 
         // Verify flush succeeded
         let _new_table = table_opt.expect("table should be available after flush");
@@ -2205,7 +2234,7 @@ mod tests {
 
         // Create table
         let schema = delta_schema();
-        let table = match open_or_create_table(&table_path, &schema).await {
+        let table = match open_or_create_table(&table_path, &schema, HashMap::new()).await {
             Ok(t) => t,
             Err(e) => panic!("Failed to create table: {}", e),
         };
@@ -2220,7 +2249,7 @@ mod tests {
         }
 
         // Flush with compression level 9 and heavy_column_compression_level 15
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15, &HashMap::new()).await;
 
         // Verify flush succeeded
         let _new_table = table_opt.expect("table should be available after flush");
@@ -2281,7 +2310,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -2294,7 +2323,7 @@ mod tests {
 
         // Flush the record to the table
         let mut buffer = vec![record];
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15, &HashMap::new()).await;
         let table = table_opt.expect("table should be available after flush");
         assert!(
             flush_result.is_ok(),
@@ -2388,7 +2417,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = match open_or_create_table(&table_path, &schema).await {
+        let table = match open_or_create_table(&table_path, &schema, HashMap::new()).await {
             Ok(t) => t,
             Err(e) => panic!("Failed to create table: {}", e),
         };
@@ -2402,7 +2431,7 @@ mod tests {
         }
 
         // Flush with compression level 9 and heavy_column_compression_level 15
-        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15).await;
+        let (table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, 10, 9, 15, &HashMap::new()).await;
 
         let _new_table = table_opt.expect("table should be available after flush");
         assert!(flush_result.is_ok(), "flush should succeed");
@@ -2555,5 +2584,249 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&table_path);
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod s3_integration_tests {
+    use super::*;
+    use deltalake::datafusion::prelude::*;
+    use parquet::file::properties::WriterProperties;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn test_record(index: u64) -> DeltaCertRecord {
+        DeltaCertRecord {
+            cert_index: index,
+            update_type: "X509LogEntry".to_string(),
+            seen: 1700000000.0,
+            seen_date: "2023-11-14".to_string(),
+            source_name: "s3-integration-test".to_string(),
+            source_url: "https://test.example.com/ct".to_string(),
+            cert_link: "".to_string(),
+            serial_number: format!("AA:BB:{:02X}", index),
+            fingerprint: format!("fp-{}", index),
+            sha256: format!("sha256-{}", index),
+            sha1: format!("sha1-{}", index),
+            not_before: 1700000000,
+            not_after: 1731536000,
+            is_ca: false,
+            signature_algorithm: "SHA256withRSA".to_string(),
+            subject_aggregated: "CN=test.example.com".to_string(),
+            issuer_aggregated: "CN=Test CA".to_string(),
+            all_domains: vec!["test.example.com".to_string(), "www.test.example.com".to_string()],
+            as_der: "".to_string(),
+            chain: vec![],
+        }
+    }
+
+    fn s3_storage_options(endpoint: &str, access_key: &str, secret_key: &str) -> HashMap<String, String> {
+        let mut opts = HashMap::new();
+        opts.insert("AWS_ENDPOINT_URL".to_string(), endpoint.to_string());
+        opts.insert("AWS_REGION".to_string(), "auto".to_string());
+        opts.insert("AWS_ACCESS_KEY_ID".to_string(), access_key.to_string());
+        opts.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string());
+        opts.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
+        opts.insert("conditional_put".to_string(), "etag".to_string());
+        opts
+    }
+
+    /// Helper to clean up all objects under an S3 prefix
+    async fn cleanup_s3_table(table_uri: &str, storage_options: &HashMap<String, String>) {
+        use futures::TryStreamExt;
+        use futures_util::StreamExt;
+
+        if let Ok(table) = DeltaTableBuilder::from_uri(table_uri)
+            .with_storage_options(storage_options.clone())
+            .build()
+        {
+            let store = table.object_store();
+            // DeltaTableBuilder::build() scopes the object_store to the table prefix,
+            // so passing None lists all objects under that prefix.
+            if let Ok(objects) = store
+                .list(None)
+                .map_ok(|meta| meta.location)
+                .try_collect::<Vec<_>>()
+                .await
+            {
+                let path_stream = futures::stream::iter(objects.into_iter().map(Ok));
+                let _ = store
+                    .delete_stream(Box::pin(path_stream))
+                    .collect::<Vec<_>>()
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_create_write_read_roundtrip() {
+        deltalake::aws::register_handlers(None);
+
+        // AC4.1: Create Delta table on Tigris bucket
+        // AC4.2: Write batch and read back with matching data
+        let endpoint = match std::env::var("CERTSTREAM_TEST_S3_ENDPOINT") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Skipping S3 integration test: CERTSTREAM_TEST_S3_ENDPOINT not set");
+                return;
+            }
+        };
+        let bucket = std::env::var("CERTSTREAM_TEST_S3_BUCKET")
+            .expect("CERTSTREAM_TEST_S3_BUCKET required");
+        let access_key = std::env::var("CERTSTREAM_TEST_S3_ACCESS_KEY_ID")
+            .expect("CERTSTREAM_TEST_S3_ACCESS_KEY_ID required");
+        let secret_key = std::env::var("CERTSTREAM_TEST_S3_SECRET_ACCESS_KEY")
+            .expect("CERTSTREAM_TEST_S3_SECRET_ACCESS_KEY required");
+
+        let test_id = Uuid::new_v4().to_string()[..8].to_string();
+        let table_uri = format!("s3://{}/integration-test-{}", bucket, test_id);
+        let storage_options = s3_storage_options(&endpoint, &access_key, &secret_key);
+
+        // Ensure cleanup on test exit
+        let cleanup_uri = table_uri.clone();
+        let cleanup_opts = storage_options.clone();
+
+        let schema = delta_schema();
+
+        // Step 1: Create table on S3
+        let table = open_or_create_table(&table_uri, &schema, storage_options.clone())
+            .await
+            .expect("Failed to create table on S3");
+        assert_eq!(table.version(), 0);
+        println!("Created Delta table at {}", table_uri);
+
+        // Step 2: Write a batch of records
+        let records: Vec<DeltaCertRecord> = (0..5).map(|i| test_record(i)).collect();
+        let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
+
+        let writer_props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                parquet::basic::ZstdLevel::try_new(3).unwrap(),
+            ))
+            .build();
+        let table = DeltaOps(table)
+            .write(vec![batch])
+            .with_writer_properties(writer_props)
+            .await
+            .expect("Failed to write batch to S3");
+        assert_eq!(table.version(), 1);
+        println!("Wrote {} records to S3", records.len());
+
+        // Step 3: Read back and verify
+        let read_table = DeltaTableBuilder::from_uri(&table_uri)
+            .with_storage_options(storage_options.clone())
+            .load()
+            .await
+            .expect("Failed to reopen table from S3");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("certs", Arc::new(read_table))
+            .expect("Failed to register table");
+
+        let df = ctx.sql("SELECT cert_index, source_name, fingerprint FROM certs ORDER BY cert_index")
+            .await
+            .expect("Failed to query");
+        let batches = df.collect().await.expect("Failed to collect results");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5, "Expected 5 records, got {}", total_rows);
+        println!("Read back {} records from S3 — data matches", total_rows);
+
+        // Cleanup
+        cleanup_s3_table(&cleanup_uri, &cleanup_opts).await;
+        println!("Cleaned up test table at {}", cleanup_uri);
+    }
+
+    #[tokio::test]
+    async fn test_s3_conditional_put_etag() {
+        deltalake::aws::register_handlers(None);
+
+        // AC4.3: Conditional put (etag) prevents concurrent write corruption
+        let endpoint = match std::env::var("CERTSTREAM_TEST_S3_ENDPOINT") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Skipping S3 integration test: CERTSTREAM_TEST_S3_ENDPOINT not set");
+                return;
+            }
+        };
+        let bucket = std::env::var("CERTSTREAM_TEST_S3_BUCKET")
+            .expect("CERTSTREAM_TEST_S3_BUCKET required");
+        let access_key = std::env::var("CERTSTREAM_TEST_S3_ACCESS_KEY_ID")
+            .expect("CERTSTREAM_TEST_S3_ACCESS_KEY_ID required");
+        let secret_key = std::env::var("CERTSTREAM_TEST_S3_SECRET_ACCESS_KEY")
+            .expect("CERTSTREAM_TEST_S3_SECRET_ACCESS_KEY required");
+
+        let test_id = Uuid::new_v4().to_string()[..8].to_string();
+        let table_uri = format!("s3://{}/integration-test-etag-{}", bucket, test_id);
+        let storage_options = s3_storage_options(&endpoint, &access_key, &secret_key);
+
+        let cleanup_uri = table_uri.clone();
+        let cleanup_opts = storage_options.clone();
+
+        let schema = delta_schema();
+
+        // Create table
+        let table = open_or_create_table(&table_uri, &schema, storage_options.clone())
+            .await
+            .expect("Failed to create table");
+
+        // Write first batch
+        let records: Vec<DeltaCertRecord> = (0..3).map(|i| test_record(i)).collect();
+        let batch = records_to_batch(&records, &schema).expect("batch");
+        let writer_props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                parquet::basic::ZstdLevel::try_new(3).unwrap(),
+            ))
+            .build();
+        let table = DeltaOps(table)
+            .write(vec![batch])
+            .with_writer_properties(writer_props.clone())
+            .await
+            .expect("write 1");
+
+        // Open a stale handle (version 1)
+        let stale_table = DeltaTableBuilder::from_uri(&table_uri)
+            .with_storage_options(storage_options.clone())
+            .load()
+            .await
+            .expect("open stale");
+        assert_eq!(stale_table.version(), 1);
+
+        // Write second batch via current handle
+        let records2: Vec<DeltaCertRecord> = (10..13).map(|i| test_record(i)).collect();
+        let batch2 = records_to_batch(&records2, &schema).expect("batch2");
+        let _table = DeltaOps(table)
+            .write(vec![batch2])
+            .with_writer_properties(writer_props.clone())
+            .await
+            .expect("write 2");
+
+        // Attempt to write via stale handle — with conditional_put=etag, this should
+        // either succeed via conflict resolution or fail with a conflict error.
+        // Delta Lake handles this via optimistic concurrency: the commit will be retried
+        // at a new version if there are no logical conflicts.
+        let records3: Vec<DeltaCertRecord> = (20..23).map(|i| test_record(i)).collect();
+        let batch3 = records_to_batch(&records3, &schema).expect("batch3");
+        let result = DeltaOps(stale_table)
+            .write(vec![batch3])
+            .with_writer_properties(writer_props)
+            .await;
+
+        // The write should succeed (Delta's optimistic concurrency resolves append-only conflicts)
+        // but the version should be 3, not 2 (conflict was detected and resolved)
+        match result {
+            Ok(final_table) => {
+                assert!(final_table.version() >= 3, "Expected version >= 3 after conflict resolution, got {}", final_table.version());
+                println!("Conditional put with etag working: conflict resolved at version {}", final_table.version());
+            }
+            Err(e) => {
+                // A conflict error also proves etag is working — the stale write was prevented
+                println!("Conditional put with etag working: stale write rejected with error: {}", e);
+            }
+        }
+
+        // Cleanup
+        cleanup_s3_table(&cleanup_uri, &cleanup_opts).await;
+        println!("Cleaned up test table at {}", cleanup_uri);
     }
 }

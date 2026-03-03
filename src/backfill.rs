@@ -1,4 +1,4 @@
-use crate::config::{Config, ZerobusSinkConfig};
+use crate::config::{Config, ZerobusSinkConfig, parse_table_uri, resolve_storage_options};
 use crate::ct::fetch;
 use crate::ct::{fetch_log_list, CtLog, LogType};
 use crate::delta_sink::{delta_schema, delta_writer_properties, DeltaCertRecord, flush_buffer, open_or_create_table};
@@ -10,8 +10,8 @@ use databricks_zerobus_ingest_sdk::{StreamConfigurationOptions, TableProperties,
 use deltalake::arrow::array::*;
 use deltalake::arrow::datatypes::Field;
 use deltalake::datafusion::prelude::*;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableError};
-use futures::stream::StreamExt;
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, DeltaTableError, ObjectStore as _, Path};
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use std::collections::HashMap;
 use std::error::Error;
@@ -280,10 +280,11 @@ async fn detect_gaps_from_context(
 /// tables are registered and a UNION ALL view is created.
 ///
 /// # Arguments
-/// * `table_path` - Path to the main delta table
-/// * `staging_path` - Optional path to the staging delta table; if provided and exists, will be unioned with main
+/// * `table_path` - URI to the main delta table
+/// * `staging_path` - Optional URI to the staging delta table; if provided and exists, will be unioned with main
 /// * `logs` - Vec of (source_url, ceiling) pairs for active logs
 /// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
+/// * `storage_options` - HashMap of storage configuration options for S3 and other backends
 ///
 /// # Returns
 /// * Vec of BackfillWorkItem ranges to fetch
@@ -292,14 +293,31 @@ pub async fn detect_gaps(
     staging_path: Option<&str>,
     logs: &[(String, u64)],
     backfill_from: Option<u64>,
+    main_storage_options: &HashMap<String, String>,
+    staging_storage_options: Option<&HashMap<String, String>>,
 ) -> Result<Vec<BackfillWorkItem>, Box<dyn Error>> {
+    // Use staging-specific storage_options when available, fall back to main
+    let effective_staging_opts = staging_storage_options.unwrap_or(main_storage_options);
+
     // Try to open the main delta table; if it doesn't exist, try staging if provided
-    let table = match deltalake::open_table(table_path).await {
+    let table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(table_path)?
+            .with_storage_options(main_storage_options.clone())
+            .load()
+            .await
+    })().await
+    {
         Ok(t) => t,
         Err(_e @ DeltaTableError::NotATable(_)) | Err(_e @ DeltaTableError::InvalidTableLocation(_)) => {
             // Main table doesn't exist — try staging if provided
             if let Some(staging) = staging_path {
-                if let Ok(staging_table) = deltalake::open_table(staging).await {
+                if let Ok(staging_table) = (|| async {
+                    DeltaTableBuilder::from_valid_uri(staging)?
+                        .with_storage_options(effective_staging_opts.clone())
+                        .load()
+                        .await
+                })().await
+                {
                     let ctx = SessionContext::new();
                     ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
                     ctx.sql(
@@ -339,7 +357,13 @@ pub async fn detect_gaps(
 
     // Register UNION ALL view if staging table exists
     let has_staging = if let Some(staging) = staging_path {
-        match deltalake::open_table(staging).await {
+        match (|| async {
+            DeltaTableBuilder::from_valid_uri(staging)?
+                .with_storage_options(effective_staging_opts.clone())
+                .load()
+                .await
+        })().await
+        {
             Ok(staging_table) => {
                 ctx.register_table("ct_staging", std::sync::Arc::new(staging_table))?;
                 ctx.sql(
@@ -428,9 +452,11 @@ fn handle_flush(
 /// 4. Graceful shutdown signal
 ///
 /// # Arguments
-/// * `table_path` - Path to the Delta table
+/// * `table_path` - URI to the Delta table
 /// * `batch_size` - Maximum records per batch before flushing
 /// * `flush_interval_secs` - Maximum time between flushes in seconds
+/// * `compression_level` - ZSTD compression level for Delta writes
+/// * `storage_options` - HashMap of storage configuration options for S3 and other backends
 /// * `rx` - mpsc receiver for DeltaCertRecord from fetchers
 /// * `shutdown` - CancellationToken for graceful shutdown
 ///
@@ -442,22 +468,27 @@ async fn run_writer(
     flush_interval_secs: u64,
     compression_level: i32,
     heavy_column_compression_level: i32,
+    storage_options: HashMap<String, String>,
     mut rx: mpsc::Receiver<DeltaCertRecord>,
     shutdown: CancellationToken,
 ) -> WriterResult {
     let schema = delta_schema();
 
-    // Ensure the table directory exists
-    if let Err(e) = std::fs::create_dir_all(&table_path) {
-        warn!(error = %e, table_path = %table_path, "Failed to create table directory");
-        return WriterResult {
-            total_records_written: 0,
-            write_errors: 1,
-        };
+    // Only create local directories; S3 paths don't need this
+    if !table_path.starts_with("s3://") {
+        // Strip file:// prefix if present for actual filesystem operations
+        let local_path = table_path.strip_prefix("file://").unwrap_or(&table_path);
+        if let Err(e) = std::fs::create_dir_all(local_path) {
+            warn!(error = %e, table_path = %table_path, "Failed to create table directory");
+            return WriterResult {
+                total_records_written: 0,
+                write_errors: 1,
+            };
+        }
     }
 
     // Open or create the delta table
-    let mut table = match open_or_create_table(&table_path, &schema).await {
+    let mut table = match open_or_create_table(&table_path, &schema, storage_options.clone()).await {
         Ok(t) => {
             info!(table_path = %table_path, "Delta table opened/created for writing");
             t
@@ -489,7 +520,7 @@ async fn run_writer(
 
                         // Flush if buffer reaches batch_size threshold
                         if buffer.len() >= batch_size {
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level, &storage_options).await;
                             let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "batch size trigger");
                             if should_break {
                                 break;
@@ -504,7 +535,7 @@ async fn run_writer(
                                 records_in_buffer = buffer.len(),
                                 "Channel closed, flushing remaining buffer"
                             );
-                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level).await;
+                            let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level, &storage_options).await;
                             let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "channel close");
                         }
                         break;
@@ -514,7 +545,7 @@ async fn run_writer(
             _ = flush_timer.tick() => {
                 // Time-triggered flush
                 if !buffer.is_empty() {
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level, &storage_options).await;
                     let (opt_table, should_break) = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "time trigger");
                     if should_break {
                         break;
@@ -529,7 +560,7 @@ async fn run_writer(
                         records_in_buffer = buffer.len(),
                         "Graceful shutdown initiated, flushing remaining buffer"
                     );
-                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level).await;
+                    let (new_table_opt, flush_result) = flush_buffer(table, &mut buffer, &schema, batch_size, compression_level, heavy_column_compression_level, &storage_options).await;
                     let _unused = handle_flush(new_table_opt, flush_result, &mut total_records_written, &mut write_errors, "shutdown");
                 }
                 break;
@@ -699,6 +730,28 @@ pub async fn run_backfill(
         info!(logs_filter = %logs_filter, "backfill_logs filter");
     }
 
+    // Parse URIs and resolve storage options for main table
+    let main_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, "Invalid delta_sink.table_path URI");
+            return 1;
+        }
+    };
+
+    // Resolve storage options for staging path (may differ from main, e.g. local main + S3 staging)
+    let staging_storage_options = if let Some(ref sp) = staging_path {
+        match parse_table_uri(sp) {
+            Ok(location) => Some(resolve_storage_options(&location, &config.storage)),
+            Err(e) => {
+                error!(error = %e, "Invalid staging path URI");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     // Step 1: Log discovery
     let client = reqwest::Client::new();
     let mut logs = match fetch_log_list(&client, &config.ct_logs_url, config.custom_logs.clone()).await {
@@ -774,7 +827,7 @@ pub async fn run_backfill(
     } else {
         // Delta sink: use gap detection to find internal gaps
         let staging_path_ref = staging_path.as_deref();
-        match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from).await {
+        match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from, &main_storage_options, staging_storage_options.as_ref()).await {
             Ok(items) => items,
             Err(e) => {
                 warn!("gap detection failed: {}", e);
@@ -848,15 +901,19 @@ pub async fn run_backfill(
         })
     } else {
         // AC3.2: default to delta writer (backwards-compatible)
-        let table_path = staging_path
-            .unwrap_or_else(|| config.delta_sink.table_path.clone());
+        // Use staging storage_options when writing to staging path, main otherwise
+        let (table_path, writer_storage_options) = if let Some(sp) = staging_path {
+            (sp, staging_storage_options.unwrap_or_default())
+        } else {
+            (config.delta_sink.table_path.clone(), main_storage_options.clone())
+        };
         let batch_size = config.delta_sink.batch_size;
         let flush_interval_secs = config.delta_sink.flush_interval_secs;
         let compression_level = config.delta_sink.compression_level;
         let heavy_column_compression_level = config.delta_sink.heavy_column_compression_level;
         let shutdown_clone = shutdown.clone();
         tokio::spawn(async move {
-            run_writer(table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level, rx, shutdown_clone).await
+            run_writer(table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level, writer_storage_options, rx, shutdown_clone).await
         })
     };
 
@@ -923,6 +980,77 @@ pub async fn run_backfill(
     }
 }
 
+/// Remove all objects under a staging path. For local paths, uses std::fs::remove_dir_all.
+/// For S3 paths, lists and deletes all objects under the prefix via object_store APIs.
+async fn cleanup_staging(staging_path: &str, storage_options: &HashMap<String, String>) {
+    if staging_path.starts_with("s3://") {
+        // S3 cleanup: list all objects and delete them
+        match (|| async {
+            DeltaTableBuilder::from_valid_uri(staging_path)?
+                .with_storage_options(storage_options.clone())
+                .build()
+        })().await
+        {
+            Ok(table) => {
+                let store = table.object_store();
+                // DeltaTableBuilder::build() returns a table whose object_store() is
+                // already scoped to the table prefix within the S3 bucket.
+                // Passing None lists all objects under that prefix.
+                let objects: Vec<Path> = match store
+                    .list(None)
+                    .map_ok(|meta| meta.location)
+                    .try_collect()
+                    .await
+                {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        warn!(error = %e, staging_path = %staging_path, "failed to list staging objects for cleanup");
+                        return;
+                    }
+                };
+
+                if objects.is_empty() {
+                    info!(staging_path = %staging_path, "no staging objects to clean up");
+                    return;
+                }
+
+                let count = objects.len();
+                let path_stream = futures::stream::iter(objects.into_iter().map(Ok));
+                let results: Vec<_> = store
+                    .delete_stream(Box::pin(path_stream))
+                    .collect::<Vec<_>>()
+                    .await;
+
+                let errors: Vec<_> = results.iter().filter(|r: &&Result<_, _>| r.is_err()).collect();
+                if errors.is_empty() {
+                    info!(staging_path = %staging_path, objects_deleted = count, "S3 staging objects deleted");
+                } else {
+                    warn!(
+                        staging_path = %staging_path,
+                        errors = errors.len(),
+                        total = count,
+                        "some S3 staging objects failed to delete"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, staging_path = %staging_path, "failed to build table for staging cleanup");
+            }
+        }
+    } else {
+        // Local cleanup — strip file:// prefix if present
+        let local_path = staging_path.strip_prefix("file://").unwrap_or(staging_path);
+        match std::fs::remove_dir_all(local_path) {
+            Ok(_) => {
+                info!(staging_path = %staging_path, "staging directory deleted");
+            }
+            Err(e) => {
+                warn!(error = %e, staging_path = %staging_path, "failed to delete staging directory");
+            }
+        }
+    }
+}
+
 /// Merge mode: merges staging table into main table via Delta MERGE INTO deduplication.
 ///
 /// Reads all staging records as RecordBatches, converts each to a DataFrame, and merges
@@ -948,8 +1076,31 @@ pub async fn run_merge(
 
     let schema = delta_schema();
 
-    // Open staging table
-    let staging_table = match deltalake::open_table(&staging_path).await {
+    // Parse URIs and resolve storage options for both main and staging paths.
+    let main_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, "Invalid delta_sink.table_path URI");
+            return 1;
+        }
+    };
+
+    let staging_storage_options = match parse_table_uri(&staging_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, "Invalid staging path URI");
+            return 1;
+        }
+    };
+
+    // Open staging table using from_valid_uri for defense-in-depth
+    let staging_table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(&staging_path)?
+            .with_storage_options(staging_storage_options.clone())
+            .load()
+            .await
+    })().await
+    {
         Ok(t) => t,
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             info!(staging_path = %staging_path, "staging table does not exist, nothing to merge");
@@ -962,7 +1113,7 @@ pub async fn run_merge(
     };
 
     // Open or create main table
-    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema).await {
+    let main_table = match open_or_create_table(&config.delta_sink.table_path, &schema, main_storage_options.clone()).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "failed to open main table");
@@ -1108,16 +1259,8 @@ pub async fn run_merge(
         "merge complete"
     );
 
-    // Delete staging directory on success (AC3.4)
-    match std::fs::remove_dir_all(&staging_path) {
-        Ok(_) => {
-            info!(staging_path = %staging_path, "staging directory deleted");
-        }
-        Err(e) => {
-            warn!(error = %e, staging_path = %staging_path, "failed to delete staging directory");
-            // Non-fatal — merge succeeded, staging cleanup failed
-        }
-    }
+    // Delete staging directory/objects on success (AC3.4)
+    cleanup_staging(&staging_path, &staging_storage_options).await;
 
     0
 }
@@ -1151,8 +1294,29 @@ pub async fn run_migrate(
 
     let schema = delta_schema();
 
+    // Resolve storage options for source and output paths
+    let source_storage_options = match parse_table_uri(&source_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, source_path = %source_path, "failed to parse source table URI");
+            return 1;
+        }
+    };
+    let output_storage_options = match parse_table_uri(&output_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, output_path = %output_path, "failed to parse output table URI");
+            return 1;
+        }
+    };
+
     // Open source table
-    let source_table = match deltalake::open_table(&source_path).await {
+    let source_table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(&source_path)?
+            .with_storage_options(source_storage_options.clone())
+            .load()
+            .await
+    })().await {
         Ok(t) => t,
         Err(e) => {
             warn!(
@@ -1165,7 +1329,7 @@ pub async fn run_migrate(
     };
 
     // Create or open output table
-    let output_table = match open_or_create_table(&output_path, &schema).await {
+    let output_table = match open_or_create_table(&output_path, &schema, output_storage_options.clone()).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, output_path = %output_path, "failed to create output table");
@@ -1258,7 +1422,12 @@ pub async fn run_migrate(
         // Query all records for this partition
         let partition_ctx = SessionContext::new();
         if let Err(e) = partition_ctx.register_table("source", Arc::new(
-            match deltalake::open_table(&source_path).await {
+            match (|| async {
+                DeltaTableBuilder::from_valid_uri(&source_path)?
+                    .with_storage_options(source_storage_options.clone())
+                    .load()
+                    .await
+            })().await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(error = %e, "failed to reopen source table for partition");
@@ -1690,7 +1859,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1711,7 +1880,7 @@ mod tests {
         // Call detect_gaps in catch-up mode (no --from)
         // Second tuple element is ceiling (was tree_size)
         let logs = vec![("https://log.example.com".to_string(), 200)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1730,7 +1899,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1753,7 +1922,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=22 (no frontier gap generated)
         let logs = vec![("https://log.example.com".to_string(), 22)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1782,7 +1951,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1802,7 +1971,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=10
         let logs = vec![("https://log.example.com".to_string(), 10)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1820,7 +1989,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1842,7 +2011,7 @@ mod tests {
             ("https://log-a.example.com".to_string(), 10),
             ("https://log-b.example.com".to_string(), 10),
         ];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1871,7 +2040,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1891,7 +2060,7 @@ mod tests {
 
         // Call detect_gaps with --from 0, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1912,7 +2081,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -1932,7 +2101,7 @@ mod tests {
 
         // Call detect_gaps with --from 40, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(40))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(40), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1955,7 +2124,7 @@ mod tests {
 
         // Call detect_gaps in historical mode with --from 0
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1978,7 +2147,7 @@ mod tests {
 
         // Call detect_gaps in catch-up mode
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2002,13 +2171,13 @@ mod tests {
 
         // Create an empty delta table
         let schema = delta_schema();
-        let _table = open_or_create_table(&table_path, &schema)
+        let _table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
         // Simulate gap detection in catch-up mode with an empty table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2125,7 +2294,7 @@ mod tests {
         // Spawn writer
         let table_path_clone = table_path.clone();
         let writer_task = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, 9, 15, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send 2 records (should trigger batch flush)
@@ -2167,7 +2336,7 @@ mod tests {
         // Spawn writer task with batch_size = 3 to trigger flush on channel close
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 3, 60, 9, 15, rx, shutdown).await
+            run_writer(table_path_clone, 3, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send records
@@ -2235,7 +2404,7 @@ mod tests {
         // Spawn writer task with small batch size to trigger flush
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, 9, 15, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send records
@@ -2279,7 +2448,7 @@ mod tests {
 
         // Use invalid path to trigger table creation failure
         let writer_handle = tokio::spawn(async move {
-            run_writer("/invalid/path/that/cannot/be/created".to_string(), 10, 60, 9, 15, rx, shutdown).await
+            run_writer("/invalid/path/that/cannot/be/created".to_string(), 10, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send one record
@@ -2341,7 +2510,7 @@ mod tests {
         // Spawn writer task
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 10, 60, 9, 15, rx, shutdown).await
+            run_writer(table_path_clone, 10, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Wait for fetchers
@@ -2379,7 +2548,7 @@ mod tests {
         // Spawn writer
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, 2, 60, 9, 15, rx, shutdown).await
+            run_writer(table_path_clone, 2, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send records to trigger flushes
@@ -2414,7 +2583,7 @@ mod tests {
         // Spawn writer with batch_size=3
         let table_path_clone = table_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(table_path_clone, batch_size, 60, 9, 15, rx, shutdown).await
+            run_writer(table_path_clone, batch_size, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send exactly batch_size records to trigger flush
@@ -2450,7 +2619,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -2471,7 +2640,7 @@ mod tests {
         // ceiling=50 is below min_index=100; irrelevant in catch-up mode
         // but verifies AC3.3 is satisfied
         let logs = vec![("https://log.example.com".to_string(), 50)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2490,7 +2659,7 @@ mod tests {
         let _ = fs::create_dir_all(&table_path);
 
         let schema = delta_schema();
-        let table = open_or_create_table(&table_path, &schema)
+        let table = open_or_create_table(&table_path, &schema, HashMap::new())
             .await
             .expect("table creation failed");
 
@@ -2511,7 +2680,7 @@ mod tests {
 
         // ceiling=1000 (well above max_index=16)
         let logs = vec![("https://log.example.com".to_string(), 1000)];
-        let work_items = detect_gaps(&table_path, None, &logs, None)
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2532,7 +2701,7 @@ mod tests {
 
         // No table — historical mode with no delta table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0))
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2560,7 +2729,7 @@ mod tests {
 
         let staging_path_clone = staging_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(staging_path_clone, 3, 60, 9, 15, rx, shutdown).await
+            run_writer(staging_path_clone, 3, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send a few records
@@ -2650,7 +2819,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at indices [10, 11, 15, 16]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2667,7 +2836,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at indices [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2683,7 +2852,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=20 and staging_path
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2711,7 +2880,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at indices [10, 15]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2727,7 +2896,7 @@ mod tests {
 
         // First call with empty staging: should detect gap [11, 14]
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2737,7 +2906,7 @@ mod tests {
         assert_eq!(work_items_first[0].end, 14);
 
         // Now create staging with records at [11, 12]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2752,7 +2921,7 @@ mod tests {
             .expect("staging write failed");
 
         // Second call with staging populated: should detect smaller gap [13, 14]
-        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2779,7 +2948,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2795,7 +2964,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at [13, 14, 25] (25 is beyond ceiling)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2812,7 +2981,7 @@ mod tests {
 
         // Call with ceiling=20: verify no work items generated beyond index 19
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2840,7 +3009,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records at [10, 11, 15]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2857,7 +3026,7 @@ mod tests {
 
         // Call with nonexistent staging path
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None)
+        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2876,6 +3045,13 @@ mod tests {
         use crate::config::{DeltaSinkConfig, ZerobusSinkConfig};
         use std::net::IpAddr;
         use std::str::FromStr;
+
+        // Ensure table_path has file:// prefix for URI-based storage
+        let uri_table_path = if table_path.contains("://") {
+            table_path.to_string()
+        } else {
+            format!("file://{table_path}")
+        };
 
         Config {
             host: IpAddr::from_str("127.0.0.1").unwrap(),
@@ -2896,7 +3072,7 @@ mod tests {
             hot_reload: crate::config::HotReloadConfig::default(),
             delta_sink: DeltaSinkConfig {
                 enabled: true,
-                table_path: table_path.to_string(),
+                table_path: uri_table_path,
                 batch_size: 100,
                 flush_interval_secs: 60,
                 compression_level: 9,
@@ -2905,6 +3081,7 @@ mod tests {
             },
             query_api: crate::config::QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
+            storage: crate::config::StorageConfig::default(),
             config_path: None,
         }
     }
@@ -2914,17 +3091,19 @@ mod tests {
         // Verifies staging-backfill.AC3.1: `--merge --staging-path` inserts staging records
         // not present in main (matched on `source_url` + `cert_index`)
         let test_name = "ac3_1_merge_inserts";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table with records at cert_index [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -2940,7 +3119,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at cert_index [13, 14, 15]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -2991,17 +3170,19 @@ mod tests {
         // Verifies staging-backfill.AC3.2: Records already in main with matching
         // (source_url, cert_index) are skipped (not duplicated)
         let test_name = "ac3_2_merge_skips";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table with records at [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3017,7 +3198,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records at [11, 12, 13] (overlap on 11 and 12)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3068,17 +3249,19 @@ mod tests {
         // Verifies staging-backfill.AC3.3: Merge is idempotent — running it twice
         // with same staging data produces identical main table
         let test_name = "ac3_3_merge_idempotent";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table with [10, 11]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3093,7 +3276,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3114,7 +3297,8 @@ mod tests {
         assert_eq!(exit_code, 0, "First merge should succeed");
 
         // Verify staging was deleted after first merge (AC3.4)
-        assert!(!std::path::Path::new(&staging_path).exists(), "Staging should be deleted");
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        assert!(!std::path::Path::new(staging_local).exists(), "Staging should be deleted");
 
         // Get count after first merge
         let main_table = deltalake::open_table(&main_path)
@@ -3137,8 +3321,9 @@ mod tests {
         assert_eq!(count_after_first, 4, "Should have 4 records after first merge");
 
         // Recreate staging with same data [12, 13]
-        let _ = fs::create_dir_all(&staging_path);
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::create_dir_all(staging_local);
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3185,17 +3370,19 @@ mod tests {
     async fn test_ac3_4_staging_directory_deleted_on_success() {
         // Verifies staging-backfill.AC3.4: Staging directory is deleted after successful merge
         let test_name = "ac3_4_staging_deleted";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![make_test_record(1, "https://log.example.com")];
@@ -3207,7 +3394,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![make_test_record(2, "https://log.example.com")];
@@ -3231,29 +3418,33 @@ mod tests {
         assert_eq!(exit_code, 0, "Merge should succeed");
 
         // Verify staging directory no longer exists
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
         assert!(
-            !std::path::Path::new(&staging_path).exists(),
+            !std::path::Path::new(staging_local).exists(),
             "Staging directory should be deleted after successful merge"
         );
 
-        let _ = fs::remove_dir_all(&main_path);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let _ = fs::remove_dir_all(main_local);
     }
 
     #[tokio::test]
     async fn test_ac3_5_merge_returns_zero_and_logs_metrics() {
         // Verifies staging-backfill.AC3.5: Merge returns 0 and logs metrics
         let test_name = "ac3_5_merge_metrics";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table with [10, 11]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3268,7 +3459,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging with overlap: [11, 12, 13] (11 overlaps, 12 and 13 are new)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3301,15 +3492,17 @@ mod tests {
     async fn test_ac4_1_missing_staging_table_exits_zero() {
         // Verifies staging-backfill.AC4.1: Missing staging table exits 0 (nothing to merge)
         let test_name = "ac4_1_missing_staging";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
         // Do NOT create staging_path — it doesn't exist
 
         let schema = delta_schema();
-        let _ = open_or_create_table(&main_path, &schema)
+        let _ = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
 
@@ -3327,22 +3520,24 @@ mod tests {
     async fn test_ac4_1_empty_staging_table_exits_zero() {
         // Verifies staging-backfill.AC4.1: Empty staging table exits 0 (nothing to merge)
         let test_name = "ac4_1_empty_staging";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table
-        let _ = open_or_create_table(&main_path, &schema)
+        let _ = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
 
         // Create empty staging table (just schema, no data)
-        let _ = open_or_create_table(&staging_path, &schema)
+        let _ = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
 
@@ -3352,26 +3547,30 @@ mod tests {
 
         assert_eq!(exit_code, 0, "Empty staging table should exit with code 0");
 
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
     }
 
     #[tokio::test]
     async fn test_ac4_2_missing_main_table_auto_created() {
         // Verifies staging-backfill.AC4.2: Missing main table is auto-created
         let test_name = "ac4_2_missing_main";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(staging_local);
         // Create the main_path directory but leave it empty (no _delta_log yet)
-        let _ = fs::create_dir_all(&main_path);
+        let _ = fs::create_dir_all(main_local);
 
         let schema = delta_schema();
 
         // Create staging table with records [10, 11, 12]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3413,25 +3612,29 @@ mod tests {
             .expect("count should be Int64");
         assert_eq!(count_arr.value(0), 3, "Main table should have 3 records from staging");
 
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
     }
 
     #[tokio::test]
     async fn test_ac4_4_cancellation_preserves_staging() {
         // Verifies staging-backfill.AC4.4: Process interruption (SIGINT) leaves staging intact
         let test_name = "ac4_4_cancellation";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap_or(&main_path);
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table with records [10, 11, 12]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3447,7 +3650,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records [13, 14, 15]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3472,8 +3675,9 @@ mod tests {
         assert_eq!(exit_code, 1, "Merge should exit with code 1 when cancelled");
 
         // Verify staging directory still exists (was NOT deleted)
+        let staging_local = staging_path.strip_prefix("file://").unwrap_or(&staging_path);
         assert!(
-            std::path::Path::new(&staging_path).exists(),
+            std::path::Path::new(staging_local).exists(),
             "Staging directory should still exist after cancellation"
         );
 
@@ -3540,7 +3744,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create an empty main table
-        let _ = open_or_create_table(&main_path, &schema)
+        let _ = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
 
@@ -3550,7 +3754,7 @@ mod tests {
 
         let staging_path_clone = staging_path.clone();
         let writer_handle = tokio::spawn(async move {
-            run_writer(staging_path_clone, 3, 60, 9, 15, rx, shutdown).await
+            run_writer(staging_path_clone, 3, 60, 9, 15, HashMap::new(), rx, shutdown).await
         });
 
         // Send records to staging
@@ -3631,7 +3835,7 @@ mod tests {
         let schema = delta_schema();
 
         // Create main table with records [10, 11, 15, 16]
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let main_records = vec![
@@ -3648,7 +3852,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with records [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let staging_records = vec![
@@ -3667,7 +3871,7 @@ mod tests {
         // Data combined: [10, 11, 12, 13, 15, 16]
         // Gap: [14] (index 14 is missing)
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None)
+        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps catch-up failed");
 
@@ -3688,7 +3892,7 @@ mod tests {
         // Should start from 0 (--from 0) and fill to ceiling=20
         // Data union: [10, 11, 12, 13, 15, 16]
         // Gaps: [0-9] (pre-existing), [14] (internal)
-        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0))
+        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps historical failed");
 
@@ -3926,7 +4130,7 @@ mod tests {
         let b64_1 = STANDARD.encode(&der_bytes_1);
         let b64_2 = STANDARD.encode(&der_bytes_2);
 
-        let source_table = open_or_create_table(&source_path, &old_schema)
+        let source_table = open_or_create_table(&source_path, &old_schema, HashMap::new())
             .await
             .expect("source table creation failed");
         let batch = old_schema_batch(&old_schema, &[100, 200], &[&b64_1, &b64_2], "2024-01-15");
@@ -3940,7 +4144,7 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
+        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Read back output table and verify
@@ -4018,7 +4222,7 @@ mod tests {
         let old_schema = old_delta_schema();
         let b64 = STANDARD.encode(&[1u8, 2, 3]);
 
-        let source_table = open_or_create_table(&source_path, &old_schema)
+        let source_table = open_or_create_table(&source_path, &old_schema, HashMap::new())
             .await
             .expect("source table creation failed");
         let batch1 = old_schema_batch(&old_schema, &[100], &[&b64], "2024-01-15");
@@ -4040,7 +4244,7 @@ mod tests {
 
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
-        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
+        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
         assert_eq!(exit_code, 1, "migration with pre-cancelled token should exit 1");
 
         // Clean up
@@ -4059,7 +4263,7 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
+        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
         assert_eq!(exit_code, 1, "migration with nonexistent source should fail gracefully");
 
         // Clean up
@@ -4085,7 +4289,7 @@ mod tests {
         // Write a minimal record so the table has data, then test that migration works.
         let old_schema = old_delta_schema();
         let b64 = STANDARD.encode(&[1u8]);
-        let source_table = open_or_create_table(&source_path, &old_schema)
+        let source_table = open_or_create_table(&source_path, &old_schema, HashMap::new())
             .await
             .expect("source table creation failed");
         let batch = old_schema_batch(&old_schema, &[1], &[&b64], "2024-01-01");
@@ -4098,7 +4302,7 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
+        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Clean up
@@ -4125,7 +4329,7 @@ mod tests {
         let b64_2 = STANDARD.encode(&[4u8, 5, 6]);
         let b64_3 = STANDARD.encode(&[7u8, 8, 9]);
 
-        let source_table = open_or_create_table(&source_path, &old_schema)
+        let source_table = open_or_create_table(&source_path, &old_schema, HashMap::new())
             .await
             .expect("source table creation failed");
         let batch1 = old_schema_batch(&old_schema, &[100], &[&b64_1], "2024-01-14");
@@ -4155,8 +4359,8 @@ mod tests {
         let shutdown = CancellationToken::new();
         let exit_code = run_migrate(
             config,
-            output_path.clone(),
-            source_path.clone(),
+            format!("file://{output_path}"),
+            format!("file://{source_path}"),
             Some("2024-01-15".to_string()),
             Some("2024-01-15".to_string()),
             shutdown,
@@ -4210,7 +4414,7 @@ mod tests {
         // to ensure multiple batches are produced
         let old_schema = old_delta_schema();
 
-        let source_table = open_or_create_table(&source_path, &old_schema)
+        let source_table = open_or_create_table(&source_path, &old_schema, HashMap::new())
             .await
             .expect("source table creation failed");
 
@@ -4254,7 +4458,7 @@ mod tests {
         let mut config = make_test_config(&source_path);
         config.delta_sink.table_path = source_path.clone();
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, output_path.clone(), source_path.clone(), None, None, shutdown).await;
+        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Verify output table has all records with correct as_der binary values
@@ -4336,6 +4540,7 @@ mod tests {
                 1,   // flush_interval_secs
                 9,   // compression_level
                 15,  // heavy_column_compression_level
+                HashMap::new(), // storage_options
                 rx,
                 CancellationToken::new(),
             )
@@ -4392,17 +4597,19 @@ mod tests {
         // Verifies Task 3.2: Merge path handles Binary as_der correctly
         // After merging staging into main, as_der should remain Binary and data should be preserved
         let test_name = "merge_binary_as_der";
-        let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
-        let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
+        let main_path = format!("file:///tmp/delta_backfill_test_{}_main", test_name);
+        let staging_path = format!("file:///tmp/delta_backfill_test_{}_staging", test_name);
+        let main_local = main_path.strip_prefix("file://").unwrap();
+        let staging_local = staging_path.strip_prefix("file://").unwrap();
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
+        let _ = fs::create_dir_all(main_local);
+        let _ = fs::create_dir_all(staging_local);
 
         let schema = delta_schema();
 
         // Create main table with a record (cert_index=1)
-        let main_table = open_or_create_table(&main_path, &schema)
+        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
             .expect("main table creation failed");
         let mut main_record = make_test_record(1, "https://log.example.com");
@@ -4416,7 +4623,7 @@ mod tests {
             .expect("main write failed");
 
         // Create staging table with a different record (cert_index=2)
-        let staging_table = open_or_create_table(&staging_path, &schema)
+        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
             .await
             .expect("staging table creation failed");
         let mut staging_record = make_test_record(2, "https://log.example.com");
@@ -4473,7 +4680,7 @@ mod tests {
         assert_eq!(as_der_col.value(0), &[0x11u8, 0x22, 0x33, 0x44][..]);
         assert_eq!(as_der_col.value(1), &[0xAAu8, 0xBB, 0xCC, 0xDD][..]);
 
-        let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
+        let _ = fs::remove_dir_all(main_local);
+        let _ = fs::remove_dir_all(staging_local);
     }
 }
