@@ -293,12 +293,16 @@ pub async fn detect_gaps(
     staging_path: Option<&str>,
     logs: &[(String, u64)],
     backfill_from: Option<u64>,
-    storage_options: &HashMap<String, String>,
+    main_storage_options: &HashMap<String, String>,
+    staging_storage_options: Option<&HashMap<String, String>>,
 ) -> Result<Vec<BackfillWorkItem>, Box<dyn Error>> {
+    // Use staging-specific storage_options when available, fall back to main
+    let effective_staging_opts = staging_storage_options.unwrap_or(main_storage_options);
+
     // Try to open the main delta table; if it doesn't exist, try staging if provided
     let table = match (|| async {
         DeltaTableBuilder::from_valid_uri(table_path)?
-            .with_storage_options(storage_options.clone())
+            .with_storage_options(main_storage_options.clone())
             .load()
             .await
     })().await
@@ -309,7 +313,7 @@ pub async fn detect_gaps(
             if let Some(staging) = staging_path {
                 if let Ok(staging_table) = (|| async {
                     DeltaTableBuilder::from_valid_uri(staging)?
-                        .with_storage_options(storage_options.clone())
+                        .with_storage_options(effective_staging_opts.clone())
                         .load()
                         .await
                 })().await
@@ -355,7 +359,7 @@ pub async fn detect_gaps(
     let has_staging = if let Some(staging) = staging_path {
         match (|| async {
             DeltaTableBuilder::from_valid_uri(staging)?
-                .with_storage_options(storage_options.clone())
+                .with_storage_options(effective_staging_opts.clone())
                 .load()
                 .await
         })().await
@@ -725,13 +729,26 @@ pub async fn run_backfill(
         info!(logs_filter = %logs_filter, "backfill_logs filter");
     }
 
-    // Parse URIs and resolve storage options
-    let storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+    // Parse URIs and resolve storage options for main table
+    let main_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
         Ok(location) => resolve_storage_options(&location, &config.storage),
         Err(e) => {
             error!(error = %e, "Invalid delta_sink.table_path URI");
             return 1;
         }
+    };
+
+    // Resolve storage options for staging path (may differ from main, e.g. local main + S3 staging)
+    let staging_storage_options = if let Some(ref sp) = staging_path {
+        match parse_table_uri(sp) {
+            Ok(location) => Some(resolve_storage_options(&location, &config.storage)),
+            Err(e) => {
+                error!(error = %e, "Invalid staging path URI");
+                return 1;
+            }
+        }
+    } else {
+        None
     };
 
     // Step 1: Log discovery
@@ -809,7 +826,7 @@ pub async fn run_backfill(
     } else {
         // Delta sink: use gap detection to find internal gaps
         let staging_path_ref = staging_path.as_deref();
-        match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from, &storage_options).await {
+        match detect_gaps(&config.delta_sink.table_path, staging_path_ref, &log_ceilings, backfill_from, &main_storage_options, staging_storage_options.as_ref()).await {
             Ok(items) => items,
             Err(e) => {
                 warn!("gap detection failed: {}", e);
@@ -883,15 +900,18 @@ pub async fn run_backfill(
         })
     } else {
         // AC3.2: default to delta writer (backwards-compatible)
-        let table_path = staging_path
-            .unwrap_or_else(|| config.delta_sink.table_path.clone());
+        // Use staging storage_options when writing to staging path, main otherwise
+        let (table_path, writer_storage_options) = if let Some(sp) = staging_path {
+            (sp, staging_storage_options.unwrap_or_default())
+        } else {
+            (config.delta_sink.table_path.clone(), main_storage_options.clone())
+        };
         let batch_size = config.delta_sink.batch_size;
         let flush_interval_secs = config.delta_sink.flush_interval_secs;
         let compression_level = config.delta_sink.compression_level;
         let shutdown_clone = shutdown.clone();
-        let storage_options_clone = storage_options.clone();
         tokio::spawn(async move {
-            run_writer(table_path, batch_size, flush_interval_secs, compression_level, storage_options_clone, rx, shutdown_clone).await
+            run_writer(table_path, batch_size, flush_interval_secs, compression_level, writer_storage_options, rx, shutdown_clone).await
         })
     };
 
@@ -1505,7 +1525,7 @@ mod tests {
         // Call detect_gaps in catch-up mode (no --from)
         // Second tuple element is ceiling (was tree_size)
         let logs = vec![("https://log.example.com".to_string(), 200)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1547,7 +1567,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=22 (no frontier gap generated)
         let logs = vec![("https://log.example.com".to_string(), 22)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1596,7 +1616,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=10
         let logs = vec![("https://log.example.com".to_string(), 10)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1636,7 +1656,7 @@ mod tests {
             ("https://log-a.example.com".to_string(), 10),
             ("https://log-b.example.com".to_string(), 10),
         ];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1685,7 +1705,7 @@ mod tests {
 
         // Call detect_gaps with --from 0, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1726,7 +1746,7 @@ mod tests {
 
         // Call detect_gaps with --from 40, ceiling=55
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(40), &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, Some(40), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1749,7 +1769,7 @@ mod tests {
 
         // Call detect_gaps in historical mode with --from 0
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1772,7 +1792,7 @@ mod tests {
 
         // Call detect_gaps in catch-up mode
         let logs = vec![("https://log.example.com".to_string(), 55)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -1802,7 +1822,7 @@ mod tests {
 
         // Simulate gap detection in catch-up mode with an empty table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2265,7 +2285,7 @@ mod tests {
         // ceiling=50 is below min_index=100; irrelevant in catch-up mode
         // but verifies AC3.3 is satisfied
         let logs = vec![("https://log.example.com".to_string(), 50)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2305,7 +2325,7 @@ mod tests {
 
         // ceiling=1000 (well above max_index=16)
         let logs = vec![("https://log.example.com".to_string(), 1000)];
-        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2326,7 +2346,7 @@ mod tests {
 
         // No table — historical mode with no delta table
         let logs = vec![("https://log.example.com".to_string(), 100)];
-        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new())
+        let work_items = detect_gaps(&table_path, None, &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2477,7 +2497,7 @@ mod tests {
 
         // Call detect_gaps with ceiling=20 and staging_path
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2521,7 +2541,7 @@ mod tests {
 
         // First call with empty staging: should detect gap [11, 14]
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
+        let work_items_first = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2546,7 +2566,7 @@ mod tests {
             .expect("staging write failed");
 
         // Second call with staging populated: should detect smaller gap [13, 14]
-        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
+        let work_items_second = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2606,7 +2626,7 @@ mod tests {
 
         // Call with ceiling=20: verify no work items generated beyond index 19
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -2651,7 +2671,7 @@ mod tests {
 
         // Call with nonexistent staging path
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None, &HashMap::new())
+        let work_items = detect_gaps(&main_path, Some(nonexistent_staging), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps failed");
 
@@ -3478,7 +3498,7 @@ mod tests {
         // Data combined: [10, 11, 12, 13, 15, 16]
         // Gap: [14] (index 14 is missing)
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new())
+        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
             .await
             .expect("detect_gaps catch-up failed");
 
@@ -3499,7 +3519,7 @@ mod tests {
         // Should start from 0 (--from 0) and fill to ceiling=20
         // Data union: [10, 11, 12, 13, 15, 16]
         // Gaps: [0-9] (pre-existing), [14] (internal)
-        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0), &HashMap::new())
+        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0), &HashMap::new(), None)
             .await
             .expect("detect_gaps historical failed");
 
