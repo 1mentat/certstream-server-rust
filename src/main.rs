@@ -54,6 +54,12 @@ async fn main() {
     // Register S3 storage handlers so deltalake recognizes s3:// URIs.
     deltalake::aws::register_handlers(None);
 
+    // Disable EC2 IMDS lookups — we provide all S3 credentials explicitly
+    // via storage_options, so IMDS is never needed. Without this, the AWS
+    // SDK spends ~6s timing out on IMDS when not running on EC2.
+    // Safety: called at startup before spawning any threads.
+    unsafe { std::env::set_var("AWS_EC2_METADATA_DISABLED", "true") };
+
     let cli_args = CliArgs::parse();
 
     if cli_args.show_help {

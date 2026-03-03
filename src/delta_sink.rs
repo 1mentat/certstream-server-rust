@@ -2126,7 +2126,6 @@ mod s3_integration_tests {
         opts.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string());
         opts.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
         opts.insert("conditional_put".to_string(), "etag".to_string());
-        opts.insert("AWS_EC2_METADATA_DISABLED".to_string(), "true".to_string());
         opts
     }
 
