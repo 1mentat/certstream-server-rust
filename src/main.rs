@@ -51,6 +51,9 @@ async fn main() {
         .install_default()
         .expect("failed to install rustls crypto provider");
 
+    // Register S3 storage handlers so deltalake recognizes s3:// URIs.
+    deltalake::aws::register_handlers(None);
+
     let cli_args = CliArgs::parse();
 
     if cli_args.show_help {
