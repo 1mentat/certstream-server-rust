@@ -525,12 +525,6 @@ pub fn resolve_storage_options(
                     opts.insert("AWS_ALLOW_HTTP".to_string(), allow.to_string());
                 }
             }
-            // Disable IMDS lookups — we provide all credentials explicitly,
-            // and IMDS timeouts add ~6s of startup delay outside AWS/EC2.
-            opts.insert(
-                "AWS_EC2_METADATA_DISABLED".to_string(),
-                "true".to_string(),
-            );
             opts
         }
     }
@@ -2045,9 +2039,7 @@ s3:
         };
         let storage = StorageConfig::default(); // s3: None
         let opts = resolve_storage_options(&location, &storage);
-        // Only AWS_EC2_METADATA_DISABLED is set (no S3 credentials)
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts.get("AWS_EC2_METADATA_DISABLED").unwrap(), "true");
+        assert!(opts.is_empty());
     }
 
     // Test resolve_storage_options with S3 location and conditional_put set
