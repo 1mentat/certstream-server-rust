@@ -10,11 +10,22 @@ pub struct CliArgs {
     pub show_version: bool,
     pub show_help: bool,
     pub backfill: bool,
-    pub backfill_from: Option<u64>,
+    pub backfill_from: Option<String>,
     pub backfill_logs: Option<String>,
     pub staging_path: Option<String>,
     pub backfill_sink: Option<String>,
     pub merge: bool,
+    pub migrate: bool,
+    pub migrate_output: Option<String>,
+    /// Source table path for migrate mode (Phase 2: used in migrate dispatch)
+    pub migrate_source: Option<String>,
+    /// End date filter for migrate mode (Phase 2: used in migrate dispatch)
+    pub to: Option<String>,
+    pub reparse_audit: bool,
+    pub extract_metadata: bool,
+    pub output_path: Option<String>,
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
 }
 
 impl CliArgs {
@@ -30,18 +41,33 @@ impl CliArgs {
         let mut backfill_logs = None;
         let mut staging_path = None;
         let mut backfill_sink = None;
+        let mut migrate_output = None;
+        let mut migrate_source = None;
+        let mut to = None;
+        let mut output_path = None;
+        let mut from_date = None;
+        let mut to_date = None;
 
         for (i, arg) in args.iter().enumerate() {
             if arg == "--from" && i + 1 < args.len() {
-                if let Ok(val) = args[i + 1].parse::<u64>() {
-                    backfill_from = Some(val);
-                }
+                backfill_from = Some(args[i + 1].clone());
             } else if arg == "--logs" && i + 1 < args.len() {
                 backfill_logs = Some(args[i + 1].clone());
             } else if arg == "--staging-path" && i + 1 < args.len() {
                 staging_path = Some(args[i + 1].clone());
             } else if arg == "--sink" && i + 1 < args.len() {
                 backfill_sink = Some(args[i + 1].clone());
+            } else if arg == "--output" && i + 1 < args.len() {
+                migrate_output = Some(args[i + 1].clone());
+                output_path = Some(args[i + 1].clone());
+            } else if arg == "--source" && i + 1 < args.len() {
+                migrate_source = Some(args[i + 1].clone());
+            } else if arg == "--to" && i + 1 < args.len() {
+                to = Some(args[i + 1].clone());
+            } else if arg == "--from-date" && i + 1 < args.len() {
+                from_date = Some(args[i + 1].clone());
+            } else if arg == "--to-date" && i + 1 < args.len() {
+                to_date = Some(args[i + 1].clone());
             }
         }
 
@@ -57,6 +83,15 @@ impl CliArgs {
             staging_path,
             backfill_sink,
             merge: args.iter().any(|a| a == "--merge"),
+            migrate: args.iter().any(|a| a == "--migrate"),
+            migrate_output,
+            migrate_source,
+            to,
+            reparse_audit: args.iter().any(|a| a == "--reparse-audit"),
+            extract_metadata: args.iter().any(|a| a == "--extract-metadata"),
+            output_path,
+            from_date,
+            to_date,
         }
     }
 
@@ -77,7 +112,7 @@ impl CliArgs {
         println!();
         println!("BACKFILL OPTIONS:");
         println!("    --backfill           Activate backfill mode (requires state file)");
-        println!("    --from <INDEX>       Override start index for all logs");
+        println!("    --from <INDEX>       Override start index for all logs (integer)");
         println!("    --logs <FILTER>      Filter to specific logs by substring");
         println!("    --sink <NAME>        Writer backend: delta (default), zerobus");
         println!();
@@ -89,6 +124,22 @@ impl CliArgs {
         println!("STAGING/MERGE OPTIONS:");
         println!("    --staging-path <PATH>  Write backfill to staging Delta table at PATH");
         println!("    --merge                Merge staging table into main table");
+        println!();
+        println!("MIGRATION OPTIONS:");
+        println!("    --migrate              Migrate existing Delta table to new schema");
+        println!("    --output <PATH>        Output path for migrated table (required with --migrate)");
+        println!("    --source <PATH>        Source table path (default: config delta_sink.table_path)");
+        println!("    --from <DATE>          Start date filter (YYYY-MM-DD, inclusive)");
+        println!("    --to <DATE>            End date filter (YYYY-MM-DD, inclusive)");
+        println!();
+        println!("    Note: --from is shared between backfill (integer index) and migrate (date).");
+        println!();
+        println!("TABLE OPERATIONS:");
+        println!("    --reparse-audit        Audit stored certs against current parsing code");
+        println!("    --extract-metadata     Extract metadata-only Delta table (requires --output)");
+        println!("    --output <PATH>        Output path for metadata extraction");
+        println!("    --from-date <DATE>     Filter partitions from this date (YYYY-MM-DD)");
+        println!("    --to-date <DATE>       Filter partitions to this date (YYYY-MM-DD)");
         println!();
         println!("ENVIRONMENT VARIABLES:");
         println!("    CERTSTREAM_CONFIG              Path to config file");
@@ -155,6 +206,75 @@ pub fn validate_backfill_sink_command(
         // No sink specified; defaults to delta
         Ok(())
     }
+}
+
+/// Validates that a date string is in YYYY-MM-DD format with valid month/day ranges.
+///
+/// # Arguments
+/// * `date` - The date string to validate
+/// * `flag_name` - The flag name for error messages (e.g., "--from", "--to")
+///
+/// # Returns
+/// * `Ok(())` if the date is valid
+/// * `Err(String)` with a descriptive error message if invalid
+///
+/// # Phase 2
+/// This function is used in migrate mode dispatch (Phase 2).
+pub fn validate_date_format(date: &str, flag_name: &str) -> Result<(), String> {
+    if date.len() != 10 {
+        return Err(format!(
+            "Error: {} value '{}' is not a valid date. Expected format: YYYY-MM-DD",
+            flag_name, date
+        ));
+    }
+
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+        return Err(format!(
+            "Error: {} value '{}' is not a valid date. Expected format: YYYY-MM-DD",
+            flag_name, date
+        ));
+    }
+
+    let year: u32 = parts[0].parse().map_err(|_| {
+        format!(
+            "Error: {} value '{}' is not a valid date. Expected format: YYYY-MM-DD",
+            flag_name, date
+        )
+    })?;
+    let month: u32 = parts[1].parse().map_err(|_| {
+        format!(
+            "Error: {} value '{}' is not a valid date. Expected format: YYYY-MM-DD",
+            flag_name, date
+        )
+    })?;
+    let day: u32 = parts[2].parse().map_err(|_| {
+        format!(
+            "Error: {} value '{}' is not a valid date. Expected format: YYYY-MM-DD",
+            flag_name, date
+        )
+    })?;
+
+    if year < 2000 || year > 2099 {
+        return Err(format!(
+            "Error: {} value '{}' has invalid year. Expected 2000-2099",
+            flag_name, date
+        ));
+    }
+    if !(1..=12).contains(&month) {
+        return Err(format!(
+            "Error: {} value '{}' has invalid month. Expected 01-12",
+            flag_name, date
+        ));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(format!(
+            "Error: {} value '{}' has invalid day. Expected 01-31",
+            flag_name, date
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,7 +346,7 @@ mod tests {
         ];
         let parsed = CliArgs::parse_args(&args);
         assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()), "backfill_sink should be zerobus");
-        assert_eq!(parsed.backfill_from, Some(12345), "backfill_from should be 12345");
+        assert_eq!(parsed.backfill_from, Some("12345".to_string()), "backfill_from should be 12345");
     }
 
     #[test]
@@ -258,7 +378,7 @@ mod tests {
         ];
         let parsed = CliArgs::parse_args(&args);
         assert_eq!(parsed.backfill_sink, Some("zerobus".to_string()));
-        assert_eq!(parsed.backfill_from, Some(100));
+        assert_eq!(parsed.backfill_from, Some("100".to_string()));
         assert_eq!(parsed.staging_path, Some("/tmp/staging".to_string()));
     }
 
@@ -338,5 +458,328 @@ mod tests {
             "error message should mention 'unknown sink', got: {}",
             err_msg
         );
+    }
+
+    // Task 1: Tests for --migrate and --output flags
+    #[test]
+    fn test_migrate_flag_parsed_correctly() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate, "migrate should be true when --migrate is provided");
+    }
+
+    #[test]
+    fn test_migrate_flag_false_when_not_provided() {
+        let args = vec![
+            "certstream".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(!parsed.migrate, "migrate should be false when --migrate is not provided");
+    }
+
+    #[test]
+    fn test_output_flag_parsed_correctly() {
+        let args = vec![
+            "certstream".to_string(),
+            "--output".to_string(),
+            "/tmp/output".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(
+            parsed.migrate_output,
+            Some("/tmp/output".to_string()),
+            "migrate_output should be /tmp/output when --output is provided"
+        );
+    }
+
+    #[test]
+    fn test_output_flag_none_when_not_provided() {
+        let args = vec![
+            "certstream".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(
+            parsed.migrate_output,
+            None,
+            "migrate_output should be None when --output is not provided"
+        );
+    }
+
+    #[test]
+    fn test_migrate_and_output_flags_together() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--output".to_string(),
+            "/data/migrated".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate, "migrate should be true");
+        assert_eq!(
+            parsed.migrate_output,
+            Some("/data/migrated".to_string()),
+            "migrate_output should be /data/migrated"
+        );
+    }
+
+    #[test]
+    fn test_migrate_with_other_flags() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--output".to_string(),
+            "/tmp/out".to_string(),
+            "--validate-config".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate, "migrate should be true");
+        assert_eq!(parsed.migrate_output, Some("/tmp/out".to_string()));
+        assert!(parsed.validate_config, "validate_config should be true");
+    }
+
+    #[test]
+    fn test_source_flag_parsed_correctly() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--output".to_string(),
+            "/tmp/out".to_string(),
+            "--source".to_string(),
+            "/data/old-table".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.migrate_source, Some("/data/old-table".to_string()));
+    }
+
+    #[test]
+    fn test_source_flag_none_when_not_provided() {
+        let args = vec!["certstream".to_string(), "--migrate".to_string()];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.migrate_source, None);
+    }
+
+    #[test]
+    fn test_to_flag_parsed_correctly() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--to".to_string(),
+            "2024-06-30".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.to, Some("2024-06-30".to_string()));
+    }
+
+    #[test]
+    fn test_to_flag_none_when_not_provided() {
+        let args = vec!["certstream".to_string()];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.to, None);
+    }
+
+    #[test]
+    fn test_from_stores_date_string() {
+        // --from now stores raw string, not parsed u64
+        let args = vec![
+            "certstream".to_string(),
+            "--from".to_string(),
+            "2024-01-15".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_from, Some("2024-01-15".to_string()));
+    }
+
+    #[test]
+    fn test_from_stores_integer_string() {
+        // --from with an integer value stores as string
+        let args = vec![
+            "certstream".to_string(),
+            "--from".to_string(),
+            "12345".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.backfill_from, Some("12345".to_string()));
+    }
+
+    #[test]
+    fn test_migrate_all_flags_together() {
+        let args = vec![
+            "certstream".to_string(),
+            "--migrate".to_string(),
+            "--output".to_string(),
+            "/tmp/out".to_string(),
+            "--source".to_string(),
+            "/data/source".to_string(),
+            "--from".to_string(),
+            "2024-01-01".to_string(),
+            "--to".to_string(),
+            "2024-01-31".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.migrate);
+        assert_eq!(parsed.migrate_output, Some("/tmp/out".to_string()));
+        assert_eq!(parsed.migrate_source, Some("/data/source".to_string()));
+        assert_eq!(parsed.backfill_from, Some("2024-01-01".to_string()));
+        assert_eq!(parsed.to, Some("2024-01-31".to_string()));
+    }
+
+    #[test]
+    fn test_validate_date_format_valid() {
+        assert!(validate_date_format("2024-01-15", "--from").is_ok());
+        assert!(validate_date_format("2025-12-31", "--to").is_ok());
+        assert!(validate_date_format("2000-01-01", "--from").is_ok());
+    }
+
+    #[test]
+    fn test_validate_date_format_invalid() {
+        assert!(validate_date_format("01-15-2024", "--from").is_err());
+        assert!(validate_date_format("2024/01/15", "--from").is_err());
+        assert!(validate_date_format("2024-1-5", "--from").is_err());
+        assert!(validate_date_format("abc", "--from").is_err());
+        assert!(validate_date_format("2024-13-01", "--from").is_err());
+        assert!(validate_date_format("2024-01-32", "--from").is_err());
+        assert!(validate_date_format("", "--from").is_err());
+    }
+
+    #[test]
+    fn test_validate_date_format_known_limitation_invalid_calendar_dates() {
+        // Known limitation: does not validate days-per-month
+        // These dates are invalid in reality but pass validation
+        assert!(validate_date_format("2024-02-31", "--from").is_ok()); // Feb 31 accepted
+        assert!(validate_date_format("2024-04-31", "--from").is_ok()); // Apr 31 accepted
+        assert!(validate_date_format("2024-06-31", "--from").is_ok()); // Jun 31 accepted
+    }
+
+    // Task 1 Tests: reparse-and-metadata-table.AC4 - CLI integration
+
+    #[test]
+    fn test_ac4_1_reparse_audit_flag() {
+        // AC4.1: Parse --reparse-audit flag and verify reparse_audit is true
+        let args = vec![
+            "certstream".to_string(),
+            "--reparse-audit".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.reparse_audit, "reparse_audit should be true");
+    }
+
+    #[test]
+    fn test_ac4_2_extract_metadata_with_output() {
+        // AC4.2: Parse --extract-metadata --output <PATH> and verify both fields set
+        let args = vec![
+            "certstream".to_string(),
+            "--extract-metadata".to_string(),
+            "--output".to_string(),
+            "/tmp/metadata".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.extract_metadata, "extract_metadata should be true");
+        assert_eq!(parsed.output_path, Some("/tmp/metadata".to_string()), "output_path should be set");
+    }
+
+    #[test]
+    fn test_ac4_3_extract_metadata_without_output() {
+        // AC4.3: Parse --extract-metadata without --output and verify output_path is None
+        let args = vec![
+            "certstream".to_string(),
+            "--extract-metadata".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.extract_metadata, "extract_metadata should be true");
+        assert_eq!(parsed.output_path, None, "output_path should be None when not provided");
+    }
+
+    #[test]
+    fn test_parse_from_date_flag() {
+        // Test that --from-date value flag is parsed correctly
+        let args = vec![
+            "certstream".to_string(),
+            "--reparse-audit".to_string(),
+            "--from-date".to_string(),
+            "2026-02-01".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.from_date, Some("2026-02-01".to_string()), "from_date should be parsed");
+    }
+
+    #[test]
+    fn test_parse_to_date_flag() {
+        // Test that --to-date value flag is parsed correctly
+        let args = vec![
+            "certstream".to_string(),
+            "--reparse-audit".to_string(),
+            "--to-date".to_string(),
+            "2026-02-27".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert_eq!(parsed.to_date, Some("2026-02-27".to_string()), "to_date should be parsed");
+    }
+
+    #[test]
+    fn test_combined_reparse_audit_with_date_filters() {
+        // Test that all flags work together: --reparse-audit --from-date --to-date
+        let args = vec![
+            "certstream".to_string(),
+            "--reparse-audit".to_string(),
+            "--from-date".to_string(),
+            "2026-02-01".to_string(),
+            "--to-date".to_string(),
+            "2026-02-27".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.reparse_audit, "reparse_audit should be true");
+        assert_eq!(parsed.from_date, Some("2026-02-01".to_string()), "from_date should be set");
+        assert_eq!(parsed.to_date, Some("2026-02-27".to_string()), "to_date should be set");
+    }
+
+    #[test]
+    fn test_combined_extract_metadata_with_all_options() {
+        // Test that --extract-metadata, --output, and date filters work together
+        let args = vec![
+            "certstream".to_string(),
+            "--extract-metadata".to_string(),
+            "--output".to_string(),
+            "/tmp/metadata".to_string(),
+            "--from-date".to_string(),
+            "2026-02-01".to_string(),
+            "--to-date".to_string(),
+            "2026-02-27".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.extract_metadata, "extract_metadata should be true");
+        assert_eq!(parsed.output_path, Some("/tmp/metadata".to_string()), "output_path should be set");
+        assert_eq!(parsed.from_date, Some("2026-02-01".to_string()), "from_date should be set");
+        assert_eq!(parsed.to_date, Some("2026-02-27".to_string()), "to_date should be set");
+    }
+
+    #[test]
+    fn test_reparse_audit_without_output_path() {
+        // Test that --reparse-audit doesn't require output_path
+        let args = vec![
+            "certstream".to_string(),
+            "--reparse-audit".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.reparse_audit, "reparse_audit should be true");
+        assert_eq!(parsed.output_path, None, "output_path should be None for reparse_audit");
+    }
+
+    #[test]
+    fn test_extract_metadata_with_only_output() {
+        // Test minimal extract-metadata: just --extract-metadata --output
+        let args = vec![
+            "certstream".to_string(),
+            "--extract-metadata".to_string(),
+            "--output".to_string(),
+            "/data/output".to_string(),
+        ];
+        let parsed = CliArgs::parse_args(&args);
+        assert!(parsed.extract_metadata, "extract_metadata should be true");
+        assert_eq!(parsed.output_path, Some("/data/output".to_string()), "output_path should be set");
+        assert_eq!(parsed.from_date, None, "from_date should be None");
+        assert_eq!(parsed.to_date, None, "to_date should be None");
     }
 }
