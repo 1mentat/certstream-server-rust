@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use api::{ApiState, CertificateCache, LogTracker, ServerStats};
 use cli::{CliArgs, VERSION};
-use config::Config;
+use config::{Config, parse_table_uri, resolve_storage_options};
 use ct::{fetch_log_list, WatcherContext};
 use dedup::DedupFilter;
 use health::{deep_health, example_json, health, HealthState};
@@ -51,6 +51,15 @@ async fn main() {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
+
+    // Register S3 storage handlers so deltalake recognizes s3:// URIs.
+    deltalake::aws::register_handlers(None);
+
+    // Disable EC2 IMDS lookups — we provide all S3 credentials explicitly
+    // via storage_options, so IMDS is never needed. Without this, the AWS
+    // SDK spends ~6s timing out on IMDS when not running on EC2.
+    // Safety: called at startup before spawning any threads.
+    unsafe { std::env::set_var("AWS_EC2_METADATA_DISABLED", "true") };
 
     let cli_args = CliArgs::parse();
 
@@ -183,6 +192,8 @@ async fn main() {
             std::process::exit(1);
         }
 
+        validate_staging_path_uri(cli_args.staging_path.as_ref());
+
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -225,6 +236,8 @@ async fn main() {
             eprintln!("{}", error_msg);
             std::process::exit(1);
         }
+
+        validate_staging_path_uri(cli_args.staging_path.as_ref());
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -311,8 +324,9 @@ async fn main() {
     let delta_sink_handle = if config.delta_sink.enabled {
         let delta_rx = tx.subscribe();
         let delta_config = config.delta_sink.clone();
+        let delta_storage = config.storage.clone();
         let delta_shutdown = shutdown_token.clone();
-        let handle = tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_rx, delta_shutdown));
+        let handle = tokio::spawn(delta_sink::run_delta_sink(delta_config, delta_storage, delta_rx, delta_shutdown));
         info!("delta sink enabled, writing to: {}", config.delta_sink.table_path);
         Some(handle)
     } else {
@@ -465,6 +479,16 @@ fn spawn_signal_handler(shutdown_token: CancellationToken) {
         warn!("initiating graceful shutdown...");
         shutdown_token.cancel();
     });
+}
+
+/// Validate staging path as a valid URI if provided.
+fn validate_staging_path_uri(staging_path: Option<&String>) {
+    if let Some(staging) = staging_path {
+        if let Err(e) = parse_table_uri(staging) {
+            eprintln!("Error: invalid --staging-path: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn spawn_rfc6962_watchers(
@@ -672,17 +696,28 @@ fn build_router(protocols: &config::ProtocolConfig, config: &Config, deps: Route
     }
 
     if config.query_api.enabled {
-        // Check table path accessibility (non-fatal warning)
-        let table_path = std::path::Path::new(&config.query_api.table_path);
-        if !table_path.exists() {
-            warn!(
-                table_path = %config.query_api.table_path,
-                "Query API table path does not exist yet; queries will return 503 until data is written"
-            );
+        // Check table path accessibility (non-fatal warning) — only for local paths
+        if !config.query_api.table_path.starts_with("s3://") {
+            let table_path = std::path::Path::new(&config.query_api.table_path);
+            if !table_path.exists() {
+                warn!(
+                    table_path = %config.query_api.table_path,
+                    "Query API table path does not exist yet; queries will return 503 until data is written"
+                );
+            }
         }
+
+        let query_storage_options = match parse_table_uri(&config.query_api.table_path) {
+            Ok(location) => resolve_storage_options(&location, &config.storage),
+            Err(e) => {
+                error!(error = %e, "Invalid query_api.table_path URI");
+                std::process::exit(1);
+            }
+        };
 
         let query_api_state = Arc::new(query::QueryApiState {
             config: config.query_api.clone(),
+            storage_options: query_storage_options,
         });
         let query_router = query::query_api_router(query_api_state);
         app = app.merge(query_router);

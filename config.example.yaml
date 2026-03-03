@@ -56,8 +56,8 @@ static_logs:
 # Writes CT entries to a local Delta table for historical analysis
 delta_sink:
   enabled: false                    # Off by default
-  table_path: "./data/certstream"   # Local filesystem path for Delta table
-  batch_size: 10000                 # Records before size-triggered flush (live streaming)
+  table_path: "file://./data/certstream"   # URI: file:// for local, s3:// for S3
+  batch_size: 10000                 # Records before size-triggered flush
   flush_interval_secs: 30           # Max seconds between flushes
   compression_level: 9              # Zstd compression level (1-22, default 9)
   heavy_column_compression_level: 15  # Zstd level for as_der column (1-22, default 15)
@@ -67,10 +67,22 @@ delta_sink:
 # Provides REST API for querying historical CT records stored in Delta Lake
 query_api:
   enabled: false                    # Off by default
-  table_path: "./data/certstream"   # Same Delta table as delta_sink
+  table_path: "file://./data/certstream"   # Same Delta table as delta_sink (URI format)
   max_results_per_page: 500         # Hard cap on results per page
   default_results_per_page: 50      # Default when limit not specified
   query_timeout_secs: 30            # DataFusion query timeout
+
+# Storage backend configuration
+# Required when using s3:// URIs for table_path or staging_path
+# Credentials should be provided via env vars: CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID, CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY
+# storage:
+#   s3:
+#     endpoint: ""                        # S3-compatible endpoint URL
+#     region: ""                          # AWS region (e.g., "auto" for Tigris)
+#     access_key_id: ""                   # Access key (prefer env var)
+#     secret_access_key: ""               # Secret key (prefer env var)
+#     conditional_put: "etag"             # Atomic writes via ETag (required for Tigris)
+#     allow_http: false                   # Allow non-HTTPS connections
 
 # ZeroBus Ingest sink (Databricks managed Delta table)
 # Streams CT entries to a Databricks-managed Delta table via ZeroBus SDK.

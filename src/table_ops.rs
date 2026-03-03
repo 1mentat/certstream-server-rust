@@ -5,12 +5,12 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use deltalake::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray, UInt64Array};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use deltalake::datafusion::prelude::SessionContext;
-use deltalake::{open_table, DeltaTableError};
+use deltalake::{DeltaTableBuilder, DeltaTableError};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, parse_table_uri, resolve_storage_options};
 use crate::ct::parse_certificate;
 
 /// Helper struct to track field mismatches and collect sample diffs.
@@ -219,8 +219,22 @@ pub async fn run_reparse_audit(
         "Starting reparse audit"
     );
 
+    // Resolve storage options for the source table
+    let source_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, "failed to parse source table URI");
+            return (1, AuditReport::default());
+        }
+    };
+
     // Step 1: Open the Delta table
-    let table = match open_table(&config.delta_sink.table_path).await {
+    let table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(&config.delta_sink.table_path)?
+            .with_storage_options(source_storage_options.clone())
+            .load()
+            .await
+    })().await {
         Ok(t) => t,
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             error!(
@@ -664,8 +678,29 @@ pub async fn run_extract_metadata(
         "Starting metadata extraction"
     );
 
+    // Resolve storage options for source and output paths
+    let source_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, "failed to parse source table URI");
+            return 1;
+        }
+    };
+    let output_storage_options = match parse_table_uri(&output_path) {
+        Ok(location) => resolve_storage_options(&location, &config.storage),
+        Err(e) => {
+            error!(error = %e, output_path = %output_path, "failed to parse output table URI");
+            return 1;
+        }
+    };
+
     // Step 1: Open the source Delta table
-    let source_table = match open_table(&config.delta_sink.table_path).await {
+    let source_table = match (|| async {
+        DeltaTableBuilder::from_valid_uri(&config.delta_sink.table_path)?
+            .with_storage_options(source_storage_options.clone())
+            .load()
+            .await
+    })().await {
         Ok(t) => {
             info!("Source table opened successfully");
             t
@@ -738,14 +773,17 @@ pub async fn run_extract_metadata(
     };
 
     // Step 5: Open or create the output Delta table
-    // First, ensure the output directory exists
-    if let Err(e) = std::fs::create_dir_all(&output_path) {
-        error!(error = %e, output_path = %output_path, "Failed to create output directory");
-        return 1;
+    // For local paths, ensure the output directory exists
+    if output_path.starts_with("file://") || !output_path.contains("://") {
+        let local_path = output_path.strip_prefix("file://").unwrap_or(&output_path);
+        if let Err(e) = std::fs::create_dir_all(local_path) {
+            error!(error = %e, output_path = %output_path, "Failed to create output directory");
+            return 1;
+        }
     }
 
     // Use the metadata schema to create the output table with the correct structure
-    let mut output_table = match open_or_create_table(&output_path, &metadata_schema()).await {
+    let mut output_table = match open_or_create_table(&output_path, &metadata_schema(), output_storage_options.clone()).await {
         Ok(t) => {
             t
         }
@@ -861,6 +899,7 @@ pub async fn run_extract_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltalake::open_table;
 
     #[test]
     fn test_date_filter_clause_both_dates() {
@@ -1064,6 +1103,13 @@ mod tests {
     fn create_test_config(table_path: &str) -> crate::config::Config {
         use std::net::IpAddr;
 
+        // Ensure table_path has file:// prefix for URI-based storage
+        let uri_table_path = if table_path.contains("://") {
+            table_path.to_string()
+        } else {
+            format!("file://{table_path}")
+        };
+
         crate::config::Config {
             host: "127.0.0.1".parse::<IpAddr>().unwrap(),
             port: 9100,
@@ -1083,7 +1129,7 @@ mod tests {
             hot_reload: Default::default(),
             delta_sink: crate::config::DeltaSinkConfig {
                 enabled: true,
-                table_path: table_path.to_string(),
+                table_path: uri_table_path,
                 batch_size: 1,
                 flush_interval_secs: 60,
                 compression_level: 9,
@@ -1092,6 +1138,7 @@ mod tests {
             },
             query_api: Default::default(),
             zerobus_sink: Default::default(),
+            storage: Default::default(),
             config_path: None,
         }
     }
@@ -1146,7 +1193,7 @@ mod tests {
         let batch = records_to_batch(&records, &schema).expect("Failed to create batch");
 
         // Create or open Delta table
-        let table = open_or_create_table(table_path, &schema)
+        let table = open_or_create_table(table_path, &schema, HashMap::new())
             .await
             .expect("Failed to open/create table");
 
@@ -1343,7 +1390,7 @@ mod tests {
         let source_check = open_table(test_dir).await;
         assert!(source_check.is_ok(), "Source table should exist before extraction");
 
-        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.1: Extraction should succeed");
 
@@ -1400,7 +1447,7 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.2: Extraction should succeed");
 
@@ -1452,7 +1499,7 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.3: Extraction should succeed");
 
@@ -1503,7 +1550,7 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.4: Extraction should succeed");
 
@@ -1541,7 +1588,7 @@ mod tests {
 
         let config = create_test_config(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
 
         assert_eq!(exit_code, 1, "AC2.5: Should exit with code 1 when source table doesn't exist");
 
@@ -1566,7 +1613,7 @@ mod tests {
         // Query for a future date range that doesn't match (2099-01-01)
         let exit_code = run_extract_metadata(
             config,
-            output_dir.to_string(),
+            format!("file://{}", output_dir),
             Some("2099-01-01".to_string()),
             None,
             shutdown,
@@ -1622,7 +1669,7 @@ mod tests {
         // Cancel the token before calling the function to simulate shutdown signal
         shutdown.cancel();
 
-        let exit_code = run_extract_metadata(config, output_dir.to_string(), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
 
         assert_eq!(exit_code, 1, "AC4.4: Metadata extraction should exit with code 1 on shutdown");
 
