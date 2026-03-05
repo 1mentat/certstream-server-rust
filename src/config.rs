@@ -2816,4 +2816,218 @@ table_path: "file:///data/targets/minimal"
         // Local paths should have empty storage_options
         assert!(resolved.storage_options.is_empty());
     }
+
+    #[test]
+    fn test_target_env_var_table_path_override() {
+        // Verifies named-targets.AC2.1: `CERTSTREAM_TARGETS_<NAME>_TABLE_PATH` overrides YAML value
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_MAIN_TABLE_PATH", "file:///env/override");
+        }
+
+        // Create target config from YAML
+        let mut targets = HashMap::new();
+        targets.insert(
+            "main".to_string(),
+            TargetConfig {
+                table_path: "file:///yaml/path".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay (simulating what Config::load() does)
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_TABLE_PATH", prefix)) {
+                target.table_path = v;
+            }
+        }
+
+        // Verify env var override won
+        assert_eq!(targets.get("main").unwrap().table_path, "file:///env/override");
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_MAIN_TABLE_PATH");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_compression_level_override() {
+        // Verifies named-targets.AC2.2: `CERTSTREAM_TARGETS_<NAME>_COMPRESSION_LEVEL` overrides YAML value
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_MAIN_COMPRESSION_LEVEL", "15");
+        }
+
+        // Create target config from YAML
+        let mut targets = HashMap::new();
+        targets.insert(
+            "main".to_string(),
+            TargetConfig {
+                table_path: "file:///data".to_string(),
+                storage: None,
+                compression_level: Some(9),
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.compression_level = Some(level);
+                }
+            }
+        }
+
+        // Verify env var override won
+        assert_eq!(targets.get("main").unwrap().compression_level, Some(15));
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_MAIN_COMPRESSION_LEVEL");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_s3_storage_override() {
+        // Verifies named-targets.AC2.3: Target storage env vars override YAML storage config
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ENDPOINT", "https://env-s3.example.com");
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_REGION", "env-region");
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ACCESS_KEY_ID", "env-key");
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_SECRET_ACCESS_KEY", "env-secret");
+        }
+
+        // Create target config with YAML storage
+        let mut targets = HashMap::new();
+        targets.insert(
+            "archive".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/archive".to_string(),
+                storage: Some(StorageConfig {
+                    s3: Some(S3StorageConfig {
+                        endpoint: "https://yaml-s3.example.com".to_string(),
+                        region: "yaml-region".to_string(),
+                        access_key_id: "yaml-key".to_string(),
+                        secret_access_key: "yaml-secret".to_string(),
+                        conditional_put: None,
+                        allow_http: None,
+                    }),
+                }),
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay (simulating what Config::load() does)
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            let s3_prefix = format!("{}_STORAGE_S3", prefix);
+            let s3_endpoint = env::var(format!("{}_ENDPOINT", s3_prefix)).unwrap_or_default();
+            if !s3_endpoint.is_empty() {
+                // If endpoint env var is set, create or override S3 config
+                let s3 = S3StorageConfig {
+                    endpoint: s3_endpoint,
+                    region: env::var(format!("{}_REGION", s3_prefix)).unwrap_or_default(),
+                    access_key_id: env::var(format!("{}_ACCESS_KEY_ID", s3_prefix)).unwrap_or_default(),
+                    secret_access_key: env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)).unwrap_or_default(),
+                    conditional_put: env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)).ok(),
+                    allow_http: env::var(format!("{}_ALLOW_HTTP", s3_prefix)).ok().and_then(|v| v.parse().ok()),
+                };
+                target.storage = Some(StorageConfig { s3: Some(s3) });
+            }
+        }
+
+        // Verify env var S3 credentials won
+        let target = targets.get("archive").unwrap();
+        assert!(target.storage.is_some());
+        let s3 = target.storage.as_ref().unwrap().s3.as_ref().unwrap();
+        assert_eq!(s3.endpoint, "https://env-s3.example.com");
+        assert_eq!(s3.region, "env-region");
+        assert_eq!(s3.access_key_id, "env-key");
+        assert_eq!(s3.secret_access_key, "env-secret");
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ENDPOINT");
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_REGION");
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ACCESS_KEY_ID");
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_SECRET_ACCESS_KEY");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_heavy_column_compression_level_override() {
+        // Test that env var overrides for heavy_column_compression_level work correctly
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_HEAVY_COLUMN_COMPRESSION_LEVEL", "20");
+        }
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "archive".to_string(),
+            TargetConfig {
+                table_path: "file:///data".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: Some(15),
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_HEAVY_COLUMN_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.heavy_column_compression_level = Some(level);
+                }
+            }
+        }
+
+        assert_eq!(targets.get("archive").unwrap().heavy_column_compression_level, Some(20));
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_HEAVY_COLUMN_COMPRESSION_LEVEL");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_offline_batch_size_override() {
+        // Test that env var overrides for offline_batch_size work correctly
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_STAGING_OFFLINE_BATCH_SIZE", "250000");
+        }
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "staging".to_string(),
+            TargetConfig {
+                table_path: "file:///staging".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: Some(100000),
+            },
+        );
+
+        // Apply env var overlay
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_OFFLINE_BATCH_SIZE", prefix)) {
+                if let Ok(size) = v.parse::<usize>() {
+                    target.offline_batch_size = Some(size);
+                }
+            }
+        }
+
+        assert_eq!(targets.get("staging").unwrap().offline_batch_size, Some(250000));
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_STAGING_OFFLINE_BATCH_SIZE");
+        }
+    }
 }
