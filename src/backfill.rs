@@ -3683,63 +3683,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_ac1_3_gap_detection_with_staging_catch_up_and_historical() {
-        // Verifies staging-backfill.AC1.3: Gap detection works with both catch-up and historical modes with staging.
-        // Tests detect_gaps() called with staging_path in BOTH catch-up (backfill_from=None)
+        // Verifies gap detection works with both catch-up and historical modes.
+        // With named targets, detect_gaps operates on a single target table.
+        // Tests detect_gaps() in BOTH catch-up (backfill_from=None)
         // and historical (backfill_from=Some(0)) modes, asserting correct work items are generated.
         let test_name = "ac1_3_gap_detection_both_modes";
         let main_path = format!("/tmp/delta_backfill_test_{}_main", test_name);
-        let staging_path = format!("/tmp/delta_backfill_test_{}_staging", test_name);
         let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
         let _ = fs::create_dir_all(&main_path);
-        let _ = fs::create_dir_all(&staging_path);
 
         let schema = delta_schema();
 
-        // Create main table with records [10, 11, 15, 16]
-        let main_table = open_or_create_table(&main_path, &schema, HashMap::new())
+        // Create table with records [10, 11, 12, 13, 15, 16] (gap at 14)
+        let table = open_or_create_table(&main_path, &schema, HashMap::new())
             .await
-            .expect("main table creation failed");
-        let main_records = vec![
+            .expect("table creation failed");
+        let records = vec![
             make_test_record(10, "https://log.example.com"),
             make_test_record(11, "https://log.example.com"),
+            make_test_record(12, "https://log.example.com"),
+            make_test_record(13, "https://log.example.com"),
             make_test_record(15, "https://log.example.com"),
             make_test_record(16, "https://log.example.com"),
         ];
-        let main_batch = records_to_batch(&main_records, &schema).expect("main batch creation failed");
-        let _main_table = DeltaOps(main_table)
-            .write(vec![main_batch])
+        let batch = records_to_batch(&records, &schema).expect("batch creation failed");
+        let _table = DeltaOps(table)
+            .write(vec![batch])
             .with_save_mode(SaveMode::Append)
             .await
-            .expect("main write failed");
+            .expect("write failed");
 
-        // Create staging table with records [12, 13]
-        let staging_table = open_or_create_table(&staging_path, &schema, HashMap::new())
-            .await
-            .expect("staging table creation failed");
-        let staging_records = vec![
-            make_test_record(12, "https://log.example.com"),
-            make_test_record(13, "https://log.example.com"),
-        ];
-        let staging_batch = records_to_batch(&staging_records, &schema).expect("staging batch creation failed");
-        let _staging_table = DeltaOps(staging_table)
-            .write(vec![staging_batch])
-            .with_save_mode(SaveMode::Append)
-            .await
-            .expect("staging write failed");
-
-        // TEST 1: Catch-up mode (backfill_from = None) with staging
-        // Gap detection should see union of main [10, 11, 15, 16] and staging [12, 13]
-        // Data combined: [10, 11, 12, 13, 15, 16]
+        // TEST 1: Catch-up mode (backfill_from = None)
+        // Data: [10, 11, 12, 13, 15, 16]
         // Gap: [14] (index 14 is missing)
         let logs = vec![("https://log.example.com".to_string(), 20)];
-        let work_items_catchup = detect_gaps(&main_path, Some(&staging_path), &logs, None, &HashMap::new(), None)
+        let work_items_catchup = detect_gaps(&main_path, &logs, None, &HashMap::new())
             .await
             .expect("detect_gaps catch-up failed");
 
         assert_eq!(
             work_items_catchup.len(), 1,
-            "Catch-up mode with staging should detect gap [14, 14]"
+            "Catch-up mode should detect gap [14, 14]"
         );
         assert_eq!(
             work_items_catchup[0].start, 14,
@@ -3750,17 +3734,17 @@ mod tests {
             "Catch-up mode gap should end at 14"
         );
 
-        // TEST 2: Historical mode (backfill_from = Some(0)) with staging
+        // TEST 2: Historical mode (backfill_from = Some(0))
         // Should start from 0 (--from 0) and fill to ceiling=20
-        // Data union: [10, 11, 12, 13, 15, 16]
+        // Data: [10, 11, 12, 13, 15, 16]
         // Gaps: [0-9] (pre-existing), [14] (internal)
-        let work_items_historical = detect_gaps(&main_path, Some(&staging_path), &logs, Some(0), &HashMap::new(), None)
+        let work_items_historical = detect_gaps(&main_path, &logs, Some(0), &HashMap::new())
             .await
             .expect("detect_gaps historical failed");
 
         assert_eq!(
             work_items_historical.len(), 2,
-            "Historical mode with staging should detect both pre-existing gap [0-9] and internal gap [14]"
+            "Historical mode should detect both pre-existing gap [0-9] and internal gap [14]"
         );
 
         // First work item should be pre-existing gap [0, 9]
@@ -3780,7 +3764,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&main_path);
-        let _ = fs::remove_dir_all(&staging_path);
     }
 
     #[test]
@@ -4497,9 +4480,10 @@ mod tests {
             .expect("staging write failed");
 
         // Run merge
-        let config = make_test_config(&main_path);
+        let source = make_test_resolved_target(staging_local);
+        let target = make_test_resolved_target(main_local);
         let shutdown = CancellationToken::new();
-        let exit_code = run_merge(config, staging_path.clone(), shutdown).await;
+        let exit_code = run_merge(source, target, shutdown).await;
         assert_eq!(exit_code, 0, "Merge should succeed");
 
         // Verify the merged table has both records with correct as_der values
