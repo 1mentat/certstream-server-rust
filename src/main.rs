@@ -153,10 +153,6 @@ async fn main() {
         let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
 
         // Transitional: override config.delta_sink.table_path with resolved source
-        // Phase 5 changes run_reparse_audit to accept ResolvedTarget directly
-        let mut audit_config = config.clone();
-        audit_config.delta_sink.table_path = resolved_source.table_path;
-
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -168,7 +164,7 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let (exit_code, _report) = table_ops::run_reparse_audit(
-            audit_config,
+            resolved_source,
             cli_args.from_date,
             cli_args.to_date,
             shutdown_token,
@@ -218,10 +214,6 @@ async fn main() {
         let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
         let resolved_target = resolve_or_exit(&config, cli_args.target.as_ref().unwrap(), "--target");
 
-        // Transitional: override config.delta_sink.table_path with resolved target
-        let mut merge_config = config.clone();
-        merge_config.delta_sink.table_path = resolved_target.table_path;
-
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -233,8 +225,8 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let exit_code = backfill::run_merge(
-            merge_config,
-            resolved_source.table_path,
+            resolved_source,
+            resolved_target,
             shutdown_token,
         )
         .await;
@@ -296,7 +288,7 @@ async fn main() {
 
         let exit_code = backfill::run_backfill(
             config,
-            resolved_target.map(|t| t.table_path),
+            resolved_target.unwrap(),
             backfill_from,
             cli_args.backfill_logs,
             cli_args.backfill_sink,
