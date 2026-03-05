@@ -113,7 +113,6 @@ impl CliArgs {
         println!("    --from <INDEX>       Override start index for all logs (integer)");
         println!("    --logs <FILTER>      Filter to specific logs by substring");
         println!("    --sink <NAME>        Writer backend: delta (default), zerobus");
-        println!("    --target <NAME>      Named target for write destination (replaces --staging-path)");
         println!();
         println!("    Backfill uses the state file (ct_log.state_file, default:");
         println!("    certstream_state.json) as the per-log upper bound. Logs not");
@@ -122,13 +121,9 @@ impl CliArgs {
         println!();
         println!("MERGE OPTIONS:");
         println!("    --merge              Merge staging table into main table");
-        println!("    --source <NAME>      Named target for staging table (replaces --staging-path)");
-        println!("    --target <NAME>      Named target for main table");
         println!();
         println!("MIGRATION OPTIONS:");
         println!("    --migrate            Migrate existing Delta table to new schema");
-        println!("    --target <NAME>      Named target for output table (replaces --output)");
-        println!("    --source <NAME>      Named target for source table (replaces --source <PATH>)");
         println!("    --from <DATE>        Start date filter (YYYY-MM-DD, inclusive)");
         println!("    --to <DATE>          End date filter (YYYY-MM-DD, inclusive)");
         println!();
@@ -137,8 +132,6 @@ impl CliArgs {
         println!("TABLE OPERATIONS:");
         println!("    --reparse-audit      Audit stored certs against current parsing code");
         println!("    --extract-metadata   Extract metadata-only Delta table");
-        println!("    --target <NAME>      Named target for output table (replaces --output)");
-        println!("    --source <NAME>      Named target for source table");
         println!("    --from-date <DATE>   Filter partitions from this date (YYYY-MM-DD)");
         println!("    --to-date <DATE>     Filter partitions to this date (YYYY-MM-DD)");
         println!();

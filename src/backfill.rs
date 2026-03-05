@@ -3718,7 +3718,7 @@ mod tests {
         assert!(cli_args.target.is_none(), "target should be None");
 
         // The validation logic in main.rs checks:
-        // if cli_args.merge && cli_args.target.is_none() => print error and exit 1
+        // if cli_args.merge && (cli_args.target.is_none() || cli_args.source.is_none()) => print error and exit 1
         // This test verifies the condition that triggers the error
         let has_merge_without_target = cli_args.merge && cli_args.target.is_none();
         assert!(
