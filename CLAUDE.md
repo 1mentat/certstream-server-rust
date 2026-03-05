@@ -90,7 +90,7 @@ The binary has six execution modes selected in main.rs:
 - **Validation scope**: `delta_sink.table_path` validated when delta_sink enabled; `query_api.table_path` validated when query_api enabled; target table paths validated at CLI dispatch in main.rs when `--source` or `--target` flags are used
 
 ## Named Targets Contracts
-- **TargetConfig struct**: `{ table_path, compression_level: Option<i32>, heavy_column_compression_level: Option<i32>, offline_batch_size: Option<usize> }`
+- **TargetConfig struct**: `{ table_path, storage: Option<StorageConfig>, compression_level: Option<i32>, heavy_column_compression_level: Option<i32>, offline_batch_size: Option<usize> }`
 - **ResolvedTarget struct**: `{ table_path: TableLocation, storage_options: HashMap<String, String>, compression_level: i32, heavy_column_compression_level: i32, offline_batch_size: usize }` — result of resolving a target with inheritance from delta_sink defaults
 - **targets config section**: optional `targets:` map in main config; keys are target names (e.g., `"main"`, `"staging"`, `"archive"`), values are `TargetConfig` structs with table_path (required) and optional compression/batch size settings
 - **Env var pattern**: `CERTSTREAM_TARGETS_<NAME>_<FIELD>` (e.g., `CERTSTREAM_TARGETS_STAGING_TABLE_PATH`, `CERTSTREAM_TARGETS_ARCHIVE_COMPRESSION_LEVEL`); env vars are merged into targets from YAML at startup
@@ -98,7 +98,7 @@ The binary has six execution modes selected in main.rs:
 - **default target behavior**: when `--target`/`--source` flags are omitted in operations (backfill, migrate, merge, reparse-audit, extract-metadata), the operation falls back to `config.delta_sink.table_path` as the implicit default target (for backward compatibility)
 - **--target and --source flags**: `--target <NAME>` specifies the named target for write operations; `--source <NAME>` specifies the named target for read operations; both are resolved via `config.resolve_target(name)` at dispatch time in main.rs
 - **Validation**: target names must exist in `config.targets` or error is printed and operation exits; table_path in target must be valid URI with scheme (file:// or s3://); compression levels must be in valid zstd range (1-22)
-- **Storage inheritance**: if a named target specifies an S3 table URI but no S3 credentials, uses top-level `config.storage.s3` or env vars; per-target storage config is not supported (all targets use global storage credentials)
+- **Storage inheritance**: per-target storage IS supported via optional `storage` field in `TargetConfig`; if a target specifies S3 table URI with per-target storage credentials, those are used; if per-target storage omitted, falls back to global `config.storage` (implemented via `target.storage.as_ref().unwrap_or(&self.storage)` in resolve_target at src/config.rs:1256)
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
