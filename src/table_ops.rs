@@ -1216,9 +1216,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.mismatch_record_count, 0, "AC1.1: Should have 0 mismatches");
@@ -1241,9 +1241,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0 (reports mismatches, doesn't fail)");
         assert_eq!(report.mismatch_record_count, 1, "AC1.2: Should detect 1 mismatch");
@@ -1276,9 +1276,9 @@ mod tests {
 
         write_test_records(test_dir, records).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.mismatch_record_count, 15, "AC1.3: Should detect 15 mismatches");
@@ -1300,9 +1300,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.unparseable_count, 1, "AC1.4: Invalid base64 should be counted as unparseable");
@@ -1324,9 +1324,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.unparseable_count, 1, "AC1.5: Garbage bytes should be counted as unparseable");
@@ -1345,11 +1345,11 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
         // Query for a date range that doesn't match the data (2026-03-01 to 2026-03-31)
         let (exit_code, report) = run_reparse_audit(
-            config,
+            target,
             Some("2026-03-01".to_string()),
             Some("2026-03-31".to_string()),
             shutdown,
@@ -1636,13 +1636,13 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
 
         // Cancel the token before calling the function to simulate shutdown signal
         shutdown.cancel();
 
-        let (exit_code, _report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, _report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 1, "AC4.4: Audit should exit with code 1 on shutdown");
 
