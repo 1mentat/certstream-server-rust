@@ -2842,8 +2842,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ac2_4_missing_staging_falls_back_to_main_only() {
-        // After Phase 5 refactoring: test gap detection with nonexistent table
-        // (staging_path parameter removed)
+        // Test gap detection when table doesn't exist
+        // Uses ResolvedTarget for table path resolution
         let test_name = "ac2_4_nonexistent_table";
         let table_path = format!("/tmp/delta_backfill_test_{}", test_name);
         let nonexistent_path = format!("/tmp/delta_backfill_test_{}_nonexistent", test_name);
@@ -3504,9 +3504,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ac4_5_cli_validation_merge_without_staging_path() {
-        // Verifies staging-backfill.AC4.5: --merge without --staging-path validation
-        // Test at CLI parsing level: construct CliArgs with merge=true, staging_path=None
+    fn test_ac4_5_cli_validation_merge_without_targets() {
+        // Verifies staging-backfill.AC4.5: --merge without required target flags validation
+        // Test at CLI parsing level: construct CliArgs with merge=true, target=None
         use crate::cli::CliArgs;
 
         let cli_args = CliArgs {

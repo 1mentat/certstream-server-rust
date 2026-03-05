@@ -454,7 +454,7 @@ mod tests {
         );
     }
 
-    // Task 1: Tests for --migrate and --output flags
+    // Tests for --migrate and target-based flags
     #[test]
     fn test_migrate_flag_parsed_correctly() {
         let args = vec![
