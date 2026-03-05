@@ -1150,6 +1150,88 @@ impl Config {
             });
         }
 
+        // Validate named targets
+        for (name, target) in &self.targets {
+            let target_field = format!("targets.{}", name);
+
+            // Validate URI format
+            match parse_table_uri(&target.table_path) {
+                Ok(location) => {
+                    // If S3 URI, validate S3 credentials are available
+                    if matches!(location, TableLocation::S3 { .. }) {
+                        let effective_storage = target.storage.as_ref().unwrap_or(&self.storage);
+                        match &effective_storage.s3 {
+                            None => {
+                                errors.push(ConfigValidationError {
+                                    field: format!("{}.storage.s3", target_field),
+                                    message: format!(
+                                        "Target '{}' uses s3:// URI but has no S3 storage configuration (neither target-level nor global)",
+                                        name
+                                    ),
+                                });
+                            }
+                            Some(s3) => {
+                                if s3.endpoint.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.endpoint", target_field),
+                                        message: format!("S3 endpoint cannot be empty for target '{}'", name),
+                                    });
+                                }
+                                if s3.region.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.region", target_field),
+                                        message: format!("S3 region cannot be empty for target '{}'", name),
+                                    });
+                                }
+                                if s3.access_key_id.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.access_key_id", target_field),
+                                        message: format!("S3 access key ID cannot be empty for target '{}'", name),
+                                    });
+                                }
+                                if s3.secret_access_key.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.secret_access_key", target_field),
+                                        message: format!("S3 secret access key cannot be empty for target '{}'", name),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(ConfigValidationError {
+                        field: format!("{}.table_path", target_field),
+                        message: e,
+                    });
+                }
+            }
+
+            // Validate compression levels if specified
+            if let Some(level) = target.compression_level {
+                if ZstdLevel::try_new(level).is_err() {
+                    errors.push(ConfigValidationError {
+                        field: format!("{}.compression_level", target_field),
+                        message: format!(
+                            "Compression level {} is invalid for target '{}'. Must be between 1 and 22",
+                            level, name
+                        ),
+                    });
+                }
+            }
+            if let Some(level) = target.heavy_column_compression_level {
+                if ZstdLevel::try_new(level).is_err() {
+                    errors.push(ConfigValidationError {
+                        field: format!("{}.heavy_column_compression_level", target_field),
+                        message: format!(
+                            "Heavy column compression level {} is invalid for target '{}'. Must be between 1 and 22",
+                            level, name
+                        ),
+                    });
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
