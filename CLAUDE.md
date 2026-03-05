@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-03-02
-Last context update: 2026-03-02
+Last verified: 2026-03-05
+Last context update: 2026-03-05
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -21,15 +21,15 @@ Last context update: 2026-03-02
 - `cargo run -- --backfill` - Run delta backfill mode (catch-up gaps)
 - `cargo run -- --backfill --from 0` - Run historical backfill from index 0
 - `cargo run -- --backfill --logs "google"` - Backfill only logs matching filter
-- `cargo run -- --backfill --staging-path file:///tmp/staging` - Backfill into staging table
+- `cargo run -- --backfill --target staging` - Backfill into staging table (named target)
 - `cargo run -- --backfill --sink zerobus --from 0` - Backfill via ZeroBus sink
-- `cargo run -- --merge --staging-path file:///tmp/staging` - Merge staging into main table
-- `cargo run -- --migrate --output file:///tmp/output` - Migrate Delta table to new schema
-- `cargo run -- --migrate --output file:///tmp/output --source file:///tmp/source --from 2026-02-01 --to 2026-02-28` - Migrate with source and date filters
-- `cargo run -- --reparse-audit` - Audit stored certs against current parsing code
-- `cargo run -- --reparse-audit --from-date 2026-02-01 --to-date 2026-02-28` - Audit with date filter
-- `cargo run -- --extract-metadata --output file:///tmp/metadata` - Extract metadata-only Delta table
-- `cargo run -- --extract-metadata --output file:///tmp/metadata --from-date 2026-02-01` - Extract with date filter
+- `cargo run -- --merge --source staging --target main` - Merge staging into main table (named targets)
+- `cargo run -- --migrate --source main --target output` - Migrate Delta table to new schema (named targets)
+- `cargo run -- --migrate --source archive --target output --from 2026-02-01 --to 2026-02-28` - Migrate with source and date filters (named targets)
+- `cargo run -- --reparse-audit --source main` - Audit stored certs against current parsing code (named target)
+- `cargo run -- --reparse-audit --source main --from-date 2026-02-01 --to-date 2026-02-28` - Audit with date filter (named target)
+- `cargo run -- --extract-metadata --source main --target metadata` - Extract metadata-only Delta table (named targets)
+- `cargo run -- --extract-metadata --source main --target metadata --from-date 2026-02-01` - Extract with date filter (named targets)
 
 ## Project Structure
 - `src/main.rs` - Entry point, server startup, task orchestration
@@ -64,18 +64,18 @@ In Delta Lake storage, the `as_der` column is stored as raw binary bytes (not ba
 
 The binary has six execution modes selected in main.rs:
 1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
-2. **Backfill mode** (`--backfill`): runs gap detection against the Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--staging-path`, writes to a separate staging table instead of the main table.
-3. **Merge mode** (`--merge --staging-path <PATH>`): merges a staging Delta table into the main table using Delta MERGE INTO with deduplication, then deletes the staging directory on success
-4. **Migrate mode** (`--migrate --output <PATH>`): reads an existing Delta table, converts `as_der` from base64 Utf8 to raw Binary, and writes to a new output table with optimized WriterProperties
-5. **Reparse audit mode** (`--reparse-audit`): reads stored certificates from the Delta table, reparses each from `as_der`, compares parsed fields against stored values, and prints a mismatch report. Exits 0 on success (even with mismatches), 1 on infrastructure failure or shutdown.
-6. **Metadata extraction mode** (`--extract-metadata --output <PATH>`): reads the source Delta table and writes a 19-column metadata-only Delta table (all columns except `as_der`) to the output path. Exits 0 on success, 1 on failure or shutdown.
+2. **Backfill mode** (`--backfill` with optional `--target <NAME>`): runs gap detection against the target Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--target <NAME>`, writes to the named target table instead of the default delta_sink table.
+3. **Merge mode** (`--merge --source <NAME> --target <NAME>`): merges source Delta table into target table using Delta MERGE INTO with deduplication, then deletes the source directory on success
+4. **Migrate mode** (`--migrate --source <NAME> --target <NAME>`): reads existing Delta table from source target, converts `as_der` from base64 Utf8 to raw Binary, and writes to target table with optimized WriterProperties
+5. **Reparse audit mode** (`--reparse-audit --source <NAME>`): reads stored certificates from source target Delta table, reparses each from `as_der`, compares parsed fields against stored values, and prints a mismatch report. Exits 0 on success (even with mismatches), 1 on infrastructure failure or shutdown.
+6. **Metadata extraction mode** (`--extract-metadata --source <NAME> --target <NAME>`): reads source Delta table and writes a 19-column metadata-only Delta table (all columns except `as_der`) to target table. Exits 0 on success, 1 on failure or shutdown.
 
 ## Key Conventions
 - Config structs use serde Deserialize with defaults; env vars override YAML
 - Env var pattern: `CERTSTREAM_<SECTION>_<FIELD>` (e.g., `CERTSTREAM_DELTA_SINK_ENABLED`)
 - All optional features use an `enabled: bool` field (default false)
 - Graceful shutdown via CancellationToken propagated to all tasks
-- **Table paths require URI scheme**: all `table_path` and `staging_path` values must use `file://` for local filesystem or `s3://` for S3-compatible storage; bare paths are rejected by `parse_table_uri()` at config validation and CLI dispatch
+- **Table paths require URI scheme**: all `table_path` values must use `file://` for local filesystem or `s3://` for S3-compatible storage; bare paths are rejected by `parse_table_uri()` at config validation and CLI dispatch
 - **Defense-in-depth URI handling**: production code uses `DeltaTableBuilder::from_valid_uri()` which returns a Result, rather than `from_uri()` which panics on invalid URIs
 
 ## Storage Config Contracts
@@ -87,7 +87,18 @@ The binary has six execution modes selected in main.rs:
 - **`parse_table_uri(uri)`**: parses `file://` to `Local`, `s3://` to `S3`; rejects empty URIs, unsupported schemes, and bare paths (suggests `file://` prefix)
 - **`resolve_storage_options(location, storage)`**: returns `HashMap<String, String>` — empty for Local, AWS-compatible options (`AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `conditional_put`, `AWS_ALLOW_HTTP`) for S3
 - **Validation (when S3 URIs used)**: `storage.s3` must be present; `endpoint`, `region`, `access_key_id`, `secret_access_key` must be non-empty; validated during `Config::validate()`
-- **Validation scope**: `delta_sink.table_path` validated when delta_sink enabled; `query_api.table_path` validated when query_api enabled; `--staging-path` validated at CLI dispatch in main.rs (both backfill and merge modes)
+- **Validation scope**: `delta_sink.table_path` validated when delta_sink enabled; `query_api.table_path` validated when query_api enabled; target table paths validated at CLI dispatch in main.rs when `--source` or `--target` flags are used
+
+## Named Targets Contracts
+- **TargetConfig struct**: `{ table_path, compression_level: Option<i32>, heavy_column_compression_level: Option<i32>, offline_batch_size: Option<usize> }`
+- **ResolvedTarget struct**: `{ table_path: TableLocation, storage_options: HashMap<String, String>, compression_level: i32, heavy_column_compression_level: i32, offline_batch_size: usize }` — result of resolving a target with inheritance from delta_sink defaults
+- **targets config section**: optional `targets:` map in main config; keys are target names (e.g., `"main"`, `"staging"`, `"archive"`), values are `TargetConfig` structs with table_path (required) and optional compression/batch size settings
+- **Env var pattern**: `CERTSTREAM_TARGETS_<NAME>_<FIELD>` (e.g., `CERTSTREAM_TARGETS_STAGING_TABLE_PATH`, `CERTSTREAM_TARGETS_ARCHIVE_COMPRESSION_LEVEL`); env vars are merged into targets from YAML at startup
+- **resolve_target() function**: looks up target by name in `config.targets` map; applies inheritance: if target omits `compression_level`, falls back to `delta_sink.compression_level`; same for `heavy_column_compression_level` and `offline_batch_size`; parses `table_path` via `parse_table_uri()` and resolves storage options via `resolve_storage_options()` to build `ResolvedTarget`
+- **default target behavior**: when `--target`/`--source` flags are omitted in operations (backfill, migrate, merge, reparse-audit, extract-metadata), the operation falls back to `config.delta_sink.table_path` as the implicit default target (for backward compatibility)
+- **--target and --source flags**: `--target <NAME>` specifies the named target for write operations; `--source <NAME>` specifies the named target for read operations; both are resolved via `config.resolve_target(name)` at dispatch time in main.rs
+- **Validation**: target names must exist in `config.targets` or error is printed and operation exits; table_path in target must be valid URI with scheme (file:// or s3://); compression levels must be in valid zstd range (1-22)
+- **Storage inheritance**: if a named target specifies an S3 table URI but no S3 credentials, uses top-level `config.storage.s3` or env vars; per-target storage config is not supported (all targets use global storage credentials)
 
 ## Delta Sink Contracts
 - **Disabled by default** (`delta_sink.enabled = false`)
@@ -149,9 +160,11 @@ The binary has six execution modes selected in main.rs:
 ## CLI Shared Flag Contracts
 - **`--from` dual purpose**: stored as raw `String` in `CliArgs.backfill_from`; interpreted as u64 integer in backfill mode (parsed at dispatch site in `main.rs`), as YYYY-MM-DD date in migrate mode (validated via `validate_date_format()`)
 - **`validate_date_format(date, flag_name)`**: public helper in `cli.rs`; validates YYYY-MM-DD format with year 2000-2099, month 01-12, day 01-31; does NOT validate days-per-month (e.g., Feb 31 passes); returns `Result<(), String>`
+- **`--target <NAME>` flag**: specifies named target for write operations (backfill, migrate, extract-metadata); resolved via `config.resolve_target(name)` at dispatch; if not provided, operations fall back to `delta_sink.table_path` as implicit default; operation exits with error if target name does not exist in config
+- **`--source <NAME>` flag**: specifies named target for read operations (merge, migrate, extract-metadata, reparse-audit); resolved via `config.resolve_target(name)` at dispatch; if not provided, operations fall back to `delta_sink.table_path` as implicit default; operation exits with error if target name does not exist in config
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--target <NAME>` selects named target table (optional, defaults to delta_sink.table_path); `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
 - **Entry point**: `backfill::run_backfill(config, target: Option<ResolvedTarget>, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
 - **ResolvedTarget parameter**: `target` is a pre-resolved target containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`. For zerobus sink, target is None (zerobus doesn't use a Delta table).
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
@@ -169,7 +182,7 @@ The binary has six execution modes selected in main.rs:
 - **Graceful shutdown**: CancellationToken checked per batch in fetchers; writer flushes remaining buffer on cancellation
 
 ## Merge Contracts
-- **CLI flags**: `--merge --source <PATH> --target <PATH>` activates merge mode; `--merge` without both flags exits with error
+- **CLI flags**: `--merge --source <NAME> --target <NAME>` activates merge mode; `--merge` without both flags exits with error
 - **Entry point**: `backfill::run_merge(source: ResolvedTarget, target: ResolvedTarget, shutdown)` called from main, returns exit code (i32)
 - **ResolvedTarget parameters**: `source` and `target` are pre-resolved targets containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`
 - **Merge predicate**: `target.source_url = source.source_url AND target.cert_index = source.cert_index` (deduplication key)
@@ -182,7 +195,7 @@ The binary has six execution modes selected in main.rs:
 - **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (source left intact)
 
 ## Migrate Contracts
-- **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--source <PATH>` overrides source table (default: `config.delta_sink.table_path`); `--from <DATE>` start date filter (YYYY-MM-DD, inclusive); `--to <DATE>` end date filter (YYYY-MM-DD, inclusive); `--migrate` without `--output` exits with error; `--from` and `--to` validated via `cli::validate_date_format()` at dispatch
+- **CLI flags**: `--migrate --source <NAME> --target <NAME>` activates migrate mode; `--from <DATE>` start date filter (YYYY-MM-DD, inclusive); `--to <DATE>` end date filter (YYYY-MM-DD, inclusive); `--migrate` without both `--source` and `--target` exits with error; `--from` and `--to` validated via `cli::validate_date_format()` at dispatch
 - **Entry point**: `backfill::run_migrate(source: ResolvedTarget, target: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns exit code (i32)
 - **ResolvedTarget parameters**: `source` and `target` are pre-resolved targets containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`
 - **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
@@ -198,7 +211,7 @@ The binary has six execution modes selected in main.rs:
 - **Error handling**: any failure (table open, query, write) exits with code 1
 
 ## Reparse Audit Contracts
-- **CLI flags**: `--reparse-audit --source <PATH>` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date
+- **CLI flags**: `--reparse-audit --source <NAME>` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date; `--source` defaults to delta_sink.table_path if omitted
 - **Entry point**: `table_ops::run_reparse_audit(source: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns `(i32, AuditReport)`
 - **ResolvedTarget parameter**: `source` is a pre-resolved target containing `table_path`, `storage_options`, and other configuration
 - **Source table**: reads from `source.table_path`
@@ -214,8 +227,8 @@ The binary has six execution modes selected in main.rs:
 - **Public helpers**: `date_filter_clause(from_date, to_date)` returns SQL WHERE fragment or Err for invalid format; `metadata_schema()` returns 19-column Arrow Schema (delta_schema minus as_der)
 
 ## Metadata Extraction Contracts
-- **CLI flags**: `--extract-metadata` activates extraction mode; `--output <PATH>` (required) sets output Delta table path; `--from-date <YYYY-MM-DD>` and `--to-date <YYYY-MM-DD>` filter partitions
-- **Validation**: `--extract-metadata` without `--output` prints error and exits 1 (checked in main.rs)
+- **CLI flags**: `--extract-metadata --source <NAME> --target <NAME>` activates extraction mode; `--from-date <YYYY-MM-DD>` and `--to-date <YYYY-MM-DD>` filter partitions
+- **Validation**: `--extract-metadata` without both `--source` and `--target` prints error and exits 1 (checked in main.rs)
 - **Entry point**: `table_ops::run_extract_metadata(source: ResolvedTarget, target: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns i32
 - **ResolvedTarget parameters**: `source` and `target` are pre-resolved targets containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`
 - **Source table**: reads from `source.table_path`
