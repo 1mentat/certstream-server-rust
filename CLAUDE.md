@@ -151,15 +151,14 @@ The binary has six execution modes selected in main.rs:
 - **`validate_date_format(date, flag_name)`**: public helper in `cli.rs`; validates YYYY-MM-DD format with year 2000-2099, month 01-12, day 01-31; does NOT validate days-per-month (e.g., Feb 31 passes); returns `Result<(), String>`
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--staging-path <PATH>` writes to staging table instead of main table; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
-- **Entry point**: `backfill::run_backfill(config, staging_path, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **Entry point**: `backfill::run_backfill(config, target: Option<ResolvedTarget>, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
+- **ResolvedTarget parameter**: `target` is a pre-resolved target containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`. For zerobus sink, target is None (zerobus doesn't use a Delta table).
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
 - **Two modes**: catch-up (no `--from`, fills internal gaps within existing Delta data) and historical (`--from N`, backfills from index N to ceiling)
-- **Gap detection**: `detect_gaps(table_path, staging_path, logs, backfill_from)` queries Delta table(s) via DataFusion SQL, finds internal gaps only (LEAD window function). When staging_path is provided and the staging table exists, both tables are queried via a UNION ALL view using `COUNT(DISTINCT cert_index)` to avoid double-counting duplicates. The second element of the `logs` tuple is the ceiling (from state file `current_index`).
-- **Gap detection fallback**: if main table does not exist but staging table does, gap detection uses staging alone; if neither exists, falls back to original mode-based logic (empty work items for catch-up, full range for historical)
-- **Staging write path**: when `--staging-path` is provided, the writer task writes to the staging table path instead of `config.delta_sink.table_path`; gap detection still reads both tables to avoid re-fetching already-staged records
-- **Catch-up rules**: only backfills logs already present in Delta table; logs not in table are skipped; only internal gaps are filled (no frontier gaps)
-- **Historical rules**: backfills all logs from `--from` index to ceiling; logs not in Delta get full range from `--from` to ceiling
+- **Gap detection**: `detect_gaps(table_path, logs, backfill_from, storage_options)` queries the target Delta table via DataFusion SQL, finds internal gaps only (LEAD window function). The second element of the `logs` tuple is the ceiling (from state file `current_index`).
+- **Catch-up rules**: only backfills logs already present in target table; logs not in table are skipped; only internal gaps are filled (no frontier gaps)
+- **Historical rules**: backfills all logs from `--from` index to ceiling; logs not in target table get full range from `--from` to ceiling
 - **Sink selection**: `--sink zerobus` requires `zerobus_sink.enabled = true` in config and `--from` (historical mode only; gap detection not supported for remote tables); `--sink delta` or omitted defaults to Delta writer; unknown sink names exit with error
 - **ZeroBus backfill writer**: `run_zerobus_writer(config, rx, shutdown)` streams records via ZeroBus SDK; same retry/recovery logic as live sink (retryable errors recreate stream, non-retryable skip record); flushes and closes stream on completion
 - **ZeroBus work items**: when `--sink zerobus`, gap detection is skipped; work items built directly from `--from` to ceiling for each log
@@ -170,16 +169,17 @@ The binary has six execution modes selected in main.rs:
 - **Graceful shutdown**: CancellationToken checked per batch in fetchers; writer flushes remaining buffer on cancellation
 
 ## Merge Contracts
-- **CLI flags**: `--merge --staging-path <PATH>` activates merge mode; `--merge` without `--staging-path` exits with error
-- **Entry point**: `backfill::run_merge(config, staging_path, shutdown)` called from main, returns exit code (i32)
+- **CLI flags**: `--merge --source <PATH> --target <PATH>` activates merge mode; `--merge` without both flags exits with error
+- **Entry point**: `backfill::run_merge(source: ResolvedTarget, target: ResolvedTarget, shutdown)` called from main, returns exit code (i32)
+- **ResolvedTarget parameters**: `source` and `target` are pre-resolved targets containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`
 - **Merge predicate**: `target.source_url = source.source_url AND target.cert_index = source.cert_index` (deduplication key)
 - **Merge behavior**: uses `DeltaOps::merge()` with `when_not_matched_insert` only (no updates, no deletes); matched source rows are silently skipped
-- **Batch-by-batch**: staging records are read via DataFusion SQL, then each RecordBatch is merged individually into the main table
-- **Missing staging table**: if staging table does not exist (NotATable or InvalidTableLocation), exits with code 0 (not an error)
-- **Empty staging table**: if all batches have zero rows, exits with code 0
-- **Staging cleanup**: on successful merge, the staging directory is deleted via `remove_dir_all`; cleanup failure is non-fatal (logged as warning)
-- **Error handling**: any failure during merge leaves staging intact for retry and exits with code 1
-- **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (staging left intact)
+- **Batch-by-batch**: source records are read via DataFusion SQL, then each RecordBatch is merged individually into the target table
+- **Missing source table**: if source table does not exist (NotATable or InvalidTableLocation), exits with code 0 (not an error)
+- **Empty source table**: if all batches have zero rows, exits with code 0
+- **Source cleanup**: on successful merge, the source directory is deleted via `remove_dir_all`; cleanup failure is non-fatal (logged as warning)
+- **Error handling**: any failure during merge leaves source intact for retry and exits with code 1
+- **Graceful shutdown**: CancellationToken checked between batch merges; if cancelled, exits with code 1 (source left intact)
 
 ## Migrate Contracts
 - **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--source <PATH>` overrides source table (default: `config.delta_sink.table_path`); `--from <DATE>` start date filter (YYYY-MM-DD, inclusive); `--to <DATE>` end date filter (YYYY-MM-DD, inclusive); `--migrate` without `--output` exits with error; `--from` and `--to` validated via `cli::validate_date_format()` at dispatch
@@ -198,9 +198,10 @@ The binary has six execution modes selected in main.rs:
 - **Error handling**: any failure (table open, query, write) exits with code 1
 
 ## Reparse Audit Contracts
-- **CLI flags**: `--reparse-audit` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date
-- **Entry point**: `table_ops::run_reparse_audit(config, from_date, to_date, shutdown)` called from main, returns `(i32, AuditReport)`
-- **Source table**: reads from `config.delta_sink.table_path` (same Delta table as delta_sink and backfill)
+- **CLI flags**: `--reparse-audit --source <PATH>` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date
+- **Entry point**: `table_ops::run_reparse_audit(source: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns `(i32, AuditReport)`
+- **ResolvedTarget parameter**: `source` is a pre-resolved target containing `table_path`, `storage_options`, and other configuration
+- **Source table**: reads from `source.table_path`
 - **Columns read**: cert_index, source_url, seen_date, as_der, subject_aggregated, issuer_aggregated, all_domains, signature_algorithm, is_ca, not_before, not_after, serial_number
 - **Comparison fields**: subject_aggregated, issuer_aggregated, all_domains (sorted), signature_algorithm, is_ca, not_before, not_after, serial_number (8 fields compared)
 - **as_der handling**: supports both Binary and Utf8 (base64-encoded) column types; null or empty values counted as unparseable

@@ -1074,51 +1074,6 @@ mod tests {
         (der_bytes, leaf)
     }
 
-    /// Helper to create a minimal Config for testing
-    fn create_test_config(table_path: &str) -> crate::config::Config {
-        use std::net::IpAddr;
-
-        // Ensure table_path has file:// prefix for URI-based storage
-        let uri_table_path = if table_path.contains("://") {
-            table_path.to_string()
-        } else {
-            format!("file://{table_path}")
-        };
-
-        crate::config::Config {
-            host: "127.0.0.1".parse::<IpAddr>().unwrap(),
-            port: 9100,
-            log_level: "info".to_string(),
-            buffer_size: 100,
-            ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/log_list.json".to_string(),
-            tls_cert: None,
-            tls_key: None,
-            custom_logs: vec![],
-            static_logs: vec![],
-            protocols: Default::default(),
-            ct_log: Default::default(),
-            connection_limit: Default::default(),
-            rate_limit: Default::default(),
-            api: Default::default(),
-            auth: Default::default(),
-            hot_reload: Default::default(),
-            delta_sink: crate::config::DeltaSinkConfig {
-                enabled: true,
-                table_path: uri_table_path,
-                batch_size: 1,
-                flush_interval_secs: 60,
-                compression_level: 9,
-                heavy_column_compression_level: 15,
-                offline_batch_size: 100000,
-            },
-            query_api: Default::default(),
-            zerobus_sink: Default::default(),
-            storage: Default::default(),
-            targets: std::collections::HashMap::new(),
-            config_path: None,
-        }
-    }
-
     fn make_test_resolved_target(table_path: &str) -> ResolvedTarget {
         // Ensure table_path has file:// prefix for URI-based storage
         let uri_table_path = if table_path.contains("://") {

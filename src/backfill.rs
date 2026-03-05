@@ -274,14 +274,11 @@ async fn detect_gaps_from_context(
 
 /// Orchestrate gap detection across all logs.
 ///
-/// Opens delta table(s) once, queries state for all logs, detects gaps per log,
+/// Opens the target delta table, queries for all logs, detects gaps per log,
 /// and generates work items for catch-up or historical backfill modes.
-/// When staging_path is provided and the staging table exists, both main and staging
-/// tables are registered and a UNION ALL view is created.
 ///
 /// # Arguments
-/// * `table_path` - URI to the main delta table
-/// * `staging_path` - Optional URI to the staging delta table; if provided and exists, will be unioned with main
+/// * `table_path` - URI to the target delta table
 /// * `logs` - Vec of (source_url, ceiling) pairs for active logs
 /// * `backfill_from` - None for catch-up mode, Some(index) for historical mode
 /// * `storage_options` - HashMap of storage configuration options for S3 and other backends
@@ -659,7 +656,7 @@ async fn run_zerobus_writer(
 
 pub async fn run_backfill(
     config: Config,
-    target: ResolvedTarget,
+    target: Option<ResolvedTarget>,
     backfill_from: Option<u64>,
     backfill_logs: Option<String>,
     backfill_sink: Option<String>,
@@ -667,7 +664,9 @@ pub async fn run_backfill(
 ) -> i32 {
     info!("backfill mode starting");
 
-    info!(target_path = %target.table_path, "writing to target table");
+    if let Some(ref t) = target {
+        info!(target_path = %t.table_path, "writing to target table");
+    }
 
     if let Some(from) = backfill_from {
         info!(from = from, "backfill_from parameter");
@@ -751,7 +750,8 @@ pub async fn run_backfill(
         items
     } else {
         // Delta sink: use gap detection to find internal gaps
-        match detect_gaps(&target.table_path, &log_ceilings, backfill_from, &target.storage_options).await {
+        let target_ref = target.as_ref().expect("delta sink requires a target table");
+        match detect_gaps(&target_ref.table_path, &log_ceilings, backfill_from, &target_ref.storage_options).await {
             Ok(items) => items,
             Err(e) => {
                 warn!("gap detection failed: {}", e);
@@ -825,12 +825,13 @@ pub async fn run_backfill(
         })
     } else {
         // AC3.2: default to delta writer (backwards-compatible)
-        let table_path = target.table_path.clone();
-        let writer_storage_options = target.storage_options.clone();
+        let target_ref = target.as_ref().expect("delta sink requires a target table");
+        let table_path = target_ref.table_path.clone();
+        let writer_storage_options = target_ref.storage_options.clone();
         let batch_size = config.delta_sink.batch_size;
         let flush_interval_secs = config.delta_sink.flush_interval_secs;
-        let compression_level = target.compression_level;
-        let heavy_column_compression_level = target.heavy_column_compression_level;
+        let compression_level = target_ref.compression_level;
+        let heavy_column_compression_level = target_ref.heavy_column_compression_level;
         let shutdown_clone = shutdown.clone();
         tokio::spawn(async move {
             run_writer(table_path, batch_size, flush_interval_secs, compression_level, heavy_column_compression_level, writer_storage_options, rx, shutdown_clone).await
@@ -971,18 +972,18 @@ async fn cleanup_staging(staging_path: &str, storage_options: &HashMap<String, S
     }
 }
 
-/// Merge mode: merges staging table into main table via Delta MERGE INTO deduplication.
+/// Merge mode: merges source table into target table via Delta MERGE INTO deduplication.
 ///
-/// Reads all staging records as RecordBatches, converts each to a DataFrame, and merges
-/// batch-by-batch into the main table using the predicate:
+/// Reads all source records as RecordBatches, converts each to a DataFrame, and merges
+/// batch-by-batch into the target table using the predicate:
 ///   target.source_url = source.source_url AND target.cert_index = source.cert_index
 ///
 /// Only when_not_matched records are inserted (no updates or deletes). On success,
-/// the staging directory is deleted.
+/// the source directory is deleted.
 ///
 /// # Arguments
-/// * `config` - Server configuration (contains delta_sink.table_path for main table)
-/// * `staging_path` - Path to the staging Delta table
+/// * `source` - ResolvedTarget for the source (staging) table
+/// * `target` - ResolvedTarget for the target (main) table
 /// * `shutdown` - CancellationToken for graceful shutdown
 ///
 /// # Returns
@@ -2885,53 +2886,6 @@ mod tests {
 
     // Task 2: Merge Tests
 
-    /// Helper function to create a minimal Config for testing
-    fn make_test_config(table_path: &str) -> Config {
-        use crate::config::{DeltaSinkConfig, ZerobusSinkConfig};
-        use std::net::IpAddr;
-        use std::str::FromStr;
-
-        // Ensure table_path has file:// prefix for URI-based storage
-        let uri_table_path = if table_path.contains("://") {
-            table_path.to_string()
-        } else {
-            format!("file://{table_path}")
-        };
-
-        Config {
-            host: IpAddr::from_str("127.0.0.1").unwrap(),
-            port: 8000,
-            log_level: "info".to_string(),
-            buffer_size: 1000,
-            ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/log_list.json".to_string(),
-            tls_cert: None,
-            tls_key: None,
-            custom_logs: vec![],
-            static_logs: vec![],
-            protocols: crate::config::ProtocolConfig::default(),
-            ct_log: crate::config::CtLogConfig::default(),
-            connection_limit: crate::config::ConnectionLimitConfig::default(),
-            rate_limit: crate::config::RateLimitConfig::default(),
-            api: crate::config::ApiConfig::default(),
-            auth: crate::config::AuthConfig::default(),
-            hot_reload: crate::config::HotReloadConfig::default(),
-            delta_sink: DeltaSinkConfig {
-                enabled: true,
-                table_path: uri_table_path,
-                batch_size: 100,
-                flush_interval_secs: 60,
-                compression_level: 9,
-                heavy_column_compression_level: 15,
-                offline_batch_size: 100000,
-            },
-            query_api: crate::config::QueryApiConfig::default(),
-            zerobus_sink: ZerobusSinkConfig::default(),
-            storage: crate::config::StorageConfig::default(),
-            targets: std::collections::HashMap::new(),
-            config_path: None,
-        }
-    }
-
     fn make_test_resolved_target(table_path: &str) -> ResolvedTarget {
         // Ensure table_path has file:// prefix for URI-based storage
         let uri_table_path = if table_path.contains("://") {
@@ -3272,7 +3226,7 @@ mod tests {
 
         // Verify source exists before merge
         assert!(
-            std::path::Path::new(&source_path).exists(),
+            std::path::Path::new(source_local).exists(),
             "Source should exist before merge"
         );
 

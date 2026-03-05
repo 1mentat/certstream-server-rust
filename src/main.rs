@@ -152,7 +152,6 @@ async fn main() {
 
         let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
 
-        // Transitional: override config.delta_sink.table_path with resolved source
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -288,7 +287,7 @@ async fn main() {
 
         let exit_code = backfill::run_backfill(
             config,
-            resolved_target.unwrap(),
+            resolved_target,
             backfill_from,
             cli_args.backfill_logs,
             cli_args.backfill_sink,
