@@ -343,6 +343,28 @@ fn default_delta_sink_offline_batch_size() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TargetConfig {
+    pub table_path: String,
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    #[serde(default)]
+    pub compression_level: Option<i32>,
+    #[serde(default)]
+    pub heavy_column_compression_level: Option<i32>,
+    #[serde(default)]
+    pub offline_batch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub table_path: String,
+    pub storage_options: HashMap<String, String>,
+    pub compression_level: i32,
+    pub heavy_column_compression_level: i32,
+    pub offline_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueryApiConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -570,6 +592,7 @@ pub struct Config {
     pub query_api: QueryApiConfig,
     pub zerobus_sink: ZerobusSinkConfig,
     pub storage: StorageConfig,
+    pub targets: HashMap<String, TargetConfig>,
     pub config_path: Option<String>,
 }
 
@@ -608,6 +631,8 @@ struct YamlConfig {
     zerobus_sink: Option<ZerobusSinkConfig>,
     #[serde(default)]
     storage: Option<StorageConfig>,
+    #[serde(default)]
+    targets: Option<HashMap<String, TargetConfig>>,
 }
 
 struct YamlConfigWithPath {
@@ -868,6 +893,7 @@ impl Config {
             query_api,
             zerobus_sink,
             storage,
+            targets: yaml_config.targets.unwrap_or_default(),
             config_path,
         }
     }
@@ -1132,6 +1158,7 @@ mod tests {
             query_api: QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
             storage: StorageConfig::default(),
+            targets: HashMap::new(),
             config_path: None,
         }
     }
