@@ -2865,6 +2865,7 @@ table_path: "file:///data/targets/minimal"
     #[test]
     fn test_resolve_target_unknown_target() {
         // Verifies named-targets.AC1.8: `resolve_target()` returns error for unknown target name
+        // Also verifies named-targets.AC5.7: dispatch resolution exits with error for unknown target
         let config = test_config();
         let result = config.resolve_target("nonexistent");
         assert!(result.is_err());
