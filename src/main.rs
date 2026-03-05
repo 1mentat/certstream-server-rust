@@ -89,8 +89,8 @@ async fn main() {
     }
 
     if cli_args.migrate {
-        if cli_args.migrate_output.is_none() {
-            eprintln!("Error: --migrate requires --output <PATH>");
+        if cli_args.target.is_none() || cli_args.source.is_none() {
+            eprintln!("Error: --migrate requires both --source <NAME> and --target <NAME>");
             std::process::exit(1);
         }
 
@@ -108,11 +108,6 @@ async fn main() {
             }
         }
 
-        // Compute source path: --source flag or config fallback
-        let source_path = cli_args
-            .migrate_source
-            .unwrap_or_else(|| config.delta_sink.table_path.clone());
-
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -125,8 +120,8 @@ async fn main() {
 
         let exit_code = backfill::run_migrate(
             config,
-            cli_args.migrate_output.unwrap(),
-            source_path,
+            cli_args.target.clone().unwrap(),
+            cli_args.source.clone().unwrap(),
             cli_args.backfill_from,
             cli_args.to,
             shutdown_token,
@@ -159,8 +154,8 @@ async fn main() {
     }
 
     if cli_args.extract_metadata {
-        if cli_args.output_path.is_none() {
-            eprintln!("Error: --extract-metadata requires --output <PATH>");
+        if cli_args.target.is_none() || cli_args.source.is_none() {
+            eprintln!("Error: --extract-metadata requires both --source <NAME> and --target <NAME>");
             std::process::exit(1);
         }
 
@@ -176,7 +171,7 @@ async fn main() {
 
         let exit_code = table_ops::run_extract_metadata(
             config,
-            cli_args.output_path.unwrap(),
+            cli_args.target.clone().unwrap(),
             cli_args.from_date,
             cli_args.to_date,
             shutdown_token,
@@ -187,12 +182,10 @@ async fn main() {
     }
 
     if cli_args.merge {
-        if cli_args.staging_path.is_none() {
-            eprintln!("Error: --merge requires --staging-path <PATH>");
+        if cli_args.target.is_none() || cli_args.source.is_none() {
+            eprintln!("Error: --merge requires both --source <NAME> and --target <NAME>");
             std::process::exit(1);
         }
-
-        validate_staging_path_uri(cli_args.staging_path.as_ref());
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -206,7 +199,7 @@ async fn main() {
 
         let exit_code = backfill::run_merge(
             config,
-            cli_args.staging_path.unwrap(),
+            cli_args.source.clone().unwrap(),
             shutdown_token,
         )
         .await;
@@ -237,8 +230,6 @@ async fn main() {
             std::process::exit(1);
         }
 
-        validate_staging_path_uri(cli_args.staging_path.as_ref());
-
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -251,7 +242,7 @@ async fn main() {
 
         let exit_code = backfill::run_backfill(
             config,
-            cli_args.staging_path,
+            cli_args.target.clone(),
             backfill_from,
             cli_args.backfill_logs,
             cli_args.backfill_sink,
@@ -482,6 +473,9 @@ fn spawn_signal_handler(shutdown_token: CancellationToken) {
 }
 
 /// Validate staging path as a valid URI if provided.
+/// Note: This function is no longer called after Phase 3 CLI refactoring.
+/// URI validation will be handled by resolve_target() in Phase 4.
+#[allow(dead_code)]
 fn validate_staging_path_uri(staging_path: Option<&String>) {
     if let Some(staging) = staging_path {
         if let Err(e) = parse_table_uri(staging) {

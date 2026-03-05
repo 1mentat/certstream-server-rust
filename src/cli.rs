@@ -12,18 +12,15 @@ pub struct CliArgs {
     pub backfill: bool,
     pub backfill_from: Option<String>,
     pub backfill_logs: Option<String>,
-    pub staging_path: Option<String>,
     pub backfill_sink: Option<String>,
     pub merge: bool,
     pub migrate: bool,
-    pub migrate_output: Option<String>,
-    /// Source table path for migrate mode (Phase 2: used in migrate dispatch)
-    pub migrate_source: Option<String>,
     /// End date filter for migrate mode (Phase 2: used in migrate dispatch)
     pub to: Option<String>,
     pub reparse_audit: bool,
     pub extract_metadata: bool,
-    pub output_path: Option<String>,
+    pub target: Option<String>,
+    pub source: Option<String>,
     pub from_date: Option<String>,
     pub to_date: Option<String>,
 }
@@ -39,12 +36,10 @@ impl CliArgs {
         // Parse value-bearing flags with index-based iteration
         let mut backfill_from = None;
         let mut backfill_logs = None;
-        let mut staging_path = None;
         let mut backfill_sink = None;
-        let mut migrate_output = None;
-        let mut migrate_source = None;
         let mut to = None;
-        let mut output_path = None;
+        let mut target = None;
+        let mut source = None;
         let mut from_date = None;
         let mut to_date = None;
 
@@ -53,15 +48,12 @@ impl CliArgs {
                 backfill_from = Some(args[i + 1].clone());
             } else if arg == "--logs" && i + 1 < args.len() {
                 backfill_logs = Some(args[i + 1].clone());
-            } else if arg == "--staging-path" && i + 1 < args.len() {
-                staging_path = Some(args[i + 1].clone());
             } else if arg == "--sink" && i + 1 < args.len() {
                 backfill_sink = Some(args[i + 1].clone());
-            } else if arg == "--output" && i + 1 < args.len() {
-                migrate_output = Some(args[i + 1].clone());
-                output_path = Some(args[i + 1].clone());
+            } else if arg == "--target" && i + 1 < args.len() {
+                target = Some(args[i + 1].clone());
             } else if arg == "--source" && i + 1 < args.len() {
-                migrate_source = Some(args[i + 1].clone());
+                source = Some(args[i + 1].clone());
             } else if arg == "--to" && i + 1 < args.len() {
                 to = Some(args[i + 1].clone());
             } else if arg == "--from-date" && i + 1 < args.len() {
@@ -80,16 +72,14 @@ impl CliArgs {
             backfill: args.iter().any(|a| a == "--backfill"),
             backfill_from,
             backfill_logs,
-            staging_path,
             backfill_sink,
             merge: args.iter().any(|a| a == "--merge"),
             migrate: args.iter().any(|a| a == "--migrate"),
-            migrate_output,
-            migrate_source,
             to,
             reparse_audit: args.iter().any(|a| a == "--reparse-audit"),
             extract_metadata: args.iter().any(|a| a == "--extract-metadata"),
-            output_path,
+            target,
+            source,
             from_date,
             to_date,
         }
