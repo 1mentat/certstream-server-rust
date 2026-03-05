@@ -3082,6 +3082,7 @@ mod tests {
             query_api: crate::config::QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
             storage: crate::config::StorageConfig::default(),
+            targets: std::collections::HashMap::new(),
             config_path: None,
         }
     }

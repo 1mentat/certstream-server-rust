@@ -1139,6 +1139,7 @@ mod tests {
             query_api: Default::default(),
             zerobus_sink: Default::default(),
             storage: Default::default(),
+            targets: std::collections::HashMap::new(),
             config_path: None,
         }
     }
