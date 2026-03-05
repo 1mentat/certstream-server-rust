@@ -91,11 +91,11 @@ The binary has six execution modes selected in main.rs:
 
 ## Named Targets Contracts
 - **TargetConfig struct**: `{ table_path, storage: Option<StorageConfig>, compression_level: Option<i32>, heavy_column_compression_level: Option<i32>, offline_batch_size: Option<usize> }`
-- **ResolvedTarget struct**: `{ table_path: TableLocation, storage_options: HashMap<String, String>, compression_level: i32, heavy_column_compression_level: i32, offline_batch_size: usize }` — result of resolving a target with inheritance from delta_sink defaults
+- **ResolvedTarget struct**: `{ table_path: String, storage_options: HashMap<String, String>, compression_level: i32, heavy_column_compression_level: i32, offline_batch_size: usize }` — result of resolving a target with inheritance from delta_sink defaults; `table_path` is a URI string (e.g., `file:///path` or `s3://bucket/key`) produced by `TableLocation::as_uri().to_string()`
 - **targets config section**: optional `targets:` map in main config; keys are target names (e.g., `"main"`, `"staging"`, `"archive"`), values are `TargetConfig` structs with table_path (required) and optional compression/batch size settings
 - **Env var pattern**: `CERTSTREAM_TARGETS_<NAME>_<FIELD>` (e.g., `CERTSTREAM_TARGETS_STAGING_TABLE_PATH`, `CERTSTREAM_TARGETS_ARCHIVE_COMPRESSION_LEVEL`); env vars are merged into targets from YAML at startup
 - **resolve_target() function**: looks up target by name in `config.targets` map; applies inheritance: if target omits `compression_level`, falls back to `delta_sink.compression_level`; same for `heavy_column_compression_level` and `offline_batch_size`; parses `table_path` via `parse_table_uri()` and resolves storage options via `resolve_storage_options()` to build `ResolvedTarget`
-- **default target behavior**: when `--target`/`--source` flags are omitted in operations (backfill, migrate, merge, reparse-audit, extract-metadata), the operation falls back to `config.delta_sink.table_path` as the implicit default target (for backward compatibility)
+- **No implicit defaults**: all operations require explicit `--target` and/or `--source` flags; omitting a required flag prints an error and exits with code 1 (no fallback to `delta_sink.table_path`)
 - **--target and --source flags**: `--target <NAME>` specifies the named target for write operations; `--source <NAME>` specifies the named target for read operations; both are resolved via `config.resolve_target(name)` at dispatch time in main.rs
 - **Validation**: target names must exist in `config.targets` or error is printed and operation exits; table_path in target must be valid URI with scheme (file:// or s3://); compression levels must be in valid zstd range (1-22)
 - **Storage inheritance**: per-target storage IS supported via optional `storage` field in `TargetConfig`; if a target specifies S3 table URI with per-target storage credentials, those are used; if per-target storage omitted, falls back to global `config.storage` (implemented via `target.storage.as_ref().unwrap_or(&self.storage)` in resolve_target at src/config.rs:1256)
@@ -160,11 +160,11 @@ The binary has six execution modes selected in main.rs:
 ## CLI Shared Flag Contracts
 - **`--from` dual purpose**: stored as raw `String` in `CliArgs.backfill_from`; interpreted as u64 integer in backfill mode (parsed at dispatch site in `main.rs`), as YYYY-MM-DD date in migrate mode (validated via `validate_date_format()`)
 - **`validate_date_format(date, flag_name)`**: public helper in `cli.rs`; validates YYYY-MM-DD format with year 2000-2099, month 01-12, day 01-31; does NOT validate days-per-month (e.g., Feb 31 passes); returns `Result<(), String>`
-- **`--target <NAME>` flag**: specifies named target for write operations (backfill, migrate, extract-metadata); resolved via `config.resolve_target(name)` at dispatch; if not provided, operations fall back to `delta_sink.table_path` as implicit default; operation exits with error if target name does not exist in config
-- **`--source <NAME>` flag**: specifies named target for read operations (merge, migrate, extract-metadata, reparse-audit); resolved via `config.resolve_target(name)` at dispatch; if not provided, operations fall back to `delta_sink.table_path` as implicit default; operation exits with error if target name does not exist in config
+- **`--target <NAME>` flag**: specifies named target for write operations (backfill, migrate, merge, extract-metadata); resolved via `config.resolve_target(name)` at dispatch; required for all write operations (no implicit default); operation exits with error if target name does not exist in config
+- **`--source <NAME>` flag**: specifies named target for read operations (merge, migrate, extract-metadata, reparse-audit); resolved via `config.resolve_target(name)` at dispatch; required for all read operations (no implicit default); operation exits with error if target name does not exist in config
 
 ## Backfill Contracts
-- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--target <NAME>` selects named target table (optional, defaults to delta_sink.table_path); `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
+- **CLI flags**: `--backfill` activates backfill mode; `--from <INDEX>` sets historical start (parsed as u64 integer at dispatch); `--logs <FILTER>` filters logs by substring; `--target <NAME>` selects named target table (required for delta sink, forbidden for zerobus sink); `--sink <NAME>` selects writer backend (`delta` default, `zerobus`)
 - **Entry point**: `backfill::run_backfill(config, target: Option<ResolvedTarget>, backfill_from, backfill_logs, backfill_sink, shutdown)` called from main, returns exit code (i32)
 - **ResolvedTarget parameter**: `target` is a pre-resolved target containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`. For zerobus sink, target is None (zerobus doesn't use a Delta table).
 - **State file dependency**: backfill loads `StateManager` from `config.ct_log.state_file` (default: `certstream_state.json`) and uses each log's `current_index` as the per-log ceiling. Logs not in the state file are skipped with a warning. If no logs have state file entries, backfill exits with code 0.
@@ -211,7 +211,7 @@ The binary has six execution modes selected in main.rs:
 - **Error handling**: any failure (table open, query, write) exits with code 1
 
 ## Reparse Audit Contracts
-- **CLI flags**: `--reparse-audit --source <NAME>` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date; `--source` defaults to delta_sink.table_path if omitted
+- **CLI flags**: `--reparse-audit --source <NAME>` activates reparse audit mode; `--from-date <YYYY-MM-DD>` filters partitions from date; `--to-date <YYYY-MM-DD>` filters partitions to date; `--source` is required (exits with error if omitted)
 - **Entry point**: `table_ops::run_reparse_audit(source: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns `(i32, AuditReport)`
 - **ResolvedTarget parameter**: `source` is a pre-resolved target containing `table_path`, `storage_options`, and other configuration
 - **Source table**: reads from `source.table_path`
