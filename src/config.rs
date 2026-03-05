@@ -2412,7 +2412,7 @@ s3:
 
     // Test URI validation: AC2.6 - parse_table_uri validates both file:// and bare paths
     #[test]
-    fn test_validate_staging_path_uri_format() {
+    fn test_parse_table_uri_validates_scheme() {
         // Valid file:// URI should succeed
         let result = parse_table_uri("file:///tmp/staging");
         assert!(result.is_ok(), "file:/// URI should parse successfully");
