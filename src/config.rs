@@ -872,6 +872,68 @@ impl Config {
             }
         }
 
+        // Overlay env vars for each named target
+        let mut targets = yaml_config.targets.unwrap_or_default();
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+
+            if let Ok(v) = env::var(format!("{}_TABLE_PATH", prefix)) {
+                target.table_path = v;
+            }
+            if let Ok(v) = env::var(format!("{}_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.compression_level = Some(level);
+                }
+            }
+            if let Ok(v) = env::var(format!("{}_HEAVY_COLUMN_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.heavy_column_compression_level = Some(level);
+                }
+            }
+            if let Ok(v) = env::var(format!("{}_OFFLINE_BATCH_SIZE", prefix)) {
+                if let Ok(size) = v.parse::<usize>() {
+                    target.offline_batch_size = Some(size);
+                }
+            }
+
+            // Storage S3 env var overrides for per-target storage
+            let s3_prefix = format!("{}_STORAGE_S3", prefix);
+            let s3_endpoint = env::var(format!("{}_ENDPOINT", s3_prefix)).unwrap_or_default();
+            if !s3_endpoint.is_empty() {
+                // If endpoint env var is set, create or override S3 config
+                let s3 = S3StorageConfig {
+                    endpoint: s3_endpoint,
+                    region: env::var(format!("{}_REGION", s3_prefix)).unwrap_or_default(),
+                    access_key_id: env::var(format!("{}_ACCESS_KEY_ID", s3_prefix)).unwrap_or_default(),
+                    secret_access_key: env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)).unwrap_or_default(),
+                    conditional_put: env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)).ok(),
+                    allow_http: env::var(format!("{}_ALLOW_HTTP", s3_prefix)).ok().and_then(|v| v.parse().ok()),
+                };
+                target.storage = Some(StorageConfig { s3: Some(s3) });
+            } else if let Some(ref mut storage) = target.storage {
+                // If no endpoint trigger but target has YAML storage, overlay individual non-endpoint fields
+                // Note: endpoint overlay is intentionally omitted here — we already know the endpoint env var
+                // is empty/unset (that's why we're in the else branch), so overlaying it would be a no-op.
+                if let Some(ref mut s3) = storage.s3 {
+                    if let Ok(v) = env::var(format!("{}_REGION", s3_prefix)) {
+                        s3.region = v;
+                    }
+                    if let Ok(v) = env::var(format!("{}_ACCESS_KEY_ID", s3_prefix)) {
+                        s3.access_key_id = v;
+                    }
+                    if let Ok(v) = env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)) {
+                        s3.secret_access_key = v;
+                    }
+                    if let Ok(v) = env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)) {
+                        s3.conditional_put = Some(v);
+                    }
+                    if let Ok(v) = env::var(format!("{}_ALLOW_HTTP", s3_prefix)) {
+                        s3.allow_http = v.parse().ok();
+                    }
+                }
+            }
+        }
+
         Self {
             host,
             port,
@@ -893,7 +955,7 @@ impl Config {
             query_api,
             zerobus_sink,
             storage,
-            targets: yaml_config.targets.unwrap_or_default(),
+            targets,
             config_path,
         }
     }
