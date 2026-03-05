@@ -3536,4 +3536,220 @@ table_path: "file:///data/targets/minimal"
         assert!(errors.iter().any(|e| e.field == "targets.test_target.compression_level"));
         assert!(errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"));
     }
+
+    // Integration test: Full config -> resolve -> operation flow with named targets
+    #[test]
+    fn test_target_integration() {
+        // Verifies named-targets.AC7.1: Full config -> CLI -> resolve -> operation flow works end-to-end
+
+        // Create temporary directories for source and target tables
+        let test_name = "target_integration_test";
+        let source_table_path = format!("/tmp/delta_{}_source", test_name);
+        let target_table_path = format!("/tmp/delta_{}_target", test_name);
+        let source_file_uri = format!("file://{}", source_table_path);
+        let target_file_uri = format!("file://{}", target_table_path);
+
+        // Clean up any previous test artifacts
+        let _ = std::fs::remove_dir_all(&source_table_path);
+        let _ = std::fs::remove_dir_all(&target_table_path);
+
+        // Create a Config with named targets
+        let mut config = test_config();
+
+        // Add "source" target with explicit compression levels
+        let source_target = TargetConfig {
+            table_path: source_file_uri.clone(),
+            storage: None,
+            compression_level: Some(10),
+            heavy_column_compression_level: Some(12),
+            offline_batch_size: Some(50000),
+        };
+        config.targets.insert("source".to_string(), source_target);
+
+        // Add "target" target using delta_sink defaults (fallback)
+        let target_target = TargetConfig {
+            table_path: target_file_uri.clone(),
+            storage: None,
+            compression_level: None,  // Will fall back to delta_sink.compression_level
+            heavy_column_compression_level: None,  // Will fall back to delta_sink.heavy_column_compression_level
+            offline_batch_size: None,  // Will fall back to delta_sink.offline_batch_size
+        };
+        config.targets.insert("target".to_string(), target_target);
+
+        // Verify the config validates
+        assert!(config.validate().is_ok(), "Config with named targets should be valid");
+
+        // Resolve both targets
+        let source_resolved = config.resolve_target("source")
+            .expect("Should resolve 'source' target");
+        let target_resolved = config.resolve_target("target")
+            .expect("Should resolve 'target' target");
+
+        // Verify source target values
+        assert_eq!(source_resolved.table_path, source_table_path,
+                   "Source table_path should match (stripped of file://)");
+        assert_eq!(source_resolved.compression_level, 10,
+                   "Source compression_level should be explicit value");
+        assert_eq!(source_resolved.heavy_column_compression_level, 12,
+                   "Source heavy_column_compression_level should be explicit value");
+        assert_eq!(source_resolved.offline_batch_size, 50000,
+                   "Source offline_batch_size should be explicit value");
+        assert!(source_resolved.storage_options.is_empty(),
+                "Source storage_options should be empty for local filesystem");
+
+        // Verify target (fallback) values
+        assert_eq!(target_resolved.table_path, target_table_path,
+                   "Target table_path should match (stripped of file://)");
+        assert_eq!(target_resolved.compression_level, config.delta_sink.compression_level,
+                   "Target compression_level should fall back to delta_sink default");
+        assert_eq!(target_resolved.heavy_column_compression_level, config.delta_sink.heavy_column_compression_level,
+                   "Target heavy_column_compression_level should fall back to delta_sink default");
+        assert_eq!(target_resolved.offline_batch_size, config.delta_sink.offline_batch_size,
+                   "Target offline_batch_size should fall back to delta_sink default");
+        assert!(target_resolved.storage_options.is_empty(),
+                "Target storage_options should be empty for local filesystem");
+
+        // Verify unknown target resolution fails with helpful error
+        let unknown_result = config.resolve_target("nonexistent");
+        assert!(unknown_result.is_err(), "Unknown target should fail to resolve");
+        let error_msg = unknown_result.unwrap_err();
+        assert!(error_msg.contains("nonexistent"), "Error should mention target name");
+        assert!(error_msg.contains("source") && error_msg.contains("target"),
+                "Error should list available targets");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&source_table_path);
+        let _ = std::fs::remove_dir_all(&target_table_path);
+    }
+
+    // Integration test: Target resolution with S3 storage config
+    #[test]
+    fn test_target_integration_s3_storage() {
+        // Verifies named-targets.AC7.1: S3 targets resolve with correct storage options
+
+        let mut config = test_config();
+
+        // Create S3 storage config
+        let s3_config = S3StorageConfig {
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-west-2".to_string(),
+            access_key_id: "test-key-id".to_string(),
+            secret_access_key: "test-secret".to_string(),
+            conditional_put: Some("etag".to_string()),
+            allow_http: Some(false),
+        };
+
+        // Create target with S3 URI and per-target storage config
+        let s3_target = TargetConfig {
+            table_path: "s3://my-bucket/certstream-data".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(s3_config),
+            }),
+            compression_level: Some(11),
+            heavy_column_compression_level: Some(13),
+            offline_batch_size: Some(75000),
+        };
+        config.targets.insert("s3_archive".to_string(), s3_target);
+
+        // Verify the config validates
+        assert!(config.validate().is_ok(), "Config with S3 target should be valid");
+
+        // Resolve the S3 target
+        let s3_resolved = config.resolve_target("s3_archive")
+            .expect("Should resolve 's3_archive' target");
+
+        // Verify S3 target values
+        assert_eq!(s3_resolved.table_path, "s3://my-bucket/certstream-data",
+                   "S3 table_path should remain as full URI");
+        assert_eq!(s3_resolved.compression_level, 11,
+                   "S3 compression_level should be explicit value");
+        assert_eq!(s3_resolved.heavy_column_compression_level, 13,
+                   "S3 heavy_column_compression_level should be explicit value");
+        assert_eq!(s3_resolved.offline_batch_size, 75000,
+                   "S3 offline_batch_size should be explicit value");
+
+        // Verify storage options were resolved correctly
+        assert!(!s3_resolved.storage_options.is_empty(),
+                "S3 storage_options should not be empty");
+        assert_eq!(s3_resolved.storage_options.get("AWS_ENDPOINT_URL"),
+                   Some(&"https://s3.example.com".to_string()),
+                   "Should have AWS_ENDPOINT_URL");
+        assert_eq!(s3_resolved.storage_options.get("AWS_REGION"),
+                   Some(&"us-west-2".to_string()),
+                   "Should have AWS_REGION");
+        assert_eq!(s3_resolved.storage_options.get("AWS_ACCESS_KEY_ID"),
+                   Some(&"test-key-id".to_string()),
+                   "Should have AWS_ACCESS_KEY_ID");
+        assert_eq!(s3_resolved.storage_options.get("AWS_SECRET_ACCESS_KEY"),
+                   Some(&"test-secret".to_string()),
+                   "Should have AWS_SECRET_ACCESS_KEY");
+        assert_eq!(s3_resolved.storage_options.get("conditional_put"),
+                   Some(&"etag".to_string()),
+                   "Should have conditional_put");
+        assert_eq!(s3_resolved.storage_options.get("AWS_ALLOW_HTTP"),
+                   Some(&"false".to_string()),
+                   "Should have AWS_ALLOW_HTTP");
+    }
+
+    // Integration test: Target resolution with global storage fallback
+    #[test]
+    fn test_target_integration_global_storage_fallback() {
+        // Verifies named-targets.AC7.1: Global storage config used when target storage is None
+
+        let mut config = test_config();
+
+        // Set global storage config
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://global-s3.example.com".to_string(),
+                region: "eu-west-1".to_string(),
+                access_key_id: "global-key".to_string(),
+                secret_access_key: "global-secret".to_string(),
+                conditional_put: None,
+                allow_http: Some(true),
+            }),
+        };
+
+        // Create target with S3 URI but no per-target storage config (will use global)
+        let s3_target = TargetConfig {
+            table_path: "s3://another-bucket/data".to_string(),
+            storage: None,  // Will use global config.storage
+            compression_level: Some(8),
+            heavy_column_compression_level: None,  // Will use delta_sink default
+            offline_batch_size: None,  // Will use delta_sink default
+        };
+        config.targets.insert("global_s3".to_string(), s3_target);
+
+        // Verify the config validates
+        assert!(config.validate().is_ok(), "Config with global S3 storage should be valid");
+
+        // Resolve the target
+        let resolved = config.resolve_target("global_s3")
+            .expect("Should resolve 'global_s3' target");
+
+        // Verify resolved values
+        assert_eq!(resolved.table_path, "s3://another-bucket/data",
+                   "Table path should be S3 URI");
+        assert_eq!(resolved.compression_level, 8,
+                   "Compression level should be explicit value");
+        assert_eq!(resolved.heavy_column_compression_level, config.delta_sink.heavy_column_compression_level,
+                   "Heavy compression should fall back to delta_sink");
+
+        // Verify global storage options were resolved
+        assert_eq!(resolved.storage_options.get("AWS_ENDPOINT_URL"),
+                   Some(&"https://global-s3.example.com".to_string()),
+                   "Should use global AWS_ENDPOINT_URL");
+        assert_eq!(resolved.storage_options.get("AWS_REGION"),
+                   Some(&"eu-west-1".to_string()),
+                   "Should use global AWS_REGION");
+        assert_eq!(resolved.storage_options.get("AWS_ACCESS_KEY_ID"),
+                   Some(&"global-key".to_string()),
+                   "Should use global AWS_ACCESS_KEY_ID");
+        assert_eq!(resolved.storage_options.get("AWS_SECRET_ACCESS_KEY"),
+                   Some(&"global-secret".to_string()),
+                   "Should use global AWS_SECRET_ACCESS_KEY");
+        assert_eq!(resolved.storage_options.get("AWS_ALLOW_HTTP"),
+                   Some(&"true".to_string()),
+                   "Should use global AWS_ALLOW_HTTP");
+    }
 }
