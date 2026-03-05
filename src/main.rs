@@ -133,9 +133,8 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let exit_code = backfill::run_migrate(
-            config,
-            resolved_target.table_path,
-            resolved_source.table_path,
+            resolved_source,
+            resolved_target,
             cli_args.backfill_from,
             cli_args.to,
             shutdown_token,
@@ -188,10 +187,6 @@ async fn main() {
         let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
         let resolved_target = resolve_or_exit(&config, cli_args.target.as_ref().unwrap(), "--target");
 
-        // Transitional: override config.delta_sink.table_path with resolved source
-        let mut extract_config = config.clone();
-        extract_config.delta_sink.table_path = resolved_source.table_path;
-
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -203,8 +198,8 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let exit_code = table_ops::run_extract_metadata(
-            extract_config,
-            resolved_target.table_path,
+            resolved_source,
+            resolved_target,
             cli_args.from_date,
             cli_args.to_date,
             shutdown_token,

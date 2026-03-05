@@ -1,4 +1,4 @@
-use crate::config::{Config, ZerobusSinkConfig, parse_table_uri, resolve_storage_options};
+use crate::config::{Config, ZerobusSinkConfig, ResolvedTarget, parse_table_uri, resolve_storage_options};
 use crate::ct::fetch;
 use crate::ct::{fetch_log_list, CtLog, LogType};
 use crate::delta_sink::{delta_schema, delta_writer_properties, DeltaCertRecord, flush_buffer, open_or_create_table};
@@ -1279,48 +1279,31 @@ pub async fn run_merge(
 ///    - Writes the transformed batch to the output table with centralized WriterProperties
 /// 5. Returns exit code 0 on success, 1 on error
 pub async fn run_migrate(
-    config: Config,
-    output_path: String,
-    source_path: String,
+    source: ResolvedTarget,
+    target: ResolvedTarget,
     from_date: Option<String>,
     to_date: Option<String>,
     shutdown: CancellationToken,
 ) -> i32 {
     info!(
-        source_path = %source_path,
-        output_path = %output_path,
+        source_path = %source.table_path,
+        target_path = %target.table_path,
         "migration mode starting"
     );
 
     let schema = delta_schema();
 
-    // Resolve storage options for source and output paths
-    let source_storage_options = match parse_table_uri(&source_path) {
-        Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(e) => {
-            error!(error = %e, source_path = %source_path, "failed to parse source table URI");
-            return 1;
-        }
-    };
-    let output_storage_options = match parse_table_uri(&output_path) {
-        Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(e) => {
-            error!(error = %e, output_path = %output_path, "failed to parse output table URI");
-            return 1;
-        }
-    };
-
     // Open source table
     let source_table = match (|| async {
-        DeltaTableBuilder::from_valid_uri(&source_path)?
-            .with_storage_options(source_storage_options.clone())
+        DeltaTableBuilder::from_valid_uri(&source.table_path)?
+            .with_storage_options(source.storage_options.clone())
             .load()
             .await
     })().await {
         Ok(t) => t,
         Err(e) => {
             warn!(
-                source_path = %source_path,
+                source_path = %source.table_path,
                 error = %e,
                 "failed to open source table"
             );
@@ -1329,10 +1312,10 @@ pub async fn run_migrate(
     };
 
     // Create or open output table
-    let output_table = match open_or_create_table(&output_path, &schema, output_storage_options.clone()).await {
+    let output_table = match open_or_create_table(&target.table_path, &schema, target.storage_options.clone()).await {
         Ok(t) => t,
         Err(e) => {
-            warn!(error = %e, output_path = %output_path, "failed to create output table");
+            warn!(error = %e, target_path = %target.table_path, "failed to create output table");
             return 1;
         }
     };
@@ -1401,15 +1384,15 @@ pub async fn run_migrate(
 
     // Get WriterProperties
     let writer_props = delta_writer_properties(
-        config.delta_sink.compression_level,
-        config.delta_sink.heavy_column_compression_level,
+        target.compression_level,
+        target.heavy_column_compression_level,
     );
 
     // Migrate partition by partition
     let mut current_output_table = output_table;
     let mut total_rows_migrated: usize = 0;
     let mut total_decode_failures: usize = 0;
-    let flush_threshold = config.delta_sink.offline_batch_size as u64;
+    let flush_threshold = target.offline_batch_size as u64;
     let mut pending_batches: Vec<RecordBatch> = Vec::new();
     let mut pending_rows: u64 = 0;
 
@@ -1423,8 +1406,8 @@ pub async fn run_migrate(
         let partition_ctx = SessionContext::new();
         if let Err(e) = partition_ctx.register_table("source", Arc::new(
             match (|| async {
-                DeltaTableBuilder::from_valid_uri(&source_path)?
-                    .with_storage_options(source_storage_options.clone())
+                DeltaTableBuilder::from_valid_uri(&source.table_path)?
+                    .with_storage_options(source.storage_options.clone())
                     .load()
                     .await
             })().await {
@@ -1611,8 +1594,8 @@ pub async fn run_migrate(
     info!(
         total_rows_migrated = total_rows_migrated,
         total_decode_failures = total_decode_failures,
-        source_path = %source_path,
-        output_path = %output_path,
+        source_path = %source.table_path,
+        target_path = %target.table_path,
         "migration complete"
     );
 
@@ -3087,6 +3070,23 @@ mod tests {
         }
     }
 
+    fn make_test_resolved_target(table_path: &str) -> ResolvedTarget {
+        // Ensure table_path has file:// prefix for URI-based storage
+        let uri_table_path = if table_path.contains("://") {
+            table_path.to_string()
+        } else {
+            format!("file://{table_path}")
+        };
+
+        ResolvedTarget {
+            table_path: uri_table_path,
+            storage_options: HashMap::new(),
+            compression_level: 9,
+            heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
+        }
+    }
+
     #[tokio::test]
     async fn test_ac3_1_merge_inserts_non_duplicate_records() {
         // Verifies staging-backfill.AC3.1: `--merge --staging-path` inserts staging records
@@ -4140,10 +4140,10 @@ mod tests {
             .expect("source write failed");
 
         // Run migration
-        let mut config = make_test_config(&source_path);
-        config.delta_sink.table_path = source_path.clone();
+        let source_target = make_test_resolved_target(&source_path);
+        let output_target = make_test_resolved_target(&output_path);
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
+        let exit_code = run_migrate(source_target, output_target, None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Read back output table and verify
@@ -4241,9 +4241,9 @@ mod tests {
         let shutdown = CancellationToken::new();
         shutdown.cancel();
 
-        let mut config = make_test_config(&source_path);
-        config.delta_sink.table_path = source_path.clone();
-        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
+        let source_target = make_test_resolved_target(&source_path);
+        let output_target = make_test_resolved_target(&output_path);
+        let exit_code = run_migrate(source_target, output_target, None, None, shutdown).await;
         assert_eq!(exit_code, 1, "migration with pre-cancelled token should exit 1");
 
         // Clean up
@@ -4259,10 +4259,10 @@ mod tests {
         let _ = fs::remove_dir_all(&source_path);
         let _ = fs::remove_dir_all(&output_path);
 
-        let mut config = make_test_config(&source_path);
-        config.delta_sink.table_path = source_path.clone();
+        let source_target = make_test_resolved_target(&source_path);
+        let output_target = make_test_resolved_target(&output_path);
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
+        let exit_code = run_migrate(source_target, output_target, None, None, shutdown).await;
         assert_eq!(exit_code, 1, "migration with nonexistent source should fail gracefully");
 
         // Clean up
@@ -4298,10 +4298,10 @@ mod tests {
             .await
             .expect("source write failed");
 
-        let mut config = make_test_config(&source_path);
-        config.delta_sink.table_path = source_path.clone();
+        let source_target = make_test_resolved_target(&source_path);
+        let output_target = make_test_resolved_target(&output_path);
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
+        let exit_code = run_migrate(source_target, output_target, None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Clean up
@@ -4350,16 +4350,13 @@ mod tests {
             .await
             .expect("write 3 failed");
 
-        // AC3.4: Use explicit source_path different from config.delta_sink.table_path
-        let config = make_test_config("/tmp/some_other_path_not_used");
-        // config.delta_sink.table_path points elsewhere — run_migrate should use source_path
-
         // AC3.1 + AC3.2 + AC3.3: Filter to only 2024-01-15
+        let source_target = make_test_resolved_target(&source_path);
+        let output_target = make_test_resolved_target(&output_path);
         let shutdown = CancellationToken::new();
         let exit_code = run_migrate(
-            config,
-            format!("file://{output_path}"),
-            format!("file://{source_path}"),
+            source_target,
+            output_target,
             Some("2024-01-15".to_string()),
             Some("2024-01-15".to_string()),
             shutdown,
@@ -4454,10 +4451,10 @@ mod tests {
             .expect("write partition 3 failed");
 
         // Run migration
-        let mut config = make_test_config(&source_path);
-        config.delta_sink.table_path = source_path.clone();
+        let source_target = make_test_resolved_target(&source_path);
+        let output_target = make_test_resolved_target(&output_path);
         let shutdown = CancellationToken::new();
-        let exit_code = run_migrate(config, format!("file://{output_path}"), format!("file://{source_path}"), None, None, shutdown).await;
+        let exit_code = run_migrate(source_target, output_target, None, None, shutdown).await;
         assert_eq!(exit_code, 0, "migration should succeed");
 
         // Verify output table has all records with correct as_der binary values
