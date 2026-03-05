@@ -3701,31 +3701,29 @@ mod tests {
             backfill: false,
             backfill_from: None,
             backfill_logs: None,
-            staging_path: None,
             backfill_sink: None,
             merge: true,
             migrate: false,
-            migrate_output: None,
-            migrate_source: None,
             to: None,
             reparse_audit: false,
             extract_metadata: false,
-            output_path: None,
+            target: None,
+            source: None,
             from_date: None,
             to_date: None,
         };
 
-        // Verify that merge is true and staging_path is None
+        // Verify that merge is true and target is None
         assert!(cli_args.merge, "merge flag should be true");
-        assert!(cli_args.staging_path.is_none(), "staging_path should be None");
+        assert!(cli_args.target.is_none(), "target should be None");
 
         // The validation logic in main.rs checks:
-        // if cli_args.merge && cli_args.staging_path.is_none() => print error and exit 1
+        // if cli_args.merge && cli_args.target.is_none() => print error and exit 1
         // This test verifies the condition that triggers the error
-        let has_merge_without_staging = cli_args.merge && cli_args.staging_path.is_none();
+        let has_merge_without_target = cli_args.merge && cli_args.target.is_none();
         assert!(
-            has_merge_without_staging,
-            "--merge without --staging-path should be detected"
+            has_merge_without_target,
+            "--merge without --target should be detected"
         );
     }
 
