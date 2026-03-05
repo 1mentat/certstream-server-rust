@@ -3112,4 +3112,427 @@ table_path: "file:///data/targets/minimal"
             env::remove_var("CERTSTREAM_TARGETS_STAGING_OFFLINE_BATCH_SIZE");
         }
     }
+
+    // Named Target Validation Tests
+    // AC3.1: Valid target with file:// table_path passes validation
+    #[test]
+    fn test_validate_target_file_uri_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with valid file:// URI");
+    }
+
+    // AC3.2: Valid target with s3:// table_path and complete S3 storage passes validation
+    #[test]
+    fn test_validate_target_s3_uri_with_storage_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with S3 URI and complete per-target S3 config");
+    }
+
+    // AC3.2: Valid target with s3:// table_path using global S3 storage passes validation
+    #[test]
+    fn test_validate_target_s3_uri_with_global_storage_valid() {
+        let mut config = test_config();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with S3 URI and global S3 config");
+    }
+
+    // AC3.3: Target with bare path (no URI scheme) fails validation
+    #[test]
+    fn test_validate_target_bare_path_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "/tmp/bare-path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with bare path");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.table_path"),
+            "error should be on targets.test_target.table_path field"
+        );
+    }
+
+    // AC3.4: Target with s3:// table_path but no S3 credentials fails validation
+    #[test]
+    fn test_validate_target_s3_uri_without_credentials_fails() {
+        let mut config = test_config();
+        config.storage = StorageConfig { s3: None };
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with S3 URI but no S3 config");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3"),
+            "error should be on targets.test_target.storage.s3 field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty endpoint fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_endpoint_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 endpoint");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.endpoint"),
+            "error should be on targets.test_target.storage.s3.endpoint field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty region fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_region_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 region");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.region"),
+            "error should be on targets.test_target.storage.s3.region field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty access_key_id fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_access_key_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 access_key_id");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.access_key_id"),
+            "error should be on targets.test_target.storage.s3.access_key_id field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty secret_access_key fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_secret_key_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 secret_access_key");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.secret_access_key"),
+            "error should be on targets.test_target.storage.s3.secret_access_key field"
+        );
+    }
+
+    // AC3.5: Target with compression_level below range (0) fails validation
+    #[test]
+    fn test_validate_target_compression_level_zero_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(0),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with compression_level 0");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.compression_level"),
+            "error should be on targets.test_target.compression_level field"
+        );
+    }
+
+    // AC3.5: Target with compression_level above range (23) fails validation
+    #[test]
+    fn test_validate_target_compression_level_too_high_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(23),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with compression_level 23");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.compression_level"),
+            "error should be on targets.test_target.compression_level field"
+        );
+    }
+
+    // AC3.5: Target with compression_level at min valid range (1) passes validation
+    #[test]
+    fn test_validate_target_compression_level_min_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(1),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with compression_level 1");
+    }
+
+    // AC3.5: Target with compression_level at max valid range (22) passes validation
+    #[test]
+    fn test_validate_target_compression_level_max_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(22),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with compression_level 22");
+    }
+
+    // AC3.5: Target with heavy_column_compression_level below range (0) fails validation
+    #[test]
+    fn test_validate_target_heavy_column_compression_level_zero_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: Some(0),
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with heavy_column_compression_level 0");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"),
+            "error should be on targets.test_target.heavy_column_compression_level field"
+        );
+    }
+
+    // AC3.5: Target with heavy_column_compression_level above range (23) fails validation
+    #[test]
+    fn test_validate_target_heavy_column_compression_level_too_high_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: Some(23),
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with heavy_column_compression_level 23");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"),
+            "error should be on targets.test_target.heavy_column_compression_level field"
+        );
+    }
+
+    // AC3.6: Empty targets map passes validation
+    #[test]
+    fn test_validate_target_empty_targets_valid() {
+        let config = test_config();
+        assert!(config.targets.is_empty(), "test config should have empty targets");
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with empty targets map");
+    }
+
+    // Additional test: Multiple targets validation accumulates errors
+    #[test]
+    fn test_validate_target_multiple_targets_errors() {
+        let mut config = test_config();
+
+        // Add a target with bare path
+        let target1 = TargetConfig {
+            table_path: "/tmp/bare-path".to_string(),
+            storage: None,
+            compression_level: Some(0),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("bad_target1".to_string(), target1);
+
+        // Add another target with S3 URI but no credentials
+        let target2 = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("bad_target2".to_string(), target2);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with multiple invalid targets");
+        let errors = result.unwrap_err();
+        assert!(errors.len() >= 2, "should have multiple errors for multiple invalid targets");
+    }
+
+    // Additional test: Target with both compression levels invalid
+    #[test]
+    fn test_validate_target_both_compression_levels_invalid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(0),
+            heavy_column_compression_level: Some(25),
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with both compression levels invalid");
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "targets.test_target.compression_level"));
+        assert!(errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"));
+    }
 }
