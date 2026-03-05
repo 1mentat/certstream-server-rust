@@ -10,7 +10,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, ResolvedTarget, parse_table_uri, resolve_storage_options};
+use crate::config::ResolvedTarget;
 use crate::ct::parse_certificate;
 
 /// Helper struct to track field mismatches and collect sample diffs.
@@ -207,38 +207,29 @@ fn print_reparse_report(
 }
 
 pub async fn run_reparse_audit(
-    config: Config,
+    source: ResolvedTarget,
     from_date: Option<String>,
     to_date: Option<String>,
     shutdown: CancellationToken,
 ) -> (i32, AuditReport) {
     info!(
-        table_path = %config.delta_sink.table_path,
+        table_path = %source.table_path,
         from_date = ?from_date,
         to_date = ?to_date,
         "Starting reparse audit"
     );
 
-    // Resolve storage options for the source table
-    let source_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
-        Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(e) => {
-            error!(error = %e, "failed to parse source table URI");
-            return (1, AuditReport::default());
-        }
-    };
-
     // Step 1: Open the Delta table
     let table = match (|| async {
-        DeltaTableBuilder::from_valid_uri(&config.delta_sink.table_path)?
-            .with_storage_options(source_storage_options.clone())
+        DeltaTableBuilder::from_valid_uri(&source.table_path)?
+            .with_storage_options(source.storage_options.clone())
             .load()
             .await
     })().await {
         Ok(t) => t,
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             error!(
-                table_path = %config.delta_sink.table_path,
+                table_path = %source.table_path,
                 "source Delta table does not exist"
             );
             return (1, AuditReport::default());
