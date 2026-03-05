@@ -1095,6 +1095,34 @@ impl Config {
         }
     }
 
+    /// Resolve a named target from config.targets, filling unspecified fields
+    /// from delta_sink defaults and resolving storage options.
+    pub fn resolve_target(&self, name: &str) -> Result<ResolvedTarget, String> {
+        let target = self
+            .targets
+            .get(name)
+            .ok_or_else(|| {
+                let available: Vec<_> = self.targets.keys().collect();
+                format!("Unknown target '{}'. Available targets: {:?}", name, available)
+            })?;
+
+        let location = parse_table_uri(&target.table_path)?;
+
+        // Use target-level storage if present, otherwise fall back to global config.storage
+        let storage = target.storage.as_ref().unwrap_or(&self.storage);
+        let storage_options = resolve_storage_options(&location, storage);
+
+        Ok(ResolvedTarget {
+            table_path: location.as_uri().to_string(),
+            storage_options,
+            compression_level: target.compression_level.unwrap_or(self.delta_sink.compression_level),
+            heavy_column_compression_level: target
+                .heavy_column_compression_level
+                .unwrap_or(self.delta_sink.heavy_column_compression_level),
+            offline_batch_size: target.offline_batch_size.unwrap_or(self.delta_sink.offline_batch_size),
+        })
+    }
+
     fn load_yaml() -> YamlConfigWithPath {
         let config_paths = [
             env::var("CERTSTREAM_CONFIG").ok(),
@@ -2482,5 +2510,248 @@ compression_level: 9
             ..test_config()
         };
         assert!(config.validate().is_ok());
+    }
+
+    // Named targets tests (from named-targets phase 1)
+
+    #[test]
+    fn test_target_config_all_fields_yaml() {
+        // Verifies named-targets.AC1.1: TargetConfig with all fields specified deserializes from YAML with correct values
+        let yaml = r#"
+table_path: "file:///data/targets/main"
+compression_level: 12
+heavy_column_compression_level: 18
+offline_batch_size: 50000
+storage:
+  s3:
+    endpoint: "https://s3.example.com"
+    region: "us-west-2"
+    access_key_id: "AKIAIOSFODNN7EXAMPLE"
+    secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+"#;
+        let config: TargetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.table_path, "file:///data/targets/main");
+        assert_eq!(config.compression_level, Some(12));
+        assert_eq!(config.heavy_column_compression_level, Some(18));
+        assert_eq!(config.offline_batch_size, Some(50000));
+        assert!(config.storage.is_some());
+        let storage = config.storage.unwrap();
+        assert!(storage.s3.is_some());
+        let s3 = storage.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "us-west-2");
+    }
+
+    #[test]
+    fn test_target_config_only_table_path_yaml() {
+        // Verifies named-targets.AC1.2: TargetConfig with only `table_path` deserializes, optional fields are `None`
+        let yaml = r#"
+table_path: "file:///data/targets/minimal"
+"#;
+        let config: TargetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.table_path, "file:///data/targets/minimal");
+        assert!(config.compression_level.is_none());
+        assert!(config.heavy_column_compression_level.is_none());
+        assert!(config.offline_batch_size.is_none());
+        assert!(config.storage.is_none());
+    }
+
+    #[test]
+    fn test_resolve_target_fill_compression_level() {
+        // Verifies named-targets.AC1.3: `resolve_target()` fills `None` compression_level from `delta_sink.compression_level`
+        let mut config = test_config();
+        config.delta_sink.compression_level = 11;
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "file:///tmp/test".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(resolved.compression_level, 11);
+    }
+
+    #[test]
+    fn test_resolve_target_fill_heavy_column_compression_level() {
+        // Verifies named-targets.AC1.4: `resolve_target()` fills `None` heavy_column_compression_level from delta_sink
+        let mut config = test_config();
+        config.delta_sink.heavy_column_compression_level = 19;
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "file:///tmp/test".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(resolved.heavy_column_compression_level, 19);
+    }
+
+    #[test]
+    fn test_resolve_target_fill_offline_batch_size() {
+        // Verifies named-targets.AC1.5: `resolve_target()` fills `None` offline_batch_size from delta_sink
+        let mut config = test_config();
+        config.delta_sink.offline_batch_size = 200000;
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "file:///tmp/test".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(resolved.offline_batch_size, 200000);
+    }
+
+    #[test]
+    fn test_resolve_target_target_level_storage() {
+        // Verifies named-targets.AC1.6: `resolve_target()` uses target-level `StorageConfig` when present
+        let mut config = test_config();
+        // Set global storage to one value
+        config.storage.s3 = Some(S3StorageConfig {
+            endpoint: "https://global-s3.example.com".to_string(),
+            region: "global-region".to_string(),
+            access_key_id: "global-key".to_string(),
+            secret_access_key: "global-secret".to_string(),
+            conditional_put: None,
+            allow_http: None,
+        });
+
+        // Set target with its own storage
+        let target_storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://target-s3.example.com".to_string(),
+                region: "target-region".to_string(),
+                access_key_id: "target-key".to_string(),
+                secret_access_key: "target-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: Some(target_storage),
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        // Should use target-level S3 credentials, not global
+        assert!(resolved.storage_options.contains_key("AWS_ENDPOINT_URL"));
+        assert_eq!(
+            resolved.storage_options.get("AWS_ENDPOINT_URL").unwrap(),
+            "https://target-s3.example.com"
+        );
+        assert_eq!(
+            resolved.storage_options.get("AWS_REGION").unwrap(),
+            "target-region"
+        );
+        assert_eq!(
+            resolved.storage_options.get("AWS_ACCESS_KEY_ID").unwrap(),
+            "target-key"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_fallback_to_global_storage() {
+        // Verifies named-targets.AC1.7: `resolve_target()` falls back to global `config.storage` when target has no storage config
+        let mut config = test_config();
+        // Set global storage
+        config.storage.s3 = Some(S3StorageConfig {
+            endpoint: "https://global-s3.example.com".to_string(),
+            region: "global-region".to_string(),
+            access_key_id: "global-key".to_string(),
+            secret_access_key: "global-secret".to_string(),
+            conditional_put: None,
+            allow_http: None,
+        });
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: None, // No target-level storage
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        // Should use global S3 credentials
+        assert!(resolved.storage_options.contains_key("AWS_ENDPOINT_URL"));
+        assert_eq!(
+            resolved.storage_options.get("AWS_ENDPOINT_URL").unwrap(),
+            "https://global-s3.example.com"
+        );
+        assert_eq!(
+            resolved.storage_options.get("AWS_REGION").unwrap(),
+            "global-region"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_unknown_target() {
+        // Verifies named-targets.AC1.8: `resolve_target()` returns error for unknown target name
+        let config = test_config();
+        let result = config.resolve_target("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Unknown target"));
+        assert!(err.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_resolve_target_file_uri() {
+        // Test that resolve_target works with file:// URIs
+        let mut config = test_config();
+        let mut targets = HashMap::new();
+        targets.insert(
+            "local".to_string(),
+            TargetConfig {
+                table_path: "file:///data/local-target".to_string(),
+                storage: None,
+                compression_level: Some(10),
+                heavy_column_compression_level: Some(20),
+                offline_batch_size: Some(150000),
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("local").unwrap();
+        assert_eq!(resolved.table_path, "/data/local-target");
+        assert_eq!(resolved.compression_level, 10);
+        assert_eq!(resolved.heavy_column_compression_level, 20);
+        assert_eq!(resolved.offline_batch_size, 150000);
+        // Local paths should have empty storage_options
+        assert!(resolved.storage_options.is_empty());
     }
 }
