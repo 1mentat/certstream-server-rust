@@ -183,15 +183,16 @@ The binary has six execution modes selected in main.rs:
 
 ## Migrate Contracts
 - **CLI flags**: `--migrate --output <PATH>` activates migrate mode; `--source <PATH>` overrides source table (default: `config.delta_sink.table_path`); `--from <DATE>` start date filter (YYYY-MM-DD, inclusive); `--to <DATE>` end date filter (YYYY-MM-DD, inclusive); `--migrate` without `--output` exits with error; `--from` and `--to` validated via `cli::validate_date_format()` at dispatch
-- **Entry point**: `backfill::run_migrate(config, output_path, source_path, from_date, to_date, shutdown)` called from main, returns exit code (i32)
+- **Entry point**: `backfill::run_migrate(source: ResolvedTarget, target: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns exit code (i32)
+- **ResolvedTarget parameters**: `source` and `target` are pre-resolved targets containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`
 - **Purpose**: converts an existing Delta table from old schema (as_der as base64 Utf8) to new schema (as_der as raw Binary) with optimized WriterProperties
-- **Source table**: reads from `source_path` parameter; defaults to `config.delta_sink.table_path` when `--source` is not provided; if source table cannot be opened, exits with code 1
-- **Output table**: created at `output_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
-- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially; within each partition, data is streamed via `execute_stream()` (one RecordBatch at a time) to avoid OOM on large partitions; batches are accumulated up to `offline_batch_size` rows before each Delta commit
+- **Source table**: reads from `source.table_path`; if source table cannot be opened, exits with code 1
+- **Output table**: created at `target.table_path` via `open_or_create_table()`; uses the current `delta_schema()` (with Binary as_der)
+- **Partition-by-partition**: queries distinct `seen_date` partitions from source, processes each partition sequentially; within each partition, data is streamed via `execute_stream()` (one RecordBatch at a time) to avoid OOM on large partitions; batches are accumulated up to `target.offline_batch_size` rows before each Delta commit
 - **Partition filtering**: when `--from` is provided, partitions with `seen_date < from` are skipped; when `--to` is provided, partitions with `seen_date > to` are skipped; filters are inclusive and applied via lexicographic string comparison
 - **as_der conversion**: base64-decodes each Utf8 string to raw bytes; decode failures produce null values and are logged as warnings (non-fatal)
 - **Column alignment**: source columns are matched by name (not index) and cast to target types if needed, handling DataFusion column reordering
-- **WriterProperties**: applies `delta_writer_properties(compression_level, heavy_column_compression_level)` to all writes
+- **WriterProperties**: applies `delta_writer_properties(target.compression_level, target.heavy_column_compression_level)` to all writes
 - **Empty source**: if source table has no partitions or no partitions match filters, exits with code 0
 - **Graceful shutdown**: CancellationToken checked between partitions; if cancelled, exits with code 1
 - **Error handling**: any failure (table open, query, write) exits with code 1
@@ -214,13 +215,14 @@ The binary has six execution modes selected in main.rs:
 ## Metadata Extraction Contracts
 - **CLI flags**: `--extract-metadata` activates extraction mode; `--output <PATH>` (required) sets output Delta table path; `--from-date <YYYY-MM-DD>` and `--to-date <YYYY-MM-DD>` filter partitions
 - **Validation**: `--extract-metadata` without `--output` prints error and exits 1 (checked in main.rs)
-- **Entry point**: `table_ops::run_extract_metadata(config, output_path, from_date, to_date, shutdown)` called from main, returns i32
-- **Source table**: reads from `config.delta_sink.table_path`
+- **Entry point**: `table_ops::run_extract_metadata(source: ResolvedTarget, target: ResolvedTarget, from_date, to_date, shutdown)` called from main, returns i32
+- **ResolvedTarget parameters**: `source` and `target` are pre-resolved targets containing `table_path`, `storage_options`, `compression_level`, `heavy_column_compression_level`, and `offline_batch_size`
+- **Source table**: reads from `source.table_path`
 - **Output schema**: 19 columns (all delta_schema columns except `as_der`): cert_index, update_type, seen, seen_date, source_name, source_url, cert_link, serial_number, fingerprint, sha256, sha1, not_before, not_after, is_ca, signature_algorithm, subject_aggregated, issuer_aggregated, all_domains, chain
 - **Output table creation**: uses `delta_sink::open_or_create_table()` with `metadata_schema()`; creates output directory via `create_dir_all`
 - **Partitioning**: output table partitioned by `seen_date` (inherits from `open_or_create_table` behavior)
-- **Compression**: zstd with `config.delta_sink.compression_level`
-- **Write mode**: `SaveMode::Append`; accumulates DataFusion batches up to `offline_batch_size` rows before each Delta commit to minimize transaction overhead
+- **Compression**: zstd with `target.compression_level`
+- **Write mode**: `SaveMode::Append`; accumulates DataFusion batches up to `target.offline_batch_size` rows before each Delta commit to minimize transaction overhead
 - **Exit code**: 0 on success or empty date range; 1 on missing source table, query failure, write failure, invalid date, or shutdown
 - **No records**: if date filter matches zero rows, exits 0
 - **Graceful shutdown**: CancellationToken checked per batch; on cancellation, partial output left intact, exits 1
