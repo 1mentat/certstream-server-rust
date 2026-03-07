@@ -10,7 +10,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, parse_table_uri, resolve_storage_options};
+use crate::config::ResolvedTarget;
 use crate::ct::parse_certificate;
 
 /// Helper struct to track field mismatches and collect sample diffs.
@@ -207,38 +207,29 @@ fn print_reparse_report(
 }
 
 pub async fn run_reparse_audit(
-    config: Config,
+    source: ResolvedTarget,
     from_date: Option<String>,
     to_date: Option<String>,
     shutdown: CancellationToken,
 ) -> (i32, AuditReport) {
     info!(
-        table_path = %config.delta_sink.table_path,
+        table_path = %source.table_path,
         from_date = ?from_date,
         to_date = ?to_date,
         "Starting reparse audit"
     );
 
-    // Resolve storage options for the source table
-    let source_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
-        Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(e) => {
-            error!(error = %e, "failed to parse source table URI");
-            return (1, AuditReport::default());
-        }
-    };
-
     // Step 1: Open the Delta table
     let table = match (|| async {
-        DeltaTableBuilder::from_valid_uri(&config.delta_sink.table_path)?
-            .with_storage_options(source_storage_options.clone())
+        DeltaTableBuilder::from_valid_uri(&source.table_path)?
+            .with_storage_options(source.storage_options.clone())
             .load()
             .await
     })().await {
         Ok(t) => t,
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             error!(
-                table_path = %config.delta_sink.table_path,
+                table_path = %source.table_path,
                 "source Delta table does not exist"
             );
             return (1, AuditReport::default());
@@ -658,8 +649,8 @@ pub async fn run_reparse_audit(
 }
 
 pub async fn run_extract_metadata(
-    config: Config,
-    output_path: String,
+    source: ResolvedTarget,
+    target: ResolvedTarget,
     from_date: Option<String>,
     to_date: Option<String>,
     shutdown: CancellationToken,
@@ -671,33 +662,17 @@ pub async fn run_extract_metadata(
     use crate::delta_sink::open_or_create_table;
 
     info!(
-        table_path = %config.delta_sink.table_path,
-        output_path = %output_path,
+        source_path = %source.table_path,
+        target_path = %target.table_path,
         from_date = ?from_date,
         to_date = ?to_date,
         "Starting metadata extraction"
     );
 
-    // Resolve storage options for source and output paths
-    let source_storage_options = match parse_table_uri(&config.delta_sink.table_path) {
-        Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(e) => {
-            error!(error = %e, "failed to parse source table URI");
-            return 1;
-        }
-    };
-    let output_storage_options = match parse_table_uri(&output_path) {
-        Ok(location) => resolve_storage_options(&location, &config.storage),
-        Err(e) => {
-            error!(error = %e, output_path = %output_path, "failed to parse output table URI");
-            return 1;
-        }
-    };
-
     // Step 1: Open the source Delta table
     let source_table = match (|| async {
-        DeltaTableBuilder::from_valid_uri(&config.delta_sink.table_path)?
-            .with_storage_options(source_storage_options.clone())
+        DeltaTableBuilder::from_valid_uri(&source.table_path)?
+            .with_storage_options(source.storage_options.clone())
             .load()
             .await
     })().await {
@@ -707,7 +682,7 @@ pub async fn run_extract_metadata(
         }
         Err(DeltaTableError::NotATable(_)) | Err(DeltaTableError::InvalidTableLocation(_)) => {
             error!(
-                table_path = %config.delta_sink.table_path,
+                table_path = %source.table_path,
                 "source Delta table does not exist"
             );
             return 1;
@@ -774,21 +749,21 @@ pub async fn run_extract_metadata(
 
     // Step 5: Open or create the output Delta table
     // For local paths, ensure the output directory exists
-    if output_path.starts_with("file://") || !output_path.contains("://") {
-        let local_path = output_path.strip_prefix("file://").unwrap_or(&output_path);
+    if target.table_path.starts_with("file://") || !target.table_path.contains("://") {
+        let local_path = target.table_path.strip_prefix("file://").unwrap_or(&target.table_path);
         if let Err(e) = std::fs::create_dir_all(local_path) {
-            error!(error = %e, output_path = %output_path, "Failed to create output directory");
+            error!(error = %e, target_path = %target.table_path, "Failed to create output directory");
             return 1;
         }
     }
 
     // Use the metadata schema to create the output table with the correct structure
-    let mut output_table = match open_or_create_table(&output_path, &metadata_schema(), output_storage_options.clone()).await {
+    let mut output_table = match open_or_create_table(&target.table_path, &metadata_schema(), target.storage_options.clone()).await {
         Ok(t) => {
             t
         }
         Err(e) => {
-            error!(error = %e, output_path = %output_path, "Failed to open or create output table");
+            error!(error = %e, target_path = %target.table_path, "Failed to open or create output table");
             return 1;
         }
     };
@@ -796,7 +771,7 @@ pub async fn run_extract_metadata(
     // Step 6: Build WriterProperties with zstd compression
     let writer_props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(config.delta_sink.compression_level)
+            ZstdLevel::try_new(target.compression_level)
                 .expect("compression level validated at startup"),
         ))
         .build();
@@ -806,7 +781,7 @@ pub async fn run_extract_metadata(
     let mut any_rows_seen = false;
     let mut pending_batches: Vec<RecordBatch> = Vec::new();
     let mut pending_rows: u64 = 0;
-    let flush_threshold: u64 = config.delta_sink.offline_batch_size as u64;
+    let flush_threshold: u64 = target.offline_batch_size as u64;
 
     while let Some(batch_result) = stream.next().await {
         if shutdown.is_cancelled() {
@@ -823,7 +798,7 @@ pub async fn run_extract_metadata(
                 }
             }
             warn!("metadata extraction interrupted by shutdown signal");
-            info!(records_written = total_records_written, "partial extraction left intact at {}", output_path);
+            info!(records_written = total_records_written, "partial extraction left intact at {}", target.table_path);
             return 1;
         }
 
@@ -1099,10 +1074,7 @@ mod tests {
         (der_bytes, leaf)
     }
 
-    /// Helper to create a minimal Config for testing
-    fn create_test_config(table_path: &str) -> crate::config::Config {
-        use std::net::IpAddr;
-
+    fn make_test_resolved_target(table_path: &str) -> ResolvedTarget {
         // Ensure table_path has file:// prefix for URI-based storage
         let uri_table_path = if table_path.contains("://") {
             table_path.to_string()
@@ -1110,36 +1082,12 @@ mod tests {
             format!("file://{table_path}")
         };
 
-        crate::config::Config {
-            host: "127.0.0.1".parse::<IpAddr>().unwrap(),
-            port: 9100,
-            log_level: "info".to_string(),
-            buffer_size: 100,
-            ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/log_list.json".to_string(),
-            tls_cert: None,
-            tls_key: None,
-            custom_logs: vec![],
-            static_logs: vec![],
-            protocols: Default::default(),
-            ct_log: Default::default(),
-            connection_limit: Default::default(),
-            rate_limit: Default::default(),
-            api: Default::default(),
-            auth: Default::default(),
-            hot_reload: Default::default(),
-            delta_sink: crate::config::DeltaSinkConfig {
-                enabled: true,
-                table_path: uri_table_path,
-                batch_size: 1,
-                flush_interval_secs: 60,
-                compression_level: 9,
-                heavy_column_compression_level: 15,
-                offline_batch_size: 100000,
-            },
-            query_api: Default::default(),
-            zerobus_sink: Default::default(),
-            storage: Default::default(),
-            config_path: None,
+        ResolvedTarget {
+            table_path: uri_table_path,
+            storage_options: HashMap::new(),
+            compression_level: 9,
+            heavy_column_compression_level: 15,
+            offline_batch_size: 100000,
         }
     }
 
@@ -1223,9 +1171,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.mismatch_record_count, 0, "AC1.1: Should have 0 mismatches");
@@ -1248,9 +1196,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0 (reports mismatches, doesn't fail)");
         assert_eq!(report.mismatch_record_count, 1, "AC1.2: Should detect 1 mismatch");
@@ -1283,9 +1231,9 @@ mod tests {
 
         write_test_records(test_dir, records).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.mismatch_record_count, 15, "AC1.3: Should detect 15 mismatches");
@@ -1307,9 +1255,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.unparseable_count, 1, "AC1.4: Invalid base64 should be counted as unparseable");
@@ -1331,9 +1279,9 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (exit_code, report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "Audit should exit with code 0");
         assert_eq!(report.unparseable_count, 1, "AC1.5: Garbage bytes should be counted as unparseable");
@@ -1352,11 +1300,11 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
         // Query for a date range that doesn't match the data (2026-03-01 to 2026-03-31)
         let (exit_code, report) = run_reparse_audit(
-            config,
+            target,
             Some("2026-03-01".to_string()),
             Some("2026-03-31".to_string()),
             shutdown,
@@ -1383,14 +1331,15 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
 
         // Debug: verify source table exists
         let source_check = open_table(test_dir).await;
         assert!(source_check.is_ok(), "Source table should exist before extraction");
 
-        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(source_target, output_target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.1: Extraction should succeed");
 
@@ -1445,9 +1394,10 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(source_target, output_target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.2: Extraction should succeed");
 
@@ -1497,9 +1447,10 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(source_target, output_target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.3: Extraction should succeed");
 
@@ -1548,9 +1499,10 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(source_target, output_target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 0, "AC2.4: Extraction should succeed");
 
@@ -1586,9 +1538,10 @@ mod tests {
         let output_dir = "/tmp/delta_table_ops_test_ac2_5_output";
         cleanup_test_dir(output_dir);
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(source_target, output_target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 1, "AC2.5: Should exit with code 1 when source table doesn't exist");
 
@@ -1608,12 +1561,13 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
         // Query for a future date range that doesn't match (2099-01-01)
         let exit_code = run_extract_metadata(
-            config,
-            format!("file://{}", output_dir),
+            source_target,
+            output_target,
             Some("2099-01-01".to_string()),
             None,
             shutdown,
@@ -1637,13 +1591,13 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let target = make_test_resolved_target(test_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
 
         // Cancel the token before calling the function to simulate shutdown signal
         shutdown.cancel();
 
-        let (exit_code, _report) = run_reparse_audit(config, None, None, shutdown).await;
+        let (exit_code, _report) = run_reparse_audit(target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 1, "AC4.4: Audit should exit with code 1 on shutdown");
 
@@ -1663,13 +1617,14 @@ mod tests {
 
         write_test_records(test_dir, vec![record]).await;
 
-        let config = create_test_config(test_dir);
+        let source_target = make_test_resolved_target(test_dir);
+        let output_target = make_test_resolved_target(output_dir);
         let shutdown = tokio_util::sync::CancellationToken::new();
 
         // Cancel the token before calling the function to simulate shutdown signal
         shutdown.cancel();
 
-        let exit_code = run_extract_metadata(config, format!("file://{}", output_dir), None, None, shutdown).await;
+        let exit_code = run_extract_metadata(source_target, output_target, None, None, shutdown).await;
 
         assert_eq!(exit_code, 1, "AC4.4: Metadata extraction should exit with code 1 on shutdown");
 
