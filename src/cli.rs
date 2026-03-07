@@ -14,9 +14,6 @@ pub struct CliArgs {
     pub backfill_logs: Option<String>,
     pub backfill_sink: Option<String>,
     pub merge: bool,
-    pub migrate: bool,
-    /// End date filter for migrate mode (Phase 2: used in migrate dispatch)
-    pub to: Option<String>,
     pub reparse_audit: bool,
     pub extract_metadata: bool,
     pub target: Option<String>,
@@ -37,7 +34,6 @@ impl CliArgs {
         let mut backfill_from = None;
         let mut backfill_logs = None;
         let mut backfill_sink = None;
-        let mut to = None;
         let mut target = None;
         let mut source = None;
         let mut from_date = None;
@@ -54,8 +50,6 @@ impl CliArgs {
                 target = Some(args[i + 1].clone());
             } else if arg == "--source" && i + 1 < args.len() {
                 source = Some(args[i + 1].clone());
-            } else if arg == "--to" && i + 1 < args.len() {
-                to = Some(args[i + 1].clone());
             } else if arg == "--from-date" && i + 1 < args.len() {
                 from_date = Some(args[i + 1].clone());
             } else if arg == "--to-date" && i + 1 < args.len() {
@@ -74,8 +68,6 @@ impl CliArgs {
             backfill_logs,
             backfill_sink,
             merge: args.iter().any(|a| a == "--merge"),
-            migrate: args.iter().any(|a| a == "--migrate"),
-            to,
             reparse_audit: args.iter().any(|a| a == "--reparse-audit"),
             extract_metadata: args.iter().any(|a| a == "--extract-metadata"),
             target,
@@ -121,13 +113,6 @@ impl CliArgs {
         println!();
         println!("MERGE OPTIONS:");
         println!("    --merge              Merge staging table into main table");
-        println!();
-        println!("MIGRATION OPTIONS:");
-        println!("    --migrate            Migrate existing Delta table to new schema");
-        println!("    --from <DATE>        Start date filter (YYYY-MM-DD, inclusive)");
-        println!("    --to <DATE>          End date filter (YYYY-MM-DD, inclusive)");
-        println!();
-        println!("    Note: --from is shared between backfill (integer index) and migrate (date).");
         println!();
         println!("TABLE OPERATIONS:");
         println!("    --reparse-audit      Audit stored certs against current parsing code");
@@ -212,8 +197,6 @@ pub fn validate_backfill_sink_command(
 /// * `Ok(())` if the date is valid
 /// * `Err(String)` with a descriptive error message if invalid
 ///
-/// # Phase 2
-/// This function is used in migrate mode dispatch (Phase 2).
 pub fn validate_date_format(date: &str, flag_name: &str) -> Result<(), String> {
     if date.len() != 10 {
         return Err(format!(
@@ -454,26 +437,6 @@ mod tests {
         );
     }
 
-    // Tests for --migrate and target-based flags
-    #[test]
-    fn test_migrate_flag_parsed_correctly() {
-        let args = vec![
-            "certstream".to_string(),
-            "--migrate".to_string(),
-        ];
-        let parsed = CliArgs::parse_args(&args);
-        assert!(parsed.migrate, "migrate should be true when --migrate is provided");
-    }
-
-    #[test]
-    fn test_migrate_flag_false_when_not_provided() {
-        let args = vec![
-            "certstream".to_string(),
-        ];
-        let parsed = CliArgs::parse_args(&args);
-        assert!(!parsed.migrate, "migrate should be false when --migrate is not provided");
-    }
-
     #[test]
     fn test_target_flag_parsed_correctly() {
         // AC4.1: Test that --target is correctly parsed into target field
@@ -505,43 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_and_target_flags_together() {
-        let args = vec![
-            "certstream".to_string(),
-            "--migrate".to_string(),
-            "--target".to_string(),
-            "output".to_string(),
-        ];
-        let parsed = CliArgs::parse_args(&args);
-        assert!(parsed.migrate, "migrate should be true");
-        assert_eq!(
-            parsed.target,
-            Some("output".to_string()),
-            "target should be 'output'"
-        );
-    }
-
-    #[test]
-    fn test_migrate_with_other_flags() {
-        let args = vec![
-            "certstream".to_string(),
-            "--migrate".to_string(),
-            "--target".to_string(),
-            "out".to_string(),
-            "--validate-config".to_string(),
-        ];
-        let parsed = CliArgs::parse_args(&args);
-        assert!(parsed.migrate, "migrate should be true");
-        assert_eq!(parsed.target, Some("out".to_string()));
-        assert!(parsed.validate_config, "validate_config should be true");
-    }
-
-    #[test]
     fn test_source_flag_parsed_correctly() {
         // AC4.2: Test that --source is correctly parsed into source field
         let args = vec![
             "certstream".to_string(),
-            "--migrate".to_string(),
+            "--extract-metadata".to_string(),
             "--target".to_string(),
             "out".to_string(),
             "--source".to_string(),
@@ -554,28 +485,9 @@ mod tests {
     #[test]
     fn test_source_flag_none_when_not_provided() {
         // AC4.2: Test that source is None when --source is not provided
-        let args = vec!["certstream".to_string(), "--migrate".to_string()];
-        let parsed = CliArgs::parse_args(&args);
-        assert_eq!(parsed.source, None);
-    }
-
-    #[test]
-    fn test_to_flag_parsed_correctly() {
-        let args = vec![
-            "certstream".to_string(),
-            "--migrate".to_string(),
-            "--to".to_string(),
-            "2024-06-30".to_string(),
-        ];
-        let parsed = CliArgs::parse_args(&args);
-        assert_eq!(parsed.to, Some("2024-06-30".to_string()));
-    }
-
-    #[test]
-    fn test_to_flag_none_when_not_provided() {
         let args = vec!["certstream".to_string()];
         let parsed = CliArgs::parse_args(&args);
-        assert_eq!(parsed.to, None);
+        assert_eq!(parsed.source, None);
     }
 
     #[test]
@@ -600,28 +512,6 @@ mod tests {
         ];
         let parsed = CliArgs::parse_args(&args);
         assert_eq!(parsed.backfill_from, Some("12345".to_string()));
-    }
-
-    #[test]
-    fn test_migrate_all_flags_together() {
-        let args = vec![
-            "certstream".to_string(),
-            "--migrate".to_string(),
-            "--target".to_string(),
-            "out".to_string(),
-            "--source".to_string(),
-            "src".to_string(),
-            "--from".to_string(),
-            "2024-01-01".to_string(),
-            "--to".to_string(),
-            "2024-01-31".to_string(),
-        ];
-        let parsed = CliArgs::parse_args(&args);
-        assert!(parsed.migrate);
-        assert_eq!(parsed.target, Some("out".to_string()));
-        assert_eq!(parsed.source, Some("src".to_string()));
-        assert_eq!(parsed.backfill_from, Some("2024-01-01".to_string()));
-        assert_eq!(parsed.to, Some("2024-01-31".to_string()));
     }
 
     #[test]
@@ -797,7 +687,6 @@ mod tests {
         // --output should not set target (flag is not recognized)
         assert_eq!(parsed.target, None, "target should be None since --output is not recognized");
         // The trailing argument is just ignored
-        assert!(!parsed.migrate, "migrate should not be affected");
     }
 
     #[test]

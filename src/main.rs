@@ -99,51 +99,6 @@ async fn main() {
         return;
     }
 
-    if cli_args.migrate {
-        if cli_args.source.is_none() || cli_args.target.is_none() {
-            eprintln!("Error: --migrate requires both --source <NAME> and --target <NAME>");
-            std::process::exit(1);
-        }
-
-        // Validate --from and --to date formats if provided
-        if let Some(ref from_date) = cli_args.backfill_from {
-            if let Err(e) = cli::validate_date_format(from_date, "--from") {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-        }
-        if let Some(ref to_date) = cli_args.to {
-            if let Err(e) = cli::validate_date_format(to_date, "--to") {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-        }
-
-        let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
-        let resolved_target = resolve_or_exit(&config, cli_args.target.as_ref().unwrap(), "--target");
-
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
-            )
-            .init();
-
-        let shutdown_token = CancellationToken::new();
-        spawn_signal_handler(shutdown_token.clone());
-
-        let exit_code = backfill::run_migrate(
-            resolved_source,
-            resolved_target,
-            cli_args.backfill_from,
-            cli_args.to,
-            shutdown_token,
-        )
-        .await;
-
-        std::process::exit(exit_code);
-    }
-
     if cli_args.reparse_audit {
         if cli_args.source.is_none() {
             eprintln!("Error: --reparse-audit requires --source <NAME>");
