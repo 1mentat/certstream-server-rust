@@ -249,6 +249,13 @@ The binary has six execution modes selected in main.rs:
 - **Shared by**: watcher, static_ct poller, and backfill fetchers
 - **Parse failures**: skipped with debug log and metrics counter increment, not treated as errors
 
+## Delta Table Replication
+- **No native CLONE**: delta-rs 0.25 does not support Delta CLONE or DEEP CLONE operations
+- **Recommended approach**: use `aws s3 sync` to copy the entire Delta table (parquet data files + `_delta_log/` transaction log directory) to an S3-compatible destination
+- **Example**: `aws s3 sync /data/certstream s3://bucket/certstream --endpoint-url https://s3.example.com` — copies all parquet files and the `_delta_log/` directory, preserving the Delta table structure
+- **Incremental sync**: subsequent `aws s3 sync` calls only transfer new/changed files, making ongoing replication efficient
+- **Tigris note**: for Tigris S3-compatible storage, use `--endpoint-url https://t3.storage.dev`; large initial syncs may encounter connection limits under heavy concurrent uploads
+
 ## Boundaries
 - Safe to edit: `src/`, `config.example.yaml`
 - Never manually edit: `Cargo.lock`
