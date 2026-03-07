@@ -31,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 
 use api::{ApiState, CertificateCache, LogTracker, ServerStats};
 use cli::{CliArgs, VERSION};
-use config::{Config, parse_table_uri, resolve_storage_options};
+use config::{Config, ResolvedTarget, parse_table_uri, resolve_storage_options};
 use ct::{fetch_log_list, WatcherContext};
 use dedup::DedupFilter;
 use health::{deep_health, example_json, health, HealthState};
@@ -42,6 +42,17 @@ use rate_limit::{RateLimiter, TierTokens};
 use sse::handle_sse_stream;
 use state::StateManager;
 use websocket::{handle_domains_only, handle_full_stream, handle_lite_stream, AppState, ConnectionCounter};
+
+/// Helper to resolve a named target and exit on error.
+fn resolve_or_exit(config: &Config, name: &str, flag: &str) -> ResolvedTarget {
+    match config.resolve_target(name) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("Error: {} '{}': {}", flag, name, e);
+            std::process::exit(1);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -88,55 +99,14 @@ async fn main() {
         return;
     }
 
-    if cli_args.migrate {
-        if cli_args.migrate_output.is_none() {
-            eprintln!("Error: --migrate requires --output <PATH>");
+    if cli_args.reparse_audit {
+        if cli_args.source.is_none() {
+            eprintln!("Error: --reparse-audit requires --source <NAME>");
             std::process::exit(1);
         }
 
-        // Validate --from and --to date formats if provided
-        if let Some(ref from_date) = cli_args.backfill_from {
-            if let Err(e) = cli::validate_date_format(from_date, "--from") {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-        }
-        if let Some(ref to_date) = cli_args.to {
-            if let Err(e) = cli::validate_date_format(to_date, "--to") {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-        }
+        let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
 
-        // Compute source path: --source flag or config fallback
-        let source_path = cli_args
-            .migrate_source
-            .unwrap_or_else(|| config.delta_sink.table_path.clone());
-
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
-            )
-            .init();
-
-        let shutdown_token = CancellationToken::new();
-        spawn_signal_handler(shutdown_token.clone());
-
-        let exit_code = backfill::run_migrate(
-            config,
-            cli_args.migrate_output.unwrap(),
-            source_path,
-            cli_args.backfill_from,
-            cli_args.to,
-            shutdown_token,
-        )
-        .await;
-
-        std::process::exit(exit_code);
-    }
-
-    if cli_args.reparse_audit {
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -148,7 +118,7 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let (exit_code, _report) = table_ops::run_reparse_audit(
-            config,
+            resolved_source,
             cli_args.from_date,
             cli_args.to_date,
             shutdown_token,
@@ -159,10 +129,13 @@ async fn main() {
     }
 
     if cli_args.extract_metadata {
-        if cli_args.output_path.is_none() {
-            eprintln!("Error: --extract-metadata requires --output <PATH>");
+        if cli_args.source.is_none() || cli_args.target.is_none() {
+            eprintln!("Error: --extract-metadata requires both --source <NAME> and --target <NAME>");
             std::process::exit(1);
         }
+
+        let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
+        let resolved_target = resolve_or_exit(&config, cli_args.target.as_ref().unwrap(), "--target");
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -175,8 +148,8 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let exit_code = table_ops::run_extract_metadata(
-            config,
-            cli_args.output_path.unwrap(),
+            resolved_source,
+            resolved_target,
             cli_args.from_date,
             cli_args.to_date,
             shutdown_token,
@@ -187,12 +160,13 @@ async fn main() {
     }
 
     if cli_args.merge {
-        if cli_args.staging_path.is_none() {
-            eprintln!("Error: --merge requires --staging-path <PATH>");
+        if cli_args.source.is_none() || cli_args.target.is_none() {
+            eprintln!("Error: --merge requires both --source <NAME> and --target <NAME>");
             std::process::exit(1);
         }
 
-        validate_staging_path_uri(cli_args.staging_path.as_ref());
+        let resolved_source = resolve_or_exit(&config, cli_args.source.as_ref().unwrap(), "--source");
+        let resolved_target = resolve_or_exit(&config, cli_args.target.as_ref().unwrap(), "--target");
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -205,8 +179,8 @@ async fn main() {
         spawn_signal_handler(shutdown_token.clone());
 
         let exit_code = backfill::run_merge(
-            config,
-            cli_args.staging_path.unwrap(),
+            resolved_source,
+            resolved_target,
             shutdown_token,
         )
         .await;
@@ -215,7 +189,20 @@ async fn main() {
     }
 
     if cli_args.backfill {
-        // Parse --from value to u64 for backfill mode
+        let is_zerobus = cli_args.backfill_sink.as_deref() == Some("zerobus");
+
+        // ZeroBus sink uses its own table configuration, so --target is not needed (AC5.8)
+        // For Delta sink, --target is required (AC5.5)
+        if is_zerobus && cli_args.target.is_some() {
+            eprintln!("Error: --target is not compatible with --sink zerobus (ZeroBus uses its own table configuration)");
+            std::process::exit(1);
+        }
+        if !is_zerobus && cli_args.target.is_none() {
+            eprintln!("Error: --backfill requires --target <NAME> (unless using --sink zerobus)");
+            std::process::exit(1);
+        }
+
+        // Parse --from value to u64
         let backfill_from: Option<u64> = match &cli_args.backfill_from {
             Some(s) => match s.parse::<u64>() {
                 Ok(v) => Some(v),
@@ -227,7 +214,6 @@ async fn main() {
             None => None,
         };
 
-        // Validate --sink flag
         if let Err(error_msg) = cli::validate_backfill_sink_command(
             cli_args.backfill_sink.as_deref(),
             backfill_from,
@@ -237,7 +223,12 @@ async fn main() {
             std::process::exit(1);
         }
 
-        validate_staging_path_uri(cli_args.staging_path.as_ref());
+        // Resolve target only for Delta sink (zerobus doesn't use it)
+        let resolved_target = if !is_zerobus {
+            Some(resolve_or_exit(&config, cli_args.target.as_ref().unwrap(), "--target"))
+        } else {
+            None
+        };
 
         tracing_subscriber::fmt()
             .with_env_filter(
@@ -251,7 +242,7 @@ async fn main() {
 
         let exit_code = backfill::run_backfill(
             config,
-            cli_args.staging_path,
+            resolved_target,
             backfill_from,
             cli_args.backfill_logs,
             cli_args.backfill_sink,
@@ -479,16 +470,6 @@ fn spawn_signal_handler(shutdown_token: CancellationToken) {
         warn!("initiating graceful shutdown...");
         shutdown_token.cancel();
     });
-}
-
-/// Validate staging path as a valid URI if provided.
-fn validate_staging_path_uri(staging_path: Option<&String>) {
-    if let Some(staging) = staging_path {
-        if let Err(e) = parse_table_uri(staging) {
-            eprintln!("Error: invalid --staging-path: {}", e);
-            std::process::exit(1);
-        }
-    }
 }
 
 async fn spawn_rfc6962_watchers(

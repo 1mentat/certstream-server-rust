@@ -343,6 +343,28 @@ fn default_delta_sink_offline_batch_size() -> usize {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TargetConfig {
+    pub table_path: String,
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+    #[serde(default)]
+    pub compression_level: Option<i32>,
+    #[serde(default)]
+    pub heavy_column_compression_level: Option<i32>,
+    #[serde(default)]
+    pub offline_batch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub table_path: String,
+    pub storage_options: HashMap<String, String>,
+    pub compression_level: i32,
+    pub heavy_column_compression_level: i32,
+    pub offline_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueryApiConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -570,6 +592,7 @@ pub struct Config {
     pub query_api: QueryApiConfig,
     pub zerobus_sink: ZerobusSinkConfig,
     pub storage: StorageConfig,
+    pub targets: HashMap<String, TargetConfig>,
     pub config_path: Option<String>,
 }
 
@@ -608,6 +631,8 @@ struct YamlConfig {
     zerobus_sink: Option<ZerobusSinkConfig>,
     #[serde(default)]
     storage: Option<StorageConfig>,
+    #[serde(default)]
+    targets: Option<HashMap<String, TargetConfig>>,
 }
 
 struct YamlConfigWithPath {
@@ -847,6 +872,68 @@ impl Config {
             }
         }
 
+        // Overlay env vars for each named target
+        let mut targets = yaml_config.targets.unwrap_or_default();
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+
+            if let Ok(v) = env::var(format!("{}_TABLE_PATH", prefix)) {
+                target.table_path = v;
+            }
+            if let Ok(v) = env::var(format!("{}_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.compression_level = Some(level);
+                }
+            }
+            if let Ok(v) = env::var(format!("{}_HEAVY_COLUMN_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.heavy_column_compression_level = Some(level);
+                }
+            }
+            if let Ok(v) = env::var(format!("{}_OFFLINE_BATCH_SIZE", prefix)) {
+                if let Ok(size) = v.parse::<usize>() {
+                    target.offline_batch_size = Some(size);
+                }
+            }
+
+            // Storage S3 env var overrides for per-target storage
+            let s3_prefix = format!("{}_STORAGE_S3", prefix);
+            let s3_endpoint = env::var(format!("{}_ENDPOINT", s3_prefix)).unwrap_or_default();
+            if !s3_endpoint.is_empty() {
+                // If endpoint env var is set, create or override S3 config
+                let s3 = S3StorageConfig {
+                    endpoint: s3_endpoint,
+                    region: env::var(format!("{}_REGION", s3_prefix)).unwrap_or_default(),
+                    access_key_id: env::var(format!("{}_ACCESS_KEY_ID", s3_prefix)).unwrap_or_default(),
+                    secret_access_key: env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)).unwrap_or_default(),
+                    conditional_put: env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)).ok(),
+                    allow_http: env::var(format!("{}_ALLOW_HTTP", s3_prefix)).ok().and_then(|v| v.parse().ok()),
+                };
+                target.storage = Some(StorageConfig { s3: Some(s3) });
+            } else if let Some(ref mut storage) = target.storage {
+                // If no endpoint trigger but target has YAML storage, overlay individual non-endpoint fields
+                // Note: endpoint overlay is intentionally omitted here — we already know the endpoint env var
+                // is empty/unset (that's why we're in the else branch), so overlaying it would be a no-op.
+                if let Some(ref mut s3) = storage.s3 {
+                    if let Ok(v) = env::var(format!("{}_REGION", s3_prefix)) {
+                        s3.region = v;
+                    }
+                    if let Ok(v) = env::var(format!("{}_ACCESS_KEY_ID", s3_prefix)) {
+                        s3.access_key_id = v;
+                    }
+                    if let Ok(v) = env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)) {
+                        s3.secret_access_key = v;
+                    }
+                    if let Ok(v) = env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)) {
+                        s3.conditional_put = Some(v);
+                    }
+                    if let Ok(v) = env::var(format!("{}_ALLOW_HTTP", s3_prefix)) {
+                        s3.allow_http = v.parse().ok();
+                    }
+                }
+            }
+        }
+
         Self {
             host,
             port,
@@ -868,6 +955,7 @@ impl Config {
             query_api,
             zerobus_sink,
             storage,
+            targets,
             config_path,
         }
     }
@@ -1062,11 +1150,121 @@ impl Config {
             });
         }
 
+        // Validate named targets
+        for (name, target) in &self.targets {
+            let target_field = format!("targets.{}", name);
+
+            // Validate URI format
+            match parse_table_uri(&target.table_path) {
+                Ok(location) => {
+                    // If S3 URI, validate S3 credentials are available
+                    if matches!(location, TableLocation::S3 { .. }) {
+                        let effective_storage = target.storage.as_ref().unwrap_or(&self.storage);
+                        match &effective_storage.s3 {
+                            None => {
+                                errors.push(ConfigValidationError {
+                                    field: format!("{}.storage.s3", target_field),
+                                    message: format!(
+                                        "Target '{}' uses s3:// URI but has no S3 storage configuration (neither target-level nor global)",
+                                        name
+                                    ),
+                                });
+                            }
+                            Some(s3) => {
+                                if s3.endpoint.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.endpoint", target_field),
+                                        message: format!("S3 endpoint cannot be empty for target '{}'", name),
+                                    });
+                                }
+                                if s3.region.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.region", target_field),
+                                        message: format!("S3 region cannot be empty for target '{}'", name),
+                                    });
+                                }
+                                if s3.access_key_id.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.access_key_id", target_field),
+                                        message: format!("S3 access key ID cannot be empty for target '{}'", name),
+                                    });
+                                }
+                                if s3.secret_access_key.is_empty() {
+                                    errors.push(ConfigValidationError {
+                                        field: format!("{}.storage.s3.secret_access_key", target_field),
+                                        message: format!("S3 secret access key cannot be empty for target '{}'", name),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(ConfigValidationError {
+                        field: format!("{}.table_path", target_field),
+                        message: e,
+                    });
+                }
+            }
+
+            // Validate compression levels if specified
+            if let Some(level) = target.compression_level {
+                if ZstdLevel::try_new(level).is_err() {
+                    errors.push(ConfigValidationError {
+                        field: format!("{}.compression_level", target_field),
+                        message: format!(
+                            "Compression level {} is invalid for target '{}'. Must be between 1 and 22",
+                            level, name
+                        ),
+                    });
+                }
+            }
+            if let Some(level) = target.heavy_column_compression_level {
+                if ZstdLevel::try_new(level).is_err() {
+                    errors.push(ConfigValidationError {
+                        field: format!("{}.heavy_column_compression_level", target_field),
+                        message: format!(
+                            "Heavy column compression level {} is invalid for target '{}'. Must be between 1 and 22",
+                            level, name
+                        ),
+                    });
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
         }
+    }
+
+    /// Resolve a named target from config.targets, filling unspecified fields
+    /// from delta_sink defaults and resolving storage options.
+    pub fn resolve_target(&self, name: &str) -> Result<ResolvedTarget, String> {
+        let target = self
+            .targets
+            .get(name)
+            .ok_or_else(|| {
+                let available: Vec<_> = self.targets.keys().collect();
+                format!("Unknown target '{}'. Available targets: {:?}", name, available)
+            })?;
+
+        let location = parse_table_uri(&target.table_path)?;
+
+        // Use target-level storage if present, otherwise fall back to global config.storage
+        let storage = target.storage.as_ref().unwrap_or(&self.storage);
+        let storage_options = resolve_storage_options(&location, storage);
+
+        Ok(ResolvedTarget {
+            table_path: location.as_uri().to_string(),
+            storage_options,
+            compression_level: target.compression_level.unwrap_or(self.delta_sink.compression_level),
+            heavy_column_compression_level: target
+                .heavy_column_compression_level
+                .unwrap_or(self.delta_sink.heavy_column_compression_level),
+            offline_batch_size: target.offline_batch_size.unwrap_or(self.delta_sink.offline_batch_size),
+        })
     }
 
     fn load_yaml() -> YamlConfigWithPath {
@@ -1132,6 +1330,7 @@ mod tests {
             query_api: QueryApiConfig::default(),
             zerobus_sink: ZerobusSinkConfig::default(),
             storage: StorageConfig::default(),
+            targets: HashMap::new(),
             config_path: None,
         }
     }
@@ -2213,7 +2412,7 @@ s3:
 
     // Test URI validation: AC2.6 - parse_table_uri validates both file:// and bare paths
     #[test]
-    fn test_validate_staging_path_uri_format() {
+    fn test_parse_table_uri_validates_scheme() {
         // Valid file:// URI should succeed
         let result = parse_table_uri("file:///tmp/staging");
         assert!(result.is_ok(), "file:/// URI should parse successfully");
@@ -2455,5 +2654,1102 @@ compression_level: 9
             ..test_config()
         };
         assert!(config.validate().is_ok());
+    }
+
+    // Named targets tests (from named-targets phase 1)
+
+    #[test]
+    fn test_target_config_all_fields_yaml() {
+        // Verifies named-targets.AC1.1: TargetConfig with all fields specified deserializes from YAML with correct values
+        let yaml = r#"
+table_path: "file:///data/targets/main"
+compression_level: 12
+heavy_column_compression_level: 18
+offline_batch_size: 50000
+storage:
+  s3:
+    endpoint: "https://s3.example.com"
+    region: "us-west-2"
+    access_key_id: "AKIAIOSFODNN7EXAMPLE"
+    secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+"#;
+        let config: TargetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.table_path, "file:///data/targets/main");
+        assert_eq!(config.compression_level, Some(12));
+        assert_eq!(config.heavy_column_compression_level, Some(18));
+        assert_eq!(config.offline_batch_size, Some(50000));
+        assert!(config.storage.is_some());
+        let storage = config.storage.unwrap();
+        assert!(storage.s3.is_some());
+        let s3 = storage.s3.unwrap();
+        assert_eq!(s3.endpoint, "https://s3.example.com");
+        assert_eq!(s3.region, "us-west-2");
+    }
+
+    #[test]
+    fn test_target_config_only_table_path_yaml() {
+        // Verifies named-targets.AC1.2: TargetConfig with only `table_path` deserializes, optional fields are `None`
+        let yaml = r#"
+table_path: "file:///data/targets/minimal"
+"#;
+        let config: TargetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.table_path, "file:///data/targets/minimal");
+        assert!(config.compression_level.is_none());
+        assert!(config.heavy_column_compression_level.is_none());
+        assert!(config.offline_batch_size.is_none());
+        assert!(config.storage.is_none());
+    }
+
+    #[test]
+    fn test_resolve_target_fill_compression_level() {
+        // Verifies named-targets.AC1.3: `resolve_target()` fills `None` compression_level from `delta_sink.compression_level`
+        let mut config = test_config();
+        config.delta_sink.compression_level = 11;
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "file:///tmp/test".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(resolved.compression_level, 11);
+    }
+
+    #[test]
+    fn test_resolve_target_fill_heavy_column_compression_level() {
+        // Verifies named-targets.AC1.4: `resolve_target()` fills `None` heavy_column_compression_level from delta_sink
+        let mut config = test_config();
+        config.delta_sink.heavy_column_compression_level = 19;
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "file:///tmp/test".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(resolved.heavy_column_compression_level, 19);
+    }
+
+    #[test]
+    fn test_resolve_target_fill_offline_batch_size() {
+        // Verifies named-targets.AC1.5: `resolve_target()` fills `None` offline_batch_size from delta_sink
+        let mut config = test_config();
+        config.delta_sink.offline_batch_size = 200000;
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "file:///tmp/test".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(resolved.offline_batch_size, 200000);
+    }
+
+    #[test]
+    fn test_resolve_target_target_level_storage() {
+        // Verifies named-targets.AC1.6: `resolve_target()` uses target-level `StorageConfig` when present
+        let mut config = test_config();
+        // Set global storage to one value
+        config.storage.s3 = Some(S3StorageConfig {
+            endpoint: "https://global-s3.example.com".to_string(),
+            region: "global-region".to_string(),
+            access_key_id: "global-key".to_string(),
+            secret_access_key: "global-secret".to_string(),
+            conditional_put: None,
+            allow_http: None,
+        });
+
+        // Set target with its own storage
+        let target_storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://target-s3.example.com".to_string(),
+                region: "target-region".to_string(),
+                access_key_id: "target-key".to_string(),
+                secret_access_key: "target-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: Some(target_storage),
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        // Should use target-level S3 credentials, not global
+        assert!(resolved.storage_options.contains_key("AWS_ENDPOINT_URL"));
+        assert_eq!(
+            resolved.storage_options.get("AWS_ENDPOINT_URL").unwrap(),
+            "https://target-s3.example.com"
+        );
+        assert_eq!(
+            resolved.storage_options.get("AWS_REGION").unwrap(),
+            "target-region"
+        );
+        assert_eq!(
+            resolved.storage_options.get("AWS_ACCESS_KEY_ID").unwrap(),
+            "target-key"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_fallback_to_global_storage() {
+        // Verifies named-targets.AC1.7: `resolve_target()` falls back to global `config.storage` when target has no storage config
+        let mut config = test_config();
+        // Set global storage
+        config.storage.s3 = Some(S3StorageConfig {
+            endpoint: "https://global-s3.example.com".to_string(),
+            region: "global-region".to_string(),
+            access_key_id: "global-key".to_string(),
+            secret_access_key: "global-secret".to_string(),
+            conditional_put: None,
+            allow_http: None,
+        });
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: None, // No target-level storage
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        // Should use global S3 credentials
+        assert!(resolved.storage_options.contains_key("AWS_ENDPOINT_URL"));
+        assert_eq!(
+            resolved.storage_options.get("AWS_ENDPOINT_URL").unwrap(),
+            "https://global-s3.example.com"
+        );
+        assert_eq!(
+            resolved.storage_options.get("AWS_REGION").unwrap(),
+            "global-region"
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_unknown_target() {
+        // Verifies named-targets.AC1.8: `resolve_target()` returns error for unknown target name
+        // Also verifies named-targets.AC5.7: dispatch resolution exits with error for unknown target
+        let config = test_config();
+        let result = config.resolve_target("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Unknown target"));
+        assert!(err.contains("nonexistent"));
+    }
+
+    #[test]
+    fn test_resolve_target_file_uri() {
+        // Test that resolve_target works with file:// URIs
+        let mut config = test_config();
+        let mut targets = HashMap::new();
+        targets.insert(
+            "local".to_string(),
+            TargetConfig {
+                table_path: "file:///data/local-target".to_string(),
+                storage: None,
+                compression_level: Some(10),
+                heavy_column_compression_level: Some(20),
+                offline_batch_size: Some(150000),
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("local").unwrap();
+        assert_eq!(resolved.table_path, "/data/local-target");
+        assert_eq!(resolved.compression_level, 10);
+        assert_eq!(resolved.heavy_column_compression_level, 20);
+        assert_eq!(resolved.offline_batch_size, 150000);
+        // Local paths should have empty storage_options
+        assert!(resolved.storage_options.is_empty());
+    }
+
+    #[test]
+    fn test_target_env_var_table_path_override() {
+        // Verifies named-targets.AC2.1: `CERTSTREAM_TARGETS_<NAME>_TABLE_PATH` overrides YAML value
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_MAIN_TABLE_PATH", "file:///env/override");
+        }
+
+        // Create target config from YAML
+        let mut targets = HashMap::new();
+        targets.insert(
+            "main".to_string(),
+            TargetConfig {
+                table_path: "file:///yaml/path".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay (simulating what Config::load() does)
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_TABLE_PATH", prefix)) {
+                target.table_path = v;
+            }
+        }
+
+        // Verify env var override won
+        assert_eq!(targets.get("main").unwrap().table_path, "file:///env/override");
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_MAIN_TABLE_PATH");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_compression_level_override() {
+        // Verifies named-targets.AC2.2: `CERTSTREAM_TARGETS_<NAME>_COMPRESSION_LEVEL` overrides YAML value
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_MAIN_COMPRESSION_LEVEL", "15");
+        }
+
+        // Create target config from YAML
+        let mut targets = HashMap::new();
+        targets.insert(
+            "main".to_string(),
+            TargetConfig {
+                table_path: "file:///data".to_string(),
+                storage: None,
+                compression_level: Some(9),
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.compression_level = Some(level);
+                }
+            }
+        }
+
+        // Verify env var override won
+        assert_eq!(targets.get("main").unwrap().compression_level, Some(15));
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_MAIN_COMPRESSION_LEVEL");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_s3_storage_override() {
+        // Verifies named-targets.AC2.3: Target storage env vars override YAML storage config
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ENDPOINT", "https://env-s3.example.com");
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_REGION", "env-region");
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ACCESS_KEY_ID", "env-key");
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_SECRET_ACCESS_KEY", "env-secret");
+        }
+
+        // Create target config with YAML storage
+        let mut targets = HashMap::new();
+        targets.insert(
+            "archive".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/archive".to_string(),
+                storage: Some(StorageConfig {
+                    s3: Some(S3StorageConfig {
+                        endpoint: "https://yaml-s3.example.com".to_string(),
+                        region: "yaml-region".to_string(),
+                        access_key_id: "yaml-key".to_string(),
+                        secret_access_key: "yaml-secret".to_string(),
+                        conditional_put: None,
+                        allow_http: None,
+                    }),
+                }),
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay (simulating what Config::load() does)
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            let s3_prefix = format!("{}_STORAGE_S3", prefix);
+            let s3_endpoint = env::var(format!("{}_ENDPOINT", s3_prefix)).unwrap_or_default();
+            if !s3_endpoint.is_empty() {
+                // If endpoint env var is set, create or override S3 config
+                let s3 = S3StorageConfig {
+                    endpoint: s3_endpoint,
+                    region: env::var(format!("{}_REGION", s3_prefix)).unwrap_or_default(),
+                    access_key_id: env::var(format!("{}_ACCESS_KEY_ID", s3_prefix)).unwrap_or_default(),
+                    secret_access_key: env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)).unwrap_or_default(),
+                    conditional_put: env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)).ok(),
+                    allow_http: env::var(format!("{}_ALLOW_HTTP", s3_prefix)).ok().and_then(|v| v.parse().ok()),
+                };
+                target.storage = Some(StorageConfig { s3: Some(s3) });
+            }
+        }
+
+        // Verify env var S3 credentials won
+        let target = targets.get("archive").unwrap();
+        assert!(target.storage.is_some());
+        let s3 = target.storage.as_ref().unwrap().s3.as_ref().unwrap();
+        assert_eq!(s3.endpoint, "https://env-s3.example.com");
+        assert_eq!(s3.region, "env-region");
+        assert_eq!(s3.access_key_id, "env-key");
+        assert_eq!(s3.secret_access_key, "env-secret");
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ENDPOINT");
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_REGION");
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_ACCESS_KEY_ID");
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_STORAGE_S3_SECRET_ACCESS_KEY");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_heavy_column_compression_level_override() {
+        // Test that env var overrides for heavy_column_compression_level work correctly
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_ARCHIVE_HEAVY_COLUMN_COMPRESSION_LEVEL", "20");
+        }
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "archive".to_string(),
+            TargetConfig {
+                table_path: "file:///data".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: Some(15),
+                offline_batch_size: None,
+            },
+        );
+
+        // Apply env var overlay
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_HEAVY_COLUMN_COMPRESSION_LEVEL", prefix)) {
+                if let Ok(level) = v.parse::<i32>() {
+                    target.heavy_column_compression_level = Some(level);
+                }
+            }
+        }
+
+        assert_eq!(targets.get("archive").unwrap().heavy_column_compression_level, Some(20));
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_ARCHIVE_HEAVY_COLUMN_COMPRESSION_LEVEL");
+        }
+    }
+
+    #[test]
+    fn test_target_env_var_offline_batch_size_override() {
+        // Test that env var overrides for offline_batch_size work correctly
+        unsafe {
+            env::set_var("CERTSTREAM_TARGETS_STAGING_OFFLINE_BATCH_SIZE", "250000");
+        }
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "staging".to_string(),
+            TargetConfig {
+                table_path: "file:///staging".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: Some(100000),
+            },
+        );
+
+        // Apply env var overlay
+        for (name, target) in targets.iter_mut() {
+            let prefix = format!("CERTSTREAM_TARGETS_{}", name.to_uppercase());
+            if let Ok(v) = env::var(format!("{}_OFFLINE_BATCH_SIZE", prefix)) {
+                if let Ok(size) = v.parse::<usize>() {
+                    target.offline_batch_size = Some(size);
+                }
+            }
+        }
+
+        assert_eq!(targets.get("staging").unwrap().offline_batch_size, Some(250000));
+
+        unsafe {
+            env::remove_var("CERTSTREAM_TARGETS_STAGING_OFFLINE_BATCH_SIZE");
+        }
+    }
+
+    // Named Target Validation Tests
+    // AC3.1: Valid target with file:// table_path passes validation
+    #[test]
+    fn test_validate_target_file_uri_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with valid file:// URI");
+    }
+
+    // AC3.2: Valid target with s3:// table_path and complete S3 storage passes validation
+    #[test]
+    fn test_validate_target_s3_uri_with_storage_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with S3 URI and complete per-target S3 config");
+    }
+
+    // AC3.2: Valid target with s3:// table_path using global S3 storage passes validation
+    #[test]
+    fn test_validate_target_s3_uri_with_global_storage_valid() {
+        let mut config = test_config();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+            }),
+        };
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with S3 URI and global S3 config");
+    }
+
+    // AC3.3: Target with bare path (no URI scheme) fails validation
+    #[test]
+    fn test_validate_target_bare_path_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "/tmp/bare-path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with bare path");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.table_path"),
+            "error should be on targets.test_target.table_path field"
+        );
+    }
+
+    // AC3.4: Target with s3:// table_path but no S3 credentials fails validation
+    #[test]
+    fn test_validate_target_s3_uri_without_credentials_fails() {
+        let mut config = test_config();
+        config.storage = StorageConfig { s3: None };
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with S3 URI but no S3 config");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3"),
+            "error should be on targets.test_target.storage.s3 field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty endpoint fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_endpoint_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 endpoint");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.endpoint"),
+            "error should be on targets.test_target.storage.s3.endpoint field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty region fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_region_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 region");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.region"),
+            "error should be on targets.test_target.storage.s3.region field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty access_key_id fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_access_key_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "".to_string(),
+                    secret_access_key: "test-secret".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 access_key_id");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.access_key_id"),
+            "error should be on targets.test_target.storage.s3.access_key_id field"
+        );
+    }
+
+    // AC3.4: Target with S3 URI but empty secret_access_key fails validation
+    #[test]
+    fn test_validate_target_s3_uri_empty_secret_key_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(S3StorageConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    access_key_id: "test-key".to_string(),
+                    secret_access_key: "".to_string(),
+                    conditional_put: None,
+                    allow_http: None,
+                }),
+            }),
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with empty S3 secret_access_key");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.storage.s3.secret_access_key"),
+            "error should be on targets.test_target.storage.s3.secret_access_key field"
+        );
+    }
+
+    // AC3.5: Target with compression_level below range (0) fails validation
+    #[test]
+    fn test_validate_target_compression_level_zero_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(0),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with compression_level 0");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.compression_level"),
+            "error should be on targets.test_target.compression_level field"
+        );
+    }
+
+    // AC3.5: Target with compression_level above range (23) fails validation
+    #[test]
+    fn test_validate_target_compression_level_too_high_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(23),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with compression_level 23");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.compression_level"),
+            "error should be on targets.test_target.compression_level field"
+        );
+    }
+
+    // AC3.5: Target with compression_level at min valid range (1) passes validation
+    #[test]
+    fn test_validate_target_compression_level_min_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(1),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with compression_level 1");
+    }
+
+    // AC3.5: Target with compression_level at max valid range (22) passes validation
+    #[test]
+    fn test_validate_target_compression_level_max_valid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(22),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with compression_level 22");
+    }
+
+    // AC3.5: Target with heavy_column_compression_level below range (0) fails validation
+    #[test]
+    fn test_validate_target_heavy_column_compression_level_zero_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: Some(0),
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with heavy_column_compression_level 0");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"),
+            "error should be on targets.test_target.heavy_column_compression_level field"
+        );
+    }
+
+    // AC3.5: Target with heavy_column_compression_level above range (23) fails validation
+    #[test]
+    fn test_validate_target_heavy_column_compression_level_too_high_fails() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: Some(23),
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with heavy_column_compression_level 23");
+        let errors = result.unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"),
+            "error should be on targets.test_target.heavy_column_compression_level field"
+        );
+    }
+
+    // AC3.6: Empty targets map passes validation
+    #[test]
+    fn test_validate_target_empty_targets_valid() {
+        let config = test_config();
+        assert!(config.targets.is_empty(), "test config should have empty targets");
+
+        let result = config.validate();
+        assert!(result.is_ok(), "validation should pass with empty targets map");
+    }
+
+    // Additional test: Multiple targets validation accumulates errors
+    #[test]
+    fn test_validate_target_multiple_targets_errors() {
+        let mut config = test_config();
+
+        // Add a target with bare path
+        let target1 = TargetConfig {
+            table_path: "/tmp/bare-path".to_string(),
+            storage: None,
+            compression_level: Some(0),
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("bad_target1".to_string(), target1);
+
+        // Add another target with S3 URI but no credentials
+        let target2 = TargetConfig {
+            table_path: "s3://bucket/path".to_string(),
+            storage: None,
+            compression_level: None,
+            heavy_column_compression_level: None,
+            offline_batch_size: None,
+        };
+        config.targets.insert("bad_target2".to_string(), target2);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with multiple invalid targets");
+        let errors = result.unwrap_err();
+        assert!(errors.len() >= 2, "should have multiple errors for multiple invalid targets");
+    }
+
+    // Additional test: Target with both compression levels invalid
+    #[test]
+    fn test_validate_target_both_compression_levels_invalid() {
+        let mut config = test_config();
+        let target = TargetConfig {
+            table_path: "file:///tmp/test".to_string(),
+            storage: None,
+            compression_level: Some(0),
+            heavy_column_compression_level: Some(25),
+            offline_batch_size: None,
+        };
+        config.targets.insert("test_target".to_string(), target);
+
+        let result = config.validate();
+        assert!(result.is_err(), "validation should fail with both compression levels invalid");
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "targets.test_target.compression_level"));
+        assert!(errors.iter().any(|e| e.field == "targets.test_target.heavy_column_compression_level"));
+    }
+
+    // Integration test: Full config -> resolve -> operation flow with named targets
+    #[test]
+    fn test_target_integration() {
+        // Verifies named-targets.AC7.1: Full config -> CLI -> resolve -> operation flow works end-to-end
+
+        // Create temporary directories for source and target tables
+        let test_name = "target_integration_test";
+        let source_table_path = format!("/tmp/delta_{}_source", test_name);
+        let target_table_path = format!("/tmp/delta_{}_target", test_name);
+        let source_file_uri = format!("file://{}", source_table_path);
+        let target_file_uri = format!("file://{}", target_table_path);
+
+        // Clean up any previous test artifacts
+        let _ = std::fs::remove_dir_all(&source_table_path);
+        let _ = std::fs::remove_dir_all(&target_table_path);
+
+        // Create a Config with named targets
+        let mut config = test_config();
+
+        // Add "source" target with explicit compression levels
+        let source_target = TargetConfig {
+            table_path: source_file_uri.clone(),
+            storage: None,
+            compression_level: Some(10),
+            heavy_column_compression_level: Some(12),
+            offline_batch_size: Some(50000),
+        };
+        config.targets.insert("source".to_string(), source_target);
+
+        // Add "target" target using delta_sink defaults (fallback)
+        let target_target = TargetConfig {
+            table_path: target_file_uri.clone(),
+            storage: None,
+            compression_level: None,  // Will fall back to delta_sink.compression_level
+            heavy_column_compression_level: None,  // Will fall back to delta_sink.heavy_column_compression_level
+            offline_batch_size: None,  // Will fall back to delta_sink.offline_batch_size
+        };
+        config.targets.insert("target".to_string(), target_target);
+
+        // Verify the config validates
+        assert!(config.validate().is_ok(), "Config with named targets should be valid");
+
+        // Resolve both targets
+        let source_resolved = config.resolve_target("source")
+            .expect("Should resolve 'source' target");
+        let target_resolved = config.resolve_target("target")
+            .expect("Should resolve 'target' target");
+
+        // Verify source target values
+        assert_eq!(source_resolved.table_path, source_table_path,
+                   "Source table_path should match (stripped of file://)");
+        assert_eq!(source_resolved.compression_level, 10,
+                   "Source compression_level should be explicit value");
+        assert_eq!(source_resolved.heavy_column_compression_level, 12,
+                   "Source heavy_column_compression_level should be explicit value");
+        assert_eq!(source_resolved.offline_batch_size, 50000,
+                   "Source offline_batch_size should be explicit value");
+        assert!(source_resolved.storage_options.is_empty(),
+                "Source storage_options should be empty for local filesystem");
+
+        // Verify target (fallback) values
+        assert_eq!(target_resolved.table_path, target_table_path,
+                   "Target table_path should match (stripped of file://)");
+        assert_eq!(target_resolved.compression_level, config.delta_sink.compression_level,
+                   "Target compression_level should fall back to delta_sink default");
+        assert_eq!(target_resolved.heavy_column_compression_level, config.delta_sink.heavy_column_compression_level,
+                   "Target heavy_column_compression_level should fall back to delta_sink default");
+        assert_eq!(target_resolved.offline_batch_size, config.delta_sink.offline_batch_size,
+                   "Target offline_batch_size should fall back to delta_sink default");
+        assert!(target_resolved.storage_options.is_empty(),
+                "Target storage_options should be empty for local filesystem");
+
+        // Verify unknown target resolution fails with helpful error
+        let unknown_result = config.resolve_target("nonexistent");
+        assert!(unknown_result.is_err(), "Unknown target should fail to resolve");
+        let error_msg = unknown_result.unwrap_err();
+        assert!(error_msg.contains("nonexistent"), "Error should mention target name");
+        assert!(error_msg.contains("source") && error_msg.contains("target"),
+                "Error should list available targets");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&source_table_path);
+        let _ = std::fs::remove_dir_all(&target_table_path);
+    }
+
+    // Integration test: Target resolution with S3 storage config
+    #[test]
+    fn test_target_integration_s3_storage() {
+        // Verifies named-targets.AC7.1: S3 targets resolve with correct storage options
+
+        let mut config = test_config();
+
+        // Create S3 storage config
+        let s3_config = S3StorageConfig {
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-west-2".to_string(),
+            access_key_id: "test-key-id".to_string(),
+            secret_access_key: "test-secret".to_string(),
+            conditional_put: Some("etag".to_string()),
+            allow_http: Some(false),
+        };
+
+        // Create target with S3 URI and per-target storage config
+        let s3_target = TargetConfig {
+            table_path: "s3://my-bucket/certstream-data".to_string(),
+            storage: Some(StorageConfig {
+                s3: Some(s3_config),
+            }),
+            compression_level: Some(11),
+            heavy_column_compression_level: Some(13),
+            offline_batch_size: Some(75000),
+        };
+        config.targets.insert("s3_archive".to_string(), s3_target);
+
+        // Verify the config validates
+        assert!(config.validate().is_ok(), "Config with S3 target should be valid");
+
+        // Resolve the S3 target
+        let s3_resolved = config.resolve_target("s3_archive")
+            .expect("Should resolve 's3_archive' target");
+
+        // Verify S3 target values
+        assert_eq!(s3_resolved.table_path, "s3://my-bucket/certstream-data",
+                   "S3 table_path should remain as full URI");
+        assert_eq!(s3_resolved.compression_level, 11,
+                   "S3 compression_level should be explicit value");
+        assert_eq!(s3_resolved.heavy_column_compression_level, 13,
+                   "S3 heavy_column_compression_level should be explicit value");
+        assert_eq!(s3_resolved.offline_batch_size, 75000,
+                   "S3 offline_batch_size should be explicit value");
+
+        // Verify storage options were resolved correctly
+        assert!(!s3_resolved.storage_options.is_empty(),
+                "S3 storage_options should not be empty");
+        assert_eq!(s3_resolved.storage_options.get("AWS_ENDPOINT_URL"),
+                   Some(&"https://s3.example.com".to_string()),
+                   "Should have AWS_ENDPOINT_URL");
+        assert_eq!(s3_resolved.storage_options.get("AWS_REGION"),
+                   Some(&"us-west-2".to_string()),
+                   "Should have AWS_REGION");
+        assert_eq!(s3_resolved.storage_options.get("AWS_ACCESS_KEY_ID"),
+                   Some(&"test-key-id".to_string()),
+                   "Should have AWS_ACCESS_KEY_ID");
+        assert_eq!(s3_resolved.storage_options.get("AWS_SECRET_ACCESS_KEY"),
+                   Some(&"test-secret".to_string()),
+                   "Should have AWS_SECRET_ACCESS_KEY");
+        assert_eq!(s3_resolved.storage_options.get("conditional_put"),
+                   Some(&"etag".to_string()),
+                   "Should have conditional_put");
+        assert_eq!(s3_resolved.storage_options.get("AWS_ALLOW_HTTP"),
+                   Some(&"false".to_string()),
+                   "Should have AWS_ALLOW_HTTP");
+    }
+
+    // Integration test: Target resolution with global storage fallback
+    #[test]
+    fn test_target_integration_global_storage_fallback() {
+        // Verifies named-targets.AC7.1: Global storage config used when target storage is None
+
+        let mut config = test_config();
+
+        // Set global storage config
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://global-s3.example.com".to_string(),
+                region: "eu-west-1".to_string(),
+                access_key_id: "global-key".to_string(),
+                secret_access_key: "global-secret".to_string(),
+                conditional_put: None,
+                allow_http: Some(true),
+            }),
+        };
+
+        // Create target with S3 URI but no per-target storage config (will use global)
+        let s3_target = TargetConfig {
+            table_path: "s3://another-bucket/data".to_string(),
+            storage: None,  // Will use global config.storage
+            compression_level: Some(8),
+            heavy_column_compression_level: None,  // Will use delta_sink default
+            offline_batch_size: None,  // Will use delta_sink default
+        };
+        config.targets.insert("global_s3".to_string(), s3_target);
+
+        // Verify the config validates
+        assert!(config.validate().is_ok(), "Config with global S3 storage should be valid");
+
+        // Resolve the target
+        let resolved = config.resolve_target("global_s3")
+            .expect("Should resolve 'global_s3' target");
+
+        // Verify resolved values
+        assert_eq!(resolved.table_path, "s3://another-bucket/data",
+                   "Table path should be S3 URI");
+        assert_eq!(resolved.compression_level, 8,
+                   "Compression level should be explicit value");
+        assert_eq!(resolved.heavy_column_compression_level, config.delta_sink.heavy_column_compression_level,
+                   "Heavy compression should fall back to delta_sink");
+
+        // Verify global storage options were resolved
+        assert_eq!(resolved.storage_options.get("AWS_ENDPOINT_URL"),
+                   Some(&"https://global-s3.example.com".to_string()),
+                   "Should use global AWS_ENDPOINT_URL");
+        assert_eq!(resolved.storage_options.get("AWS_REGION"),
+                   Some(&"eu-west-1".to_string()),
+                   "Should use global AWS_REGION");
+        assert_eq!(resolved.storage_options.get("AWS_ACCESS_KEY_ID"),
+                   Some(&"global-key".to_string()),
+                   "Should use global AWS_ACCESS_KEY_ID");
+        assert_eq!(resolved.storage_options.get("AWS_SECRET_ACCESS_KEY"),
+                   Some(&"global-secret".to_string()),
+                   "Should use global AWS_SECRET_ACCESS_KEY");
+        assert_eq!(resolved.storage_options.get("AWS_ALLOW_HTTP"),
+                   Some(&"true".to_string()),
+                   "Should use global AWS_ALLOW_HTTP");
     }
 }

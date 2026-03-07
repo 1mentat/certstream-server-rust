@@ -39,6 +39,24 @@ hot_reload:
 
 custom_logs: []
 
+# Named targets: reusable Delta table configurations for CLI operations
+# targets:
+#   main:
+#     table_path: "file:///data/certstream/main"
+#   staging:
+#     table_path: "file:///data/certstream/staging"
+#   archive:
+#     table_path: "s3://my-bucket/certstream/archive"
+#     compression_level: 15
+#     heavy_column_compression_level: 19
+#     offline_batch_size: 200000
+#     storage:
+#       s3:
+#         endpoint: "https://s3.us-east-1.amazonaws.com"
+#         region: "us-east-1"
+#         access_key_id: "AKIA..."
+#         secret_access_key: "..."
+
 # Static CT logs (Sunlight / static-ct-api protocol)
 # These logs use checkpoint + tile-based fetching instead of get-sth/get-entries
 # Use monitoring prefix (mon.*) for read access to checkpoint and tile data
@@ -61,7 +79,7 @@ delta_sink:
   flush_interval_secs: 30           # Max seconds between flushes
   compression_level: 9              # Zstd compression level (1-22, default 9)
   heavy_column_compression_level: 15  # Zstd level for as_der column (1-22, default 15)
-  offline_batch_size: 100000        # Records per Delta commit for offline operations (extract-metadata, migrate)
+  offline_batch_size: 100000        # Records per Delta commit for offline operations (extract-metadata)
 
 # Query API for searching certificates in Delta table
 # Provides REST API for querying historical CT records stored in Delta Lake
