@@ -5,6 +5,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 use parquet::basic::ZstdLevel;
+use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CustomCtLog {
@@ -456,6 +457,8 @@ pub struct S3StorageConfig {
     pub conditional_put: Option<String>,
     #[serde(default)]
     pub allow_http: Option<bool>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -525,6 +528,43 @@ pub fn parse_table_uri(uri: &str) -> Result<TableLocation, String> {
     }
 }
 
+/// S3-compatible storage provider, detected from endpoint URL or explicit annotation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum S3Provider {
+    Tigris,
+    Aws,
+    R2,
+    MinIO,
+    Generic,
+}
+
+/// Detect the S3 provider from an explicit provider string or endpoint URL pattern.
+///
+/// Priority: explicit provider > endpoint URL matching.
+/// URL matching is case-insensitive.
+pub fn detect_s3_provider(endpoint: &str, explicit_provider: &Option<String>) -> S3Provider {
+    if let Some(provider) = explicit_provider {
+        return match provider.to_lowercase().as_str() {
+            "tigris" => S3Provider::Tigris,
+            "aws" => S3Provider::Aws,
+            "r2" => S3Provider::R2,
+            "minio" => S3Provider::MinIO,
+            _ => S3Provider::Generic,
+        };
+    }
+
+    let endpoint_lower = endpoint.to_lowercase();
+    if endpoint_lower.contains("tigris") {
+        S3Provider::Tigris
+    } else if endpoint_lower.contains("amazonaws.com") {
+        S3Provider::Aws
+    } else if endpoint_lower.contains("r2.cloudflarestorage.com") {
+        S3Provider::R2
+    } else {
+        S3Provider::Generic
+    }
+}
+
 /// Resolves storage options for a given TableLocation and StorageConfig.
 ///
 /// Returns a HashMap of storage options suitable for use with Delta Lake or similar APIs:
@@ -559,6 +599,21 @@ pub fn resolve_storage_options(
                 }
                 if let Some(allow) = s3.allow_http {
                     opts.insert("AWS_ALLOW_HTTP".to_string(), allow.to_string());
+                }
+                // Detect provider and apply provider-specific defaults
+                let provider = detect_s3_provider(&s3.endpoint, &s3.provider);
+                match provider {
+                    S3Provider::Tigris | S3Provider::R2 | S3Provider::MinIO => {
+                        if !opts.contains_key("conditional_put") {
+                            opts.insert("conditional_put".to_string(), "etag".to_string());
+                            info!(
+                                "Provider detected as {:?} from {}, setting conditional_put=etag",
+                                provider,
+                                if s3.provider.is_some() { "explicit config" } else { "endpoint URL" }
+                            );
+                        }
+                    }
+                    S3Provider::Aws | S3Provider::Generic => {}
                 }
             }
             opts
@@ -854,6 +909,9 @@ impl Config {
             if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP") {
                 s3.allow_http = v.parse().ok();
             }
+            if let Ok(v) = env::var("CERTSTREAM_STORAGE_S3_PROVIDER") {
+                s3.provider = Some(v);
+            }
         } else {
             // If no s3 section in YAML, check if env vars want to create one.
             // CERTSTREAM_STORAGE_S3_ENDPOINT is the trigger: if it's empty or unset,
@@ -868,6 +926,7 @@ impl Config {
                     secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
                     conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
                     allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+                    provider: env::var("CERTSTREAM_STORAGE_S3_PROVIDER").ok(),
                 });
             }
         }
@@ -908,6 +967,7 @@ impl Config {
                     secret_access_key: env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)).unwrap_or_default(),
                     conditional_put: env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)).ok(),
                     allow_http: env::var(format!("{}_ALLOW_HTTP", s3_prefix)).ok().and_then(|v| v.parse().ok()),
+                    provider: env::var(format!("{}_PROVIDER", s3_prefix)).ok(),
                 };
                 target.storage = Some(StorageConfig { s3: Some(s3) });
             } else if let Some(ref mut storage) = target.storage {
@@ -929,6 +989,9 @@ impl Config {
                     }
                     if let Ok(v) = env::var(format!("{}_ALLOW_HTTP", s3_prefix)) {
                         s3.allow_http = v.parse().ok();
+                    }
+                    if let Ok(v) = env::var(format!("{}_PROVIDER", s3_prefix)) {
+                        s3.provider = Some(v);
                     }
                 }
             }
@@ -2078,6 +2141,7 @@ s3:
                 secret_access_key: String::new(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
         if let Some(ref mut s3) = storage.s3 {
@@ -2108,6 +2172,7 @@ s3:
                 secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
                 conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
                 allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+                provider: None,
             });
         }
         unsafe {
@@ -2137,6 +2202,7 @@ s3:
                 secret_access_key: env::var("CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY").unwrap_or_default(),
                 conditional_put: env::var("CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT").ok(),
                 allow_http: env::var("CERTSTREAM_STORAGE_S3_ALLOW_HTTP").ok().and_then(|v| v.parse().ok()),
+                provider: None,
             });
         }
         unsafe {
@@ -2238,6 +2304,7 @@ s3:
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
                 conditional_put: Some("etag".to_string()),
                 allow_http: Some(false),
+                provider: None,
             }),
         };
         let opts = resolve_storage_options(&location, &storage);
@@ -2284,6 +2351,7 @@ s3:
                 secret_access_key: String::new(),
                 conditional_put: Some("etag".to_string()),
                 allow_http: None,
+                provider: None,
             }),
         };
         let opts = resolve_storage_options(&location, &storage);
@@ -2311,6 +2379,7 @@ s3:
                 secret_access_key: String::new(),
                 conditional_put: None,
                 allow_http: Some(true),
+                provider: None,
             }),
         };
         let opts = resolve_storage_options(&location, &storage);
@@ -2336,6 +2405,7 @@ s3:
                 secret_access_key: "test-secret".to_string(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
 
@@ -2392,6 +2462,7 @@ s3:
                 secret_access_key: "test-secret".to_string(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
 
@@ -2484,6 +2555,7 @@ s3:
                 secret_access_key: "test-secret".to_string(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
 
@@ -2510,6 +2582,7 @@ s3:
                 secret_access_key: "test-secret".to_string(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
 
@@ -2538,6 +2611,7 @@ s3:
                 secret_access_key: String::new(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
 
@@ -2778,7 +2852,8 @@ table_path: "file:///data/targets/minimal"
             secret_access_key: "global-secret".to_string(),
             conditional_put: None,
             allow_http: None,
-        });
+                provider: None,
+            });
 
         // Set target with its own storage
         let target_storage = StorageConfig {
@@ -2789,6 +2864,7 @@ table_path: "file:///data/targets/minimal"
                 secret_access_key: "target-secret".to_string(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
 
@@ -2834,7 +2910,8 @@ table_path: "file:///data/targets/minimal"
             secret_access_key: "global-secret".to_string(),
             conditional_put: None,
             allow_http: None,
-        });
+                provider: None,
+            });
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -2998,7 +3075,8 @@ table_path: "file:///data/targets/minimal"
                         secret_access_key: "yaml-secret".to_string(),
                         conditional_put: None,
                         allow_http: None,
-                    }),
+                provider: None,
+            }),
                 }),
                 compression_level: None,
                 heavy_column_compression_level: None,
@@ -3020,6 +3098,7 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: env::var(format!("{}_SECRET_ACCESS_KEY", s3_prefix)).unwrap_or_default(),
                     conditional_put: env::var(format!("{}_CONDITIONAL_PUT", s3_prefix)).ok(),
                     allow_http: env::var(format!("{}_ALLOW_HTTP", s3_prefix)).ok().and_then(|v| v.parse().ok()),
+                    provider: env::var(format!("{}_PROVIDER", s3_prefix)).ok(),
                 };
                 target.storage = Some(StorageConfig { s3: Some(s3) });
             }
@@ -3146,7 +3225,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                }),
+                provider: None,
+            }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3170,6 +3250,7 @@ table_path: "file:///data/targets/minimal"
                 secret_access_key: "test-secret".to_string(),
                 conditional_put: None,
                 allow_http: None,
+                provider: None,
             }),
         };
         let target = TargetConfig {
@@ -3244,7 +3325,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                }),
+                provider: None,
+            }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3275,7 +3357,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                }),
+                provider: None,
+            }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3306,7 +3389,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                }),
+                provider: None,
+            }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3337,7 +3421,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                }),
+                provider: None,
+            }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3637,7 +3722,8 @@ table_path: "file:///data/targets/minimal"
             secret_access_key: "test-secret".to_string(),
             conditional_put: Some("etag".to_string()),
             allow_http: Some(false),
-        };
+                provider: None,
+            };
 
         // Create target with S3 URI and per-target storage config
         let s3_target = TargetConfig {
@@ -3707,6 +3793,7 @@ table_path: "file:///data/targets/minimal"
                 secret_access_key: "global-secret".to_string(),
                 conditional_put: None,
                 allow_http: Some(true),
+                provider: None,
             }),
         };
 
