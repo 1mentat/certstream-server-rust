@@ -2391,6 +2391,359 @@ s3:
         assert_eq!(opts.get("AWS_ALLOW_HTTP"), Some(&"true".to_string()));
     }
 
+    // --- Provider detection tests ---
+
+    #[test]
+    fn test_detect_s3_provider_explicit_tigris() {
+        // Verifies s3-write-resilience.AC1.1: explicit provider takes priority
+        let provider = detect_s3_provider("https://unrelated.example.com", &Some("tigris".to_string()));
+        assert_eq!(provider, S3Provider::Tigris);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_aws() {
+        let provider = detect_s3_provider("https://unrelated.example.com", &Some("aws".to_string()));
+        assert_eq!(provider, S3Provider::Aws);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_r2() {
+        let provider = detect_s3_provider("https://unrelated.example.com", &Some("r2".to_string()));
+        assert_eq!(provider, S3Provider::R2);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_minio() {
+        let provider = detect_s3_provider("https://unrelated.example.com", &Some("minio".to_string()));
+        assert_eq!(provider, S3Provider::MinIO);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_unknown() {
+        // Verifies s3-write-resilience.AC1.3: unknown explicit provider -> Generic
+        let provider = detect_s3_provider("https://unrelated.example.com", &Some("unknown".to_string()));
+        assert_eq!(provider, S3Provider::Generic);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_tigris_url() {
+        // Verifies s3-write-resilience.AC1.2: tigris in URL -> Tigris
+        let provider = detect_s3_provider("https://fly.storage.tigris.dev", &None);
+        assert_eq!(provider, S3Provider::Tigris);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_aws_url() {
+        // Verifies s3-write-resilience.AC1.2: amazonaws.com in URL -> Aws
+        let provider = detect_s3_provider("https://s3.us-east-1.amazonaws.com", &None);
+        assert_eq!(provider, S3Provider::Aws);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_r2_url() {
+        // Verifies s3-write-resilience.AC1.2: r2.cloudflarestorage.com in URL -> R2
+        let provider = detect_s3_provider("https://abc123.r2.cloudflarestorage.com", &None);
+        assert_eq!(provider, S3Provider::R2);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_generic_url() {
+        // Verifies s3-write-resilience.AC1.3: no match -> Generic
+        let provider = detect_s3_provider("https://s3.example.com", &None);
+        assert_eq!(provider, S3Provider::Generic);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_case_insensitive() {
+        // Verifies s3-write-resilience.AC1.4: case-insensitive URL matching
+        let provider = detect_s3_provider("https://fly.storage.TIGRIS.dev", &None);
+        assert_eq!(provider, S3Provider::Tigris);
+
+        let provider = detect_s3_provider("https://s3.us-east-1.AMAZONAWS.COM", &None);
+        assert_eq!(provider, S3Provider::Aws);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_case_insensitive() {
+        // Verifies s3-write-resilience.AC1.4: case-insensitive explicit provider
+        let provider = detect_s3_provider("", &Some("TIGRIS".to_string()));
+        assert_eq!(provider, S3Provider::Tigris);
+
+        let provider = detect_s3_provider("", &Some("MinIO".to_string()));
+        assert_eq!(provider, S3Provider::MinIO);
+    }
+
+    #[test]
+    fn test_detect_s3_provider_explicit_overrides_url() {
+        // Verifies s3-write-resilience.AC1.1: explicit provider overrides URL detection
+        // Endpoint looks like Tigris but explicit provider says AWS
+        let provider = detect_s3_provider("https://fly.storage.tigris.dev", &Some("aws".to_string()));
+        assert_eq!(provider, S3Provider::Aws);
+    }
+
+    // --- Provider defaults in resolve_storage_options tests ---
+
+    #[test]
+    fn test_resolve_storage_options_tigris_auto_conditional_put() {
+        // Verifies s3-write-resilience.AC2.1: Tigris auto-sets conditional_put
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_storage_options_r2_auto_conditional_put() {
+        // Verifies s3-write-resilience.AC2.2: R2 auto-sets conditional_put
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://abc123.r2.cloudflarestorage.com".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_storage_options_minio_explicit_provider_auto_conditional_put() {
+        // Verifies s3-write-resilience.AC2.3: MinIO (via explicit provider) auto-sets conditional_put
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://minio.internal.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: Some("minio".to_string()),
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        assert_eq!(opts.get("conditional_put"), Some(&"etag".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_storage_options_aws_no_auto_conditional_put() {
+        // Verifies s3-write-resilience.AC2.4: AWS does NOT auto-set conditional_put
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(!opts.contains_key("conditional_put"));
+    }
+
+    #[test]
+    fn test_resolve_storage_options_generic_no_auto_conditional_put() {
+        // Verifies s3-write-resilience.AC2.4: Generic does NOT auto-set conditional_put
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://s3.example.com".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(!opts.contains_key("conditional_put"));
+    }
+
+    #[test]
+    fn test_resolve_storage_options_explicit_conditional_put_not_overridden() {
+        // Verifies s3-write-resilience.AC2.5: explicit conditional_put is never overridden
+        let location = TableLocation::S3 {
+            uri: "s3://bucket/prefix".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: Some("custom-value".to_string()),
+                allow_http: None,
+                provider: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        // Should keep the explicit value, not override with "etag"
+        assert_eq!(opts.get("conditional_put"), Some(&"custom-value".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_storage_options_local_unaffected_by_provider() {
+        // Verifies s3-write-resilience.AC4.1: local storage returns empty map regardless
+        let location = TableLocation::Local {
+            path: "/data/certstream".to_string(),
+        };
+        let storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: None,
+            }),
+        };
+        let opts = resolve_storage_options(&location, &storage);
+        assert!(opts.is_empty());
+    }
+
+    // --- Named target provider defaults integration tests ---
+
+    #[test]
+    fn test_resolve_target_tigris_target_gets_auto_conditional_put() {
+        // Verifies s3-write-resilience.AC2.1 via named target with Tigris endpoint
+        let mut config = test_config();
+        config.storage = StorageConfig::default(); // global storage has no S3
+
+        let target_storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "target-key".to_string(),
+                secret_access_key: "target-secret".to_string(),
+                conditional_put: None, // Not set — should be auto-filled
+                allow_http: None,
+                provider: None,
+            }),
+        };
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "tigris".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: Some(target_storage),
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("tigris").unwrap();
+        assert_eq!(
+            resolved.storage_options.get("conditional_put"),
+            Some(&"etag".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_global_storage_fallback_gets_provider_defaults() {
+        // Verifies s3-write-resilience.AC4.3: targets without storage fall back to global
+        // AND global Tigris storage gets auto conditional_put
+        let mut config = test_config();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "global-key".to_string(),
+                secret_access_key: "global-secret".to_string(),
+                conditional_put: None,
+                allow_http: None,
+                provider: None,
+            }),
+        };
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: None, // Falls back to global
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(
+            resolved.storage_options.get("conditional_put"),
+            Some(&"etag".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_global_explicit_conditional_put_preserved() {
+        // Verifies s3-write-resilience.AC4.2: global storage with explicit conditional_put not affected
+        let mut config = test_config();
+        config.storage = StorageConfig {
+            s3: Some(S3StorageConfig {
+                endpoint: "https://fly.storage.tigris.dev".to_string(),
+                region: "auto".to_string(),
+                access_key_id: "global-key".to_string(),
+                secret_access_key: "global-secret".to_string(),
+                conditional_put: Some("etag".to_string()), // Already set explicitly
+                allow_http: None,
+                provider: None,
+            }),
+        };
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test".to_string(),
+            TargetConfig {
+                table_path: "s3://bucket/path".to_string(),
+                storage: None,
+                compression_level: None,
+                heavy_column_compression_level: None,
+                offline_batch_size: None,
+            },
+        );
+        config.targets = targets;
+
+        let resolved = config.resolve_target("test").unwrap();
+        assert_eq!(
+            resolved.storage_options.get("conditional_put"),
+            Some(&"etag".to_string())
+        );
+    }
+
     // Test URI validation: AC2.1 - Config with S3 URI and full storage config validates OK
     #[test]
     fn test_validate_s3_uri_with_full_config() {
