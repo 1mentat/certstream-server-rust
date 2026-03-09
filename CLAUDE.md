@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-03-05
-Last context update: 2026-03-05
+Last verified: 2026-03-09
+Last context update: 2026-03-09
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -61,7 +61,7 @@ The delta_sink and zerobus_sink are spawned as optional tokio tasks and do not a
 In Delta Lake storage, the `as_der` column is stored as raw binary bytes (not base64-encoded). The WriterProperties builder applies dictionary encoding to low-cardinality columns (update_type, source_name, source_url, signature_algorithm, issuer_aggregated) and skips it for high-cardinality columns (fingerprint, sha256, sha1, serial_number, as_der, subject_aggregated, cert_link), with per-column ZSTD compression using `compression_level` for most columns and `heavy_column_compression_level` for the `as_der` column.
 
 The binary has five execution modes selected in main.rs:
-1. **Server mode** (default): starts the WebSocket/SSE server and live CT log watchers
+1. **Server mode** (default): when delta_sink is enabled, checkpoints the Delta log (fatal on failure), then starts the WebSocket/SSE server and live CT log watchers
 2. **Backfill mode** (`--backfill` with optional `--target <NAME>`): runs gap detection against the target Delta table, spawns per-log fetcher tasks and a single writer task, then exits with code 0 (success) or 1 (errors). With `--target <NAME>`, writes to the named target table instead of the default delta_sink table.
 3. **Merge mode** (`--merge --source <NAME> --target <NAME>`): merges source Delta table into target table using Delta MERGE INTO with deduplication, then deletes the source directory on success
 4. **Reparse audit mode** (`--reparse-audit --source <NAME>`): reads stored certificates from source target Delta table, reparses each from `as_der`, compares parsed fields against stored values, and prints a mismatch report. Exits 0 on success (even with mismatches), 1 on infrastructure failure or shutdown.
@@ -108,8 +108,9 @@ The binary has five execution modes selected in main.rs:
 - **Buffer overflow**: if buffer > 2x batch_size, drops oldest half
 - **Error recovery**: failed writes retain buffer for retry; table handle reopened
 - **Non-fatal startup**: if table creation fails, task exits without crashing server
-- **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged)
-- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `delta_writer_properties(compression_level, heavy_column_compression_level)`, `flush_buffer(table, buffer, schema, batch_size, compression_level, heavy_column_compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()` are public for reuse by backfill
+- **Startup checkpoint**: when delta_sink is enabled, `checkpoint_table(&config.delta_sink, &config.storage)` is called synchronously in main before spawning the live sink task; creates a checkpoint parquet file in `_delta_log/` and cleans up expired log files; checkpoint failure is fatal (exits with code 1); log cleanup failure is non-fatal (logged as warning, returns Ok)
+- **Metrics**: `certstream_delta_*` (records_written, flushes, write_errors, buffer_size, flush_duration_seconds, messages_lagged, checkpoint_duration_seconds, checkpoint_logs_cleaned)
+- **Public helpers**: `delta_schema()`, `open_or_create_table()`, `delta_writer_properties(compression_level, heavy_column_compression_level)`, `flush_buffer(table, buffer, schema, batch_size, compression_level, heavy_column_compression_level)`, `records_to_batch()`, `DeltaCertRecord::from_message()`, `checkpoint_table(config, storage)` are public for reuse by backfill
 
 ## ZeroBus Sink Contracts
 - **Disabled by default** (`zerobus_sink.enabled = false`)
