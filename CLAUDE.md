@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-03-05
-Last context update: 2026-03-05
+Last verified: 2026-03-09
+Last context update: 2026-03-09
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -77,12 +77,15 @@ The binary has five execution modes selected in main.rs:
 
 ## Storage Config Contracts
 - **Config**: `StorageConfig { s3: Option<S3StorageConfig> }` — top-level config section for storage backend credentials
-- **S3StorageConfig**: `{ endpoint, region, access_key_id, secret_access_key, conditional_put: Option<String>, allow_http: Option<bool> }`
-- **Env vars**: `CERTSTREAM_STORAGE_S3_ENDPOINT`, `CERTSTREAM_STORAGE_S3_REGION`, `CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID`, `CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY`, `CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT`, `CERTSTREAM_STORAGE_S3_ALLOW_HTTP`
+- **S3StorageConfig**: `{ endpoint, region, access_key_id, secret_access_key, conditional_put: Option<String>, allow_http: Option<bool>, provider: Option<String> }`
+- **Env vars**: `CERTSTREAM_STORAGE_S3_ENDPOINT`, `CERTSTREAM_STORAGE_S3_REGION`, `CERTSTREAM_STORAGE_S3_ACCESS_KEY_ID`, `CERTSTREAM_STORAGE_S3_SECRET_ACCESS_KEY`, `CERTSTREAM_STORAGE_S3_CONDITIONAL_PUT`, `CERTSTREAM_STORAGE_S3_ALLOW_HTTP`, `CERTSTREAM_STORAGE_S3_PROVIDER`
 - **Env var trigger**: if no `storage.s3` section in YAML, `CERTSTREAM_STORAGE_S3_ENDPOINT` being non-empty triggers creation of S3 config from env vars; if endpoint is empty/unset, no S3 config is created even if other S3 env vars are set
 - **TableLocation enum**: `Local { path }` or `S3 { uri }`; `as_uri()` returns the string for `DeltaTableBuilder::from_uri()` (stripped path for Local, full `s3://` URI for S3)
 - **`parse_table_uri(uri)`**: parses `file://` to `Local`, `s3://` to `S3`; rejects empty URIs, unsupported schemes, and bare paths (suggests `file://` prefix)
-- **`resolve_storage_options(location, storage)`**: returns `HashMap<String, String>` — empty for Local, AWS-compatible options (`AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `conditional_put`, `AWS_ALLOW_HTTP`) for S3
+- **S3Provider enum**: `Tigris`, `Aws`, `R2`, `MinIO`, `Generic` — represents detected S3-compatible storage provider
+- **`detect_s3_provider(endpoint, explicit_provider)`**: returns `S3Provider`; priority: explicit `provider` field > endpoint URL pattern matching; explicit values: `"tigris"`, `"aws"`, `"r2"`, `"minio"` (case-insensitive), unknown strings map to `Generic`; URL patterns: `"tigris"` in URL -> Tigris, `"amazonaws.com"` -> Aws, `"r2.cloudflarestorage.com"` -> R2, otherwise Generic; MinIO is not URL-detectable (requires explicit provider)
+- **`resolve_storage_options(location, storage)`**: returns `HashMap<String, String>` — empty for Local, AWS-compatible options (`AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `conditional_put`, `AWS_ALLOW_HTTP`) for S3; additionally applies provider-specific defaults: for Tigris, R2, and MinIO providers, auto-sets `conditional_put=etag` if not explicitly configured (logged via `tracing::info`); Aws and Generic providers do not get auto-defaults
+- **Provider-specific defaults**: `conditional_put=etag` is auto-applied for Tigris/R2/MinIO because these providers support ETag-based conditional writes required for safe Delta Lake concurrent access; explicit `conditional_put` in config is never overridden
 - **Validation (when S3 URIs used)**: `storage.s3` must be present; `endpoint`, `region`, `access_key_id`, `secret_access_key` must be non-empty; validated during `Config::validate()`
 - **Validation scope**: `delta_sink.table_path` validated when delta_sink enabled; `query_api.table_path` validated when query_api enabled; target table paths validated at CLI dispatch in main.rs when `--source` or `--target` flags are used
 
