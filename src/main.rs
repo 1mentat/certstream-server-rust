@@ -313,6 +313,12 @@ async fn main() {
     info!("cross-log dedup filter enabled");
 
     let delta_sink_handle = if config.delta_sink.enabled {
+        // Checkpoint delta log before starting the live sink
+        if let Err(e) = delta_sink::checkpoint_table(&config.delta_sink, &config.storage).await {
+            eprintln!("Error: delta log checkpoint failed: {e}");
+            std::process::exit(1);
+        }
+
         let delta_rx = tx.subscribe();
         let delta_config = config.delta_sink.clone();
         let delta_storage = config.storage.clone();
