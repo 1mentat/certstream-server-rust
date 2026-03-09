@@ -56,6 +56,7 @@ custom_logs: []
 #         region: "us-east-1"
 #         access_key_id: "AKIA..."
 #         secret_access_key: "..."
+#         provider: ""                    # S3 provider hint (auto-detected from endpoint if omitted)
 
 # Static CT logs (Sunlight / static-ct-api protocol)
 # These logs use checkpoint + tile-based fetching instead of get-sth/get-entries
@@ -101,6 +102,7 @@ query_api:
 #     secret_access_key: ""               # Secret key (prefer env var)
 #     conditional_put: "etag"             # Atomic writes via ETag (required for Tigris)
 #     allow_http: false                   # Allow non-HTTPS connections
+#     provider: ""                        # S3 provider hint: tigris, aws, r2, minio (auto-detected from endpoint if omitted)
 
 # ZeroBus Ingest sink (Databricks managed Delta table)
 # Streams CT entries to a Databricks-managed Delta table via ZeroBus SDK.
