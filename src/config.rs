@@ -2852,8 +2852,8 @@ table_path: "file:///data/targets/minimal"
             secret_access_key: "global-secret".to_string(),
             conditional_put: None,
             allow_http: None,
-                provider: None,
-            });
+            provider: None,
+        });
 
         // Set target with its own storage
         let target_storage = StorageConfig {
@@ -2910,8 +2910,8 @@ table_path: "file:///data/targets/minimal"
             secret_access_key: "global-secret".to_string(),
             conditional_put: None,
             allow_http: None,
-                provider: None,
-            });
+            provider: None,
+        });
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -3075,8 +3075,8 @@ table_path: "file:///data/targets/minimal"
                         secret_access_key: "yaml-secret".to_string(),
                         conditional_put: None,
                         allow_http: None,
-                provider: None,
-            }),
+                        provider: None,
+                    }),
                 }),
                 compression_level: None,
                 heavy_column_compression_level: None,
@@ -3225,8 +3225,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                provider: None,
-            }),
+                    provider: None,
+                }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3325,8 +3325,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                provider: None,
-            }),
+                    provider: None,
+                }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3357,8 +3357,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                provider: None,
-            }),
+                    provider: None,
+                }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3389,8 +3389,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "test-secret".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                provider: None,
-            }),
+                    provider: None,
+                }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3421,8 +3421,8 @@ table_path: "file:///data/targets/minimal"
                     secret_access_key: "".to_string(),
                     conditional_put: None,
                     allow_http: None,
-                provider: None,
-            }),
+                    provider: None,
+                }),
             }),
             compression_level: None,
             heavy_column_compression_level: None,
@@ -3722,8 +3722,8 @@ table_path: "file:///data/targets/minimal"
             secret_access_key: "test-secret".to_string(),
             conditional_put: Some("etag".to_string()),
             allow_http: Some(false),
-                provider: None,
-            };
+            provider: None,
+        };
 
         // Create target with S3 URI and per-target storage config
         let s3_target = TargetConfig {
