@@ -19,12 +19,11 @@
     <meta property="og:url" content="https://certstream.dev/architecture.html">
     <meta property="og:title" content="certstream-server-rust architecture">
     <meta property="og:description" content="How certstream-server-rust reads CT logs, parses certificates, deduplicates entries, persists state, and broadcasts messages to clients.">
-    <meta name="theme-color" content="#b7410e">
+    <meta name="theme-color" content="#ffffff">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
-    <link rel="alternate" type="application/rss+xml" title="certstream-server-rust blog" href="/feed.xml">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
     <script>
       // Applied before first paint so the page never flashes the wrong theme.
       (function () {
@@ -52,14 +51,13 @@
 <body>
     <header>
         <div class="wrap">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <nav>
                 <ul class="nav-links">
                     <li><a href="/">Home</a></li>
                     <li><a href="docs.html">API Docs</a></li>
                     <li><a href="quickstart.html">Quick Start</a></li>
                     <li><a href="architecture.html" class="active">Architecture</a></li>
-                    <li><a href="/blog/">Blog</a></li>
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
@@ -75,7 +73,7 @@
     </header>
     <div class="mobile-nav" id="mobile-nav">
         <div class="mobile-nav-header">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <button class="mobile-nav-close" onclick="document.getElementById('mobile-nav').classList.remove('active')">&times;</button>
         </div>
         <ul class="mobile-nav-links">
@@ -83,7 +81,6 @@
             <li><a href="docs.html">API Docs</a></li>
             <li><a href="quickstart.html">Quick Start</a></li>
             <li><a href="architecture.html" class="active">Architecture</a></li>
-            <li><a href="/blog/">Blog</a></li>
             <li><a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
@@ -91,7 +88,6 @@
     <main>
         <div class="wrap">
             <div class="page-header">
-                <span class="eyebrow">Architecture</span>
                 <h1>How certstream works</h1>
                 <p>The path a certificate takes, from a Certificate Transparency log to a connected client.</p>
             </div>
@@ -100,9 +96,7 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Overview</span>
                     <h2>End-to-end data flow</h2>
-                    <p>From CT logs to WebSocket and SSE clients.</p>
                 </div>
                 <div class="mermaid">
 flowchart LR
@@ -136,9 +130,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Ingest · RFC 6962</span>
                     <h2>CT log polling</h2>
-                    <p>How certificates are fetched from classic Certificate Transparency logs.</p>
                 </div>
                 <ol class="step-list">
                     <li>
@@ -172,9 +164,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Ingest · static-CT-API</span>
                     <h2>Static CT protocol</h2>
-                    <p>Checkpoint and tile-based fetching for newer CT logs.</p>
                 </div>
                 <div class="info-box">
                     <h4>Why static CT?</h4>
@@ -216,9 +206,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Pipeline</span>
                     <h2>Cross-log deduplication</h2>
-                    <p>The same certificate can appear in more than one CT log.</p>
                 </div>
                 <div class="mermaid">
 flowchart LR
@@ -246,9 +234,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Pipeline</span>
                     <h2>Certificate parsing</h2>
-                    <p>X.509 decoding, from a CT entry to the fields the server exposes.</p>
                 </div>
                 <div class="mermaid">
 flowchart LR
@@ -293,9 +279,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Pipeline</span>
                     <h2>Pre-serialization</h2>
-                    <p>Messages are serialized once before being broadcast.</p>
                 </div>
                 <div class="mermaid">
 flowchart LR
@@ -322,9 +306,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Output</span>
                     <h2>Stream formats</h2>
-                    <p>Three payload formats are available.</p>
                 </div>
                 <div class="format-grid">
                     <div class="format-card">
@@ -352,9 +334,7 @@ flowchart LR
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Durability</span>
                     <h2>State persistence</h2>
-                    <p>Resume from the last position after a restart.</p>
                 </div>
                 <div class="mermaid">
 flowchart LR
@@ -389,7 +369,6 @@ flowchart LR
             <div class="links">
                 <a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener">Container Registry</a>
-                <a href="/blog/">Blog</a>
                 <a href="docs.html">Documentation</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
                 <a href="https://github.com/sponsors/reloading01" target="_blank" rel="noopener">Sponsor</a>
@@ -435,7 +414,7 @@ flowchart LR
                 mermaid.run({ nodes: nodes });
             }
 
-            render();
+            document.fonts.load('14px "IBM Plex Sans"').then(render, render);
             window.onThemeChange = render;
             var mq = window.matchMedia('(prefers-color-scheme: dark)');
             var onSystemChange = function () {

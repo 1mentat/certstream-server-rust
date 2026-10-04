@@ -25,12 +25,11 @@
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="certstream-server-rust: Certificate Transparency streaming">
     <meta name="twitter:description" content="Stream SSL/TLS certificates from Chrome- and Apple-trusted CT logs over WebSocket and SSE. RFC 6962 and static-ct-api, in a single binary.">
-    <meta name="theme-color" content="#b7410e">
+    <meta name="theme-color" content="#ffffff">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
-    <link rel="alternate" type="application/rss+xml" title="certstream-server-rust blog" href="/feed.xml">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
     <script>
       // Applied before first paint so the page never flashes the wrong theme.
       (function () {
@@ -128,14 +127,13 @@
 <body>
     <header>
         <div class="wrap">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <nav>
                 <ul class="nav-links">
                     <li><a href="/" class="active">Home</a></li>
                     <li><a href="docs.html">API Docs</a></li>
                     <li><a href="quickstart.html">Quick Start</a></li>
                     <li><a href="architecture.html">Architecture</a></li>
-                    <li><a href="/blog/">Blog</a></li>
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
@@ -151,7 +149,7 @@
     </header>
     <div class="mobile-nav" id="mobile-nav">
         <div class="mobile-nav-header">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <button class="mobile-nav-close" onclick="document.getElementById('mobile-nav').classList.remove('active')">&times;</button>
         </div>
         <ul class="mobile-nav-links">
@@ -159,7 +157,6 @@
             <li><a href="docs.html">API Docs</a></li>
             <li><a href="quickstart.html">Quick Start</a></li>
             <li><a href="architecture.html">Architecture</a></li>
-            <li><a href="/blog/">Blog</a></li>
             <li><a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
@@ -167,85 +164,90 @@
     <main>
         <section class="hero">
             <div class="wrap hero-grid">
-              <div class="hero-copy">
-                <span class="eyebrow">Certificate transparency · streamed</span>
-                <h1>Certificate Transparency streaming, <em>written in Rust.</em></h1>
-                <p class="hero-desc">
-                    Reads newly issued SSL/TLS certificates from Chrome- and Apple-trusted Certificate Transparency
-                    logs and streams them over WebSocket or Server-Sent Events. Both RFC 6962 and static-ct-api logs
-                    are supported, in a single binary.
-                </p>
-                <div class="hero-meta">
-                    <span>v1.6.0</span><span>·</span><span>MIT</span><span>·</span>
-                    <span>RFC 6962</span><span>·</span><span>static-CT-API</span><span>·</span>
-                    <span>WebSocket &amp; SSE</span><span>·</span><span>single binary</span>
+                <div class="hero-copy">
+                    <h1>Certificate Transparency streaming in Rust</h1>
+                    <p class="hero-desc">
+                        Watches the Chrome- and Apple-trusted Certificate Transparency logs and streams every new SSL/TLS certificate to you over WebSocket or Server-Sent Events. RFC 6962 and static-ct-api logs both work, in one binary.
+                    </p>
+                    <div class="hero-actions">
+                        <a href="/quickstart.html" class="btn btn-primary">Quick Start</a>
+                        <a href="https://github.com/reloading01/certstream-server-rust" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+                    </div>
+                    <p class="hero-stats" id="hero-stats" hidden></p>
                 </div>
-                <div class="hero-actions">
-                    <a href="/quickstart.html" class="btn btn-primary">Quick Start</a>
-                    <a href="https://github.com/reloading01/certstream-server-rust" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+                <div class="hero-demo">
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Run</span>
+                            <button class="copy-btn" onclick="navigator.clipboard.writeText('docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest');this.textContent='Copied'">Copy</button>
+                        </div>
+                        <pre class="wrap"><span class="cm">$</span> docker run -d -p 8080:8080 \
+    ghcr.io/reloading01/certstream-server-rust:latest</pre>
+                    </div>
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Stream</span>
+                            <span class="tag">/domains-only</span>
+                        </div>
+                        <pre class="wrap"><span class="cm">$</span> wscat -c ws://localhost:8080/domains-only
+{"<span class="str">message_type</span>":"<span class="str">certificate_update</span>",
+ "<span class="str">data</span>":["<span class="str">example.com</span>","<span class="str">www.example.com</span>"]}</pre>
+                    </div>
                 </div>
-                <div class="install-box">
-                    <code>docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest</code>
-                    <button onclick="navigator.clipboard.writeText('docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest');this.textContent='Copied'">Copy</button>
-                </div>
-              </div>
-
             </div>
         </section>
 
-        <section id="features">
+        <section id="features" class="split">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Features</span>
-                    <h2>What the server does.</h2>
+                    <h2>Features</h2>
                 </div>
                 <div class="features-list">
                     <div class="feature-item">
                         <h3>WebSocket and SSE</h3>
-                        <p>Certificate updates can be consumed over WebSocket or Server-Sent Events. Both transports carry the same certificate stream.</p>
+                        <p>Use WebSocket or Server-Sent Events, whichever your client prefers. Both carry the same certificates.</p>
                     </div>
                     <div class="feature-item">
                         <h3>RFC 6962 and static-ct-api</h3>
-                        <p>The server watches both classic <code>get-entries</code> logs and newer static-ct-api logs based on checkpoints and tiles. Both types run in the same process.</p>
+                        <p>Classic <code>get-entries</code> logs and the newer checkpoint-and-tile static-ct-api logs are watched side by side in one process.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Cross-log deduplication</h3>
-                        <p>The same certificate is often submitted to several CT logs. Certificates are deduplicated by SHA-256 before broadcast, so clients receive one update per certificate within the configured deduplication window.</p>
+                        <p>One certificate usually ends up in several CT logs. The server hashes each one with SHA-256 and sends it once per deduplication window, so your client does not see repeats.</p>
                     </div>
                     <div class="feature-item">
                         <h3>State persistence</h3>
-                        <p>Watcher positions can be written to disk and restored after a restart, so each log does not start from scratch after a restart or upgrade.</p>
+                        <p>Log positions are saved to disk. After a restart or an upgrade each log continues where it stopped instead of starting over.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Connection limits</h3>
-                        <p>Optional limits can be applied to the total connection count and per IP address.</p>
+                        <p>Optional caps on total connections and on connections per IP address.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Token authentication</h3>
-                        <p>Bearer-token authentication can be enabled for client connections. Tokens are compared in constant time, and multiple tokens and a custom header name are supported.</p>
+                        <p>Turn on bearer tokens for clients. Tokens are compared in constant time. You can set several of them and change the header name.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Configuration reload</h3>
-                        <p>The configuration file can be watched for changes, so supported settings can be updated without restarting the process.</p>
+                        <p>The config file is watched. Settings that support it take effect without a restart.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Log health</h3>
-                        <p>Each CT log is tracked independently. Repeated failures move a watcher through healthy, degraded, and unhealthy, with retries and exponential backoff behind a per-log circuit breaker.</p>
+                        <p>Every CT log has its own watcher. Repeated failures move it from healthy to degraded to unhealthy, with retries, exponential backoff and a circuit breaker per log.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Metrics and REST API</h3>
-                        <p>Prometheus metrics are exposed at <code>/metrics</code>. An optional REST API serves server statistics, CT log status, and certificate lookup.</p>
+                        <p>Prometheus metrics at <code>/metrics</code>. An optional REST API returns server statistics, CT log status and certificate lookups.</p>
                     </div>
                 </div>
             </div>
         </section>
 
-        <section id="migrating">
+        <section id="migrating" class="split">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Compatibility</span>
-                    <h2>Existing certstream clients.</h2>
-                    <p>The certificate message format follows the one used by Calidog's certstream-server and certstream-server-go, so a client only needs a different WebSocket address.</p>
+                    <h2>Compatibility</h2>
+                    <p>The message format is the one Calidog's certstream-server and certstream-server-go use, so a client only needs a different WebSocket address.</p>
                 </div>
                 <div class="code-examples">
                     <div class="code-example">
@@ -269,21 +271,16 @@ wscat -c <span class="str">wss://your-host:8080/</span></pre>
                     </div>
                 </div>
                 <p style="margin-top: 24px; color: var(--ink-2); font-size: 0.92rem; max-width: 72ch;">
-                    Message types, field names and the <code>leaf_cert</code> shape are unchanged, so a parser written
-                    against either predecessor keeps working. This implementation additionally reads static-ct-api
-                    logs and deduplicates certificates seen across several logs. If only domain names are needed, the
-                    <code>/domains-only</code> stream sends roughly 100 to 500 bytes per message instead of the 2 to
-                    5 KB of the default stream.
+                    Message types, field names and the <code>leaf_cert</code> shape are unchanged, so a parser written for either of them keeps working. On top of that, this server reads static-ct-api logs and drops duplicates seen across logs. If you only want domain names, <code>/domains-only</code> sends about 100 to 500 bytes per message instead of 2 to 5 KB.
                 </p>
             </div>
         </section>
 
-        <section id="performance">
+        <section id="performance" class="split">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Performance</span>
-                    <h2>Measured throughput.</h2>
-                    <p>A two-hour run against all 45 Chrome- and Apple-trusted logs, with the default configuration and one subscriber on the domains-only stream. Metrics were sampled every 30 seconds.</p>
+                    <h2>Performance</h2>
+                    <p>Two hours against all 45 Chrome- and Apple-trusted logs, default configuration, one subscriber on the domains-only stream, metrics sampled every 30 seconds.</p>
                 </div>
                 <div class="stat-grid">
                     <div class="stat-cell">
@@ -304,55 +301,24 @@ wscat -c <span class="str">wss://your-host:8080/</span></pre>
                     </div>
                 </div>
                 <p style="margin-top: 24px; color: var(--ink-2); font-size: 0.92rem; max-width: 72ch;">
-                    At the measured median that is about 36 million certificate updates a day. Each certificate is
-                    serialized once and shared with every subscriber through an
-                    <code>Arc&lt;PreSerializedMessage&gt;</code>, and serialization is skipped when no client is
-                    connected. The memory behaviour is described in
-                    <a href="/blog/jemalloc-transparent-huge-pages-rss.html">358 MB resident, 52 MB in use</a>.
+                    At the median that works out to roughly 36 million certificate updates a day. Each certificate is serialized once and shared with every subscriber through an <code>Arc&lt;PreSerializedMessage&gt;</code>, and with no clients connected the serialization is skipped. Memory is covered in the
+                    <a href="docs.html#performance">API docs</a>.
                 </p>
             </div>
         </section>
 
-        <section id="writing">
-            <div class="wrap">
-                <div class="section-header">
-                    <span class="eyebrow">Blog</span>
-                    <h2>Engineering notes.</h2>
-                </div>
-                <!-- blog-teaser:start -->
-                <article class="post-list-item">
-                    <h2><a href="/blog/http2-multiplexing-vs-per-connection-rate-limits.html">HTTP/2 multiplexing vs per-connection rate limits</a></h2>
-                    <p>Every request succeeded and the log stayed 33,000 entries behind. Switching transport gave me three connections instead of one, and changed nothing.</p>
-                </article>
-                <article class="post-list-item">
-                    <h2><a href="/blog/ct-logs-tiles-without-checkpoint.html">Reading Certificate Transparency tiles without a checkpoint</a></h2>
-                    <p>Three logs, zero errors, and 279,000 entries behind. The faster path was already there, behind an endpoint that returns 404.</p>
-                </article>
-                <article class="post-list-item">
-                    <h2><a href="/blog/jemalloc-transparent-huge-pages-rss.html">358 MB resident, 52 MB in use: where the rest went</a></h2>
-                    <p>A service that looked like it was leaking. It wasn&#x27;t, and the fix was five settings the allocator had been running without.</p>
-                </article>
-                <!-- blog-teaser:end -->
-                <div class="center-block" style="margin-top: 28px;">
-                    <a href="/blog/" class="btn btn-secondary">All posts</a>
-                </div>
-            </div>
-        </section>
 
-        <section id="support">
+        <section id="support" class="split">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Support</span>
-                    <h2>Supporting the project.</h2>
+                    <h2>Support</h2>
                 </div>
                 <div class="center-block">
                     <p>
-                        certstream-server-rust is developed in my spare time and released under the MIT license. If you
-                        find it useful, starring the repository, reporting issues, or sharing it with someone who needs
-                        it is appreciated.
+                        I develop certstream-server-rust in my spare time and release it under the MIT license. If it is useful to you, a star, a bug report or a word to someone who needs it helps.
                     </p>
                     <p>
-                        GitHub Sponsors is also available for anyone who wants to support development.
+                        GitHub Sponsors is there if you want to support the work.
                     </p>
                     <div style="margin-top: 24px;">
                         <a href="https://github.com/sponsors/reloading01" class="btn btn-primary" target="_blank" rel="noopener">Sponsor on GitHub</a>
@@ -367,7 +333,6 @@ wscat -c <span class="str">wss://your-host:8080/</span></pre>
             <div class="links">
                 <a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener">Container Registry</a>
-                <a href="/blog/">Blog</a>
                 <a href="docs.html">Documentation</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
                 <a href="https://github.com/sponsors/reloading01" target="_blank" rel="noopener">Sponsor</a>
@@ -376,5 +341,15 @@ wscat -c <span class="str">wss://your-host:8080/</span></pre>
             <span class="colophon">certstream-server-rust</span>
         </div>
     </footer>
+    <script>
+      fetch('/stats.json').then(function (r) { return r.json(); }).then(function (s) {
+        var n = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+        var total = s.container_pulls + s.release_downloads;
+        var el = document.getElementById('hero-stats');
+        el.innerHTML = '<a href="https://github.com/reloading01/certstream-server-rust/stargazers" target="_blank" rel="noopener"><strong>' + n.format(s.stars) + '</strong> stars</a>' +
+          '<span title="' + s.container_pulls.toLocaleString('en') + ' container image pulls and ' + s.release_downloads.toLocaleString('en') + ' release file downloads"><strong>' + n.format(total) + '</strong> downloads</span>';
+        el.hidden = false;
+      }).catch(function () {});
+    </script>
 </body>
 </html>
