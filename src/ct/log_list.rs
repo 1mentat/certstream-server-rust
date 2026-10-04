@@ -46,6 +46,8 @@ struct Operator {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct RawCtLog {
+    /// Absent on `pending` and `test` entries.
+    #[serde(default)]
     description: String,
     url: String,
     #[serde(default)]
@@ -75,6 +77,8 @@ struct RawCtLog {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct RawTiledLog {
+    /// Absent on `pending` and `test` entries.
+    #[serde(default)]
     description: String,
     monitoring_url: String,
     submission_url: String,
@@ -434,9 +438,10 @@ fn parse_list(bytes: &[u8], source_name: &str) -> Vec<CtLog> {
         for raw in op.logs {
             count_unknown_fields(source_name, &raw._other);
             count_unknown_state_enum(source_name, raw.state.as_ref());
+            let url = normalize_url(&raw.url);
             out.push(CtLog {
-                description: raw.description,
-                url: normalize_url(&raw.url),
+                description: named(raw.description, &url),
+                url,
                 operator: operator.clone(),
                 operator_display: operator_display.clone(),
                 log_type: LogType::Rfc6962,
@@ -454,9 +459,10 @@ fn parse_list(bytes: &[u8], source_name: &str) -> Vec<CtLog> {
         for raw in op.tiled_logs {
             count_unknown_fields(source_name, &raw._other);
             count_unknown_state_enum(source_name, raw.state.as_ref());
+            let url = normalize_url(&raw.monitoring_url);
             out.push(CtLog {
-                description: raw.description,
-                url: normalize_url(&raw.monitoring_url),
+                description: named(raw.description, &url),
+                url,
                 operator: operator.clone(),
                 operator_display: operator_display.clone(),
                 log_type: LogType::StaticCt,
@@ -473,6 +479,16 @@ fn parse_list(bytes: &[u8], source_name: &str) -> Vec<CtLog> {
         }
     }
     out
+}
+
+/// A log without a description is named by its URL, so a watcher, a metric
+/// label or a log line never carries an empty name.
+fn named(description: String, url: &str) -> String {
+    if description.is_empty() {
+        url.to_string()
+    } else {
+        description
+    }
 }
 
 /// Count each unknown top-level key once, with the raw name in a WARN log (the
@@ -986,6 +1002,54 @@ mod tests {
             local_override_conflicts(std::slice::from_ref(&discovered), &[derived]).is_empty(),
             "an override without a declared origin must not conflict"
         );
+    }
+
+    /// Google's `all_logs_list.json` includes `log_type: "test"` logs that have
+    /// no `description`. One such entry used to fail the whole list.
+    #[test]
+    fn test_parse_list_keeps_logs_without_a_description() {
+        let json = br#"{
+            "operators": [{
+                "name": "Sectigo",
+                "logs": [
+                    {
+                        "description": "Sectigo 'Elephant2026h2'",
+                        "url": "https://elephant2026h2.ct.sectigo.com/",
+                        "log_id": "aaa=",
+                        "state": {"usable": {"timestamp": "2026-01-01T00:00:00Z"}}
+                    },
+                    {
+                        "url": "https://dumbo.ctlabs.sectigo.com/",
+                        "log_id": "bbb=",
+                        "mmd": 86400,
+                        "log_type": "test"
+                    }
+                ]
+            }]
+        }"#;
+        let logs = parse_list(json, "google_v3_all");
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[1].url, "https://dumbo.ctlabs.sectigo.com");
+        assert_eq!(logs[1].description, "https://dumbo.ctlabs.sectigo.com");
+    }
+
+    #[test]
+    fn test_parse_list_keeps_pending_tiled_logs_without_a_description() {
+        let json = br#"{
+            "operators": [{
+                "name": "HARICA",
+                "logs": [],
+                "tiled_logs": [{
+                    "log_id": "ccc=",
+                    "monitoring_url": "https://selene.mon.ct.harica.eu/selene2027h1/",
+                    "submission_url": "https://selene.ct.harica.eu/selene2027h1/",
+                    "state": {"pending": {"timestamp": "2026-09-01T00:00:00Z"}}
+                }]
+            }]
+        }"#;
+        let logs = parse_list(json, "google_v3_all");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].description, logs[0].url);
     }
 
     /// Apple's log list adds `assetVersionV2` and `tiled_logs` and may include
