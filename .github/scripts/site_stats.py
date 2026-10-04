@@ -17,7 +17,6 @@ def get(url, api=False):
 
 
 repo = json.loads(get(f"https://api.github.com/repos/{REPO}", api=True))
-releases = json.loads(get(f"https://api.github.com/repos/{REPO}/releases?per_page=100", api=True))
 page = get(PACKAGE_PAGE)
 
 match = re.search(r'Total downloads</span>\s*<h3 title="(\d+)"', page)
@@ -26,8 +25,6 @@ if not match:
 
 stats = {
     "stars": repo["stargazers_count"],
-    "forks": repo["forks_count"],
-    "release_downloads": sum(a["download_count"] for r in releases for a in r["assets"]),
     "container_pulls": int(match.group(1)),
 }
 

@@ -344,10 +344,9 @@ wscat -c <span class="str">wss://your-host:8080/</span></pre>
     <script>
       fetch('/stats.json').then(function (r) { return r.json(); }).then(function (s) {
         var n = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
-        var total = s.container_pulls + s.release_downloads;
         var el = document.getElementById('hero-stats');
         el.innerHTML = '<a href="https://github.com/reloading01/certstream-server-rust/stargazers" target="_blank" rel="noopener"><strong>' + n.format(s.stars) + '</strong> stars</a>' +
-          '<span title="' + s.container_pulls.toLocaleString('en') + ' container image pulls and ' + s.release_downloads.toLocaleString('en') + ' release file downloads"><strong>' + n.format(total) + '</strong> downloads</span>';
+          '<a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener"><strong>' + n.format(s.container_pulls) + '</strong> image pulls</a>';
         el.hidden = false;
       }).catch(function () {});
     </script>
