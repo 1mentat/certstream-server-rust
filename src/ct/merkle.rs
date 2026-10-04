@@ -106,30 +106,42 @@ impl HttpTileReader {
         }
     }
 
-    fn fetch(&self, path: &str) -> Result<Vec<u8>, tlog_tiles::Error> {
+    fn fetch(&self, path: &str) -> Fetched {
         let url = format!("{}/{}", self.base_url, path);
         let client = self.client.clone();
         let timeout = self.timeout;
-        let fetch_url = url.clone();
         let limiter = self.rate_limiter.clone();
-        self.handle
-            .block_on(async move {
-                if let Some(limiter) = &limiter {
-                    limiter.tick().await;
-                }
-                let resp = client.get(&fetch_url).timeout(timeout).send().await.ok()?;
-                if !resp.status().is_success() {
-                    debug!(url = %fetch_url, status = %resp.status(), "hash tile request rejected");
-                    return None;
-                }
-                resp.bytes().await.ok()
-            })
-            .map(|b| b.to_vec())
-            .ok_or_else(|| {
+        self.handle.block_on(async move {
+            if let Some(limiter) = &limiter {
+                limiter.tick().await;
+            }
+            let Ok(resp) = client.get(&url).timeout(timeout).send().await else {
                 debug!(%url, "hash tile fetch failed");
-                tlog_tiles::Error::InvalidTile
-            })
+                return Fetched::Failed;
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                debug!(%url, %status, "hash tile request rejected");
+                return if status == reqwest::StatusCode::NOT_FOUND {
+                    Fetched::NotFound
+                } else {
+                    Fetched::Failed
+                };
+            }
+            match resp.bytes().await {
+                Ok(b) => Fetched::Body(b.to_vec()),
+                Err(_) => Fetched::Failed,
+            }
+        })
     }
+}
+
+/// What a hash tile request came back with. A 404 is told apart from other
+/// failures because it is the one that has a fallback for a partial tile.
+enum Fetched {
+    Body(Vec<u8>),
+    NotFound,
+    Failed,
 }
 
 /// Where a hash tile lives on a static-CT log.
@@ -139,13 +151,20 @@ impl HttpTileReader {
 /// `tile/<L>/<N>[.p/<W>]` — so using the crate's own path would 404 against
 /// every log.
 fn tile_path(tile: &Tile) -> String {
-    let n = crate::ct::static_ct::encode_tile_path(tile.level_index());
     let width = tile.width();
     if width == 1u32 << tile.height() {
-        format!("tile/{}/{}", tile.level(), n)
+        full_tile_path(tile)
     } else {
-        format!("tile/{}/{}.p/{}", tile.level(), n, width)
+        format!("{}.p/{}", full_tile_path(tile), width)
     }
+}
+
+fn full_tile_path(tile: &Tile) -> String {
+    format!(
+        "tile/{}/{}",
+        tile.level(),
+        crate::ct::static_ct::encode_tile_path(tile.level_index())
+    )
 }
 
 impl TileReader for HttpTileReader {
@@ -161,10 +180,26 @@ impl TileReader for HttpTileReader {
                 out.push(cached.clone());
                 continue;
             }
-            let data = self.fetch(&path)?;
+            let want = tile.width() as usize * 32;
+            let data = match self.fetch(&path) {
+                Fetched::Body(data) => data,
+                // A log may delete a partial tile once the full tile exists
+                // (tlog-tiles), and the full tile starts with the same hashes.
+                // Only a 404 falls back; a 429 or a timeout would just spend
+                // another request.
+                Fetched::NotFound if tile.width() != 1u32 << tile.height() => {
+                    match self.fetch(&full_tile_path(tile)) {
+                        Fetched::Body(mut full) if full.len() >= want => {
+                            full.truncate(want);
+                            full
+                        }
+                        _ => return Err(tlog_tiles::Error::InvalidTile),
+                    }
+                }
+                _ => return Err(tlog_tiles::Error::InvalidTile),
+            };
             // The verifier rejects a wrong-length tile itself, but catching it
             // here names the tile in the log line.
-            let want = tile.width() as usize * 32;
             if data.len() != want {
                 debug!(path = %path, got = data.len(), want, "hash tile has the wrong length");
                 return Err(tlog_tiles::Error::InvalidTile);
@@ -379,6 +414,90 @@ mod tests {
             matches!(verdict, Verdict::Unavailable(_)),
             "unreachable tiles must not read as an integrity failure: {verdict:?}"
         );
+    }
+
+    /// Serve `body_for(path)` for every request: `Some(bytes)` as a 200, `None`
+    /// as a 404. Returns the base URL.
+    async fn serve_tiles(body_for: fn(&str) -> Option<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let reply = match body_for(&path) {
+                        Some(body) => {
+                            let mut r = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            r.extend_from_slice(&body);
+                            r
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_vec(),
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn full_tile_bytes() -> Vec<u8> {
+        (0..256 * 32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A log may delete a partial tile once the full tile exists (tlog-tiles),
+    /// so a 404 on `.p/W` is not "unavailable" while the full tile can still
+    /// be read. Its first W hashes are the partial tile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_partial_tile_is_read_from_the_full_tile() {
+        let base = serve_tiles(|path| {
+            (!path.contains(".p/")).then(full_tile_bytes)
+        })
+        .await;
+        let reader = HttpTileReader::new(
+            &base,
+            reqwest::Client::new(),
+            Duration::from_secs(2),
+            tokio::runtime::Handle::current(),
+            None,
+        );
+        let partial = Tile::new(TILE_HEIGHT, 0, 7, 42, false);
+
+        let tiles = tokio::task::spawn_blocking(move || reader.read_tiles(&[partial]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(tiles[0], full_tile_bytes()[..42 * 32]);
+    }
+
+    /// With the full tile missing too, the log has not grown past that tile
+    /// yet: genuinely unavailable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_tile_with_no_full_tile_is_unavailable() {
+        let base = serve_tiles(|_| None).await;
+        let reader = HttpTileReader::new(
+            &base,
+            reqwest::Client::new(),
+            Duration::from_secs(2),
+            tokio::runtime::Handle::current(),
+            None,
+        );
+        let partial = Tile::new(TILE_HEIGHT, 0, 7, 42, false);
+
+        let result = tokio::task::spawn_blocking(move || reader.read_tiles(&[partial]))
+            .await
+            .unwrap();
+
+        assert!(result.is_err());
     }
 
     /// The layout bug this cost a live run to find: `Tile::path()` is the Go
