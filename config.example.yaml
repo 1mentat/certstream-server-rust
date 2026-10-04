@@ -104,6 +104,11 @@ ct_log:
   operator_rate_limits: {}
   # User-Agent for all outbound HTTP. Some operators (e.g. Geomys) apply a
   # more generous rate limit tier to clients that include a contact email.
+  # GoDaddy limits by the product and version at the start of the string
+  # (tested: certstream-server-rust/1.6.0 is refused with a 429 even with text
+  # after it, other names are accepted), and the default is shared by every
+  # install. Use a name of your own, for example
+  # "yourname-monitor/1.0 (you@example.com)".
   # Unset or blank defaults to certstream-server-rust/{VERSION}.
   # (env: CERTSTREAM_USER_AGENT)
   user_agent: null

@@ -16,6 +16,12 @@ The hourly refresh probes every catalog log and dropped the ones that did not an
 
 Google's `all_logs_list.json` omits `description` on test and pending logs, and one such entry made the whole list fail to parse (147 entries). Entries without a description are now named by their URL. The list is informational and was never authoritative, so watchers were not affected.
 
+### Watchers that give up
+
+A watcher that could not read its log's first checkpoint exited for good, and the refresh did not start it again because the key was still in the pool, so a log that was rate limiting at startup stayed dead until the process restarted. The supervisor now starts such a watcher again after 30 seconds, doubling up to 15 minutes, and starting over once it has run for ten. A refused checkpoint is reported as its HTTP status instead of as a malformed checkpoint.
+
+GoDaddy's limit is keyed on the start of the User-Agent. In a test, `certstream-server-rust/1.6.0` was refused with a 429 whether or not text followed it, while any other name was accepted. The default is shared by every install, so set `CERTSTREAM_USER_AGENT` to a name of your own for GoDaddy's logs.
+
 ### Static-CT inclusion verification
 
 A log may delete a partial hash tile once the full tile exists, and the verifier turned every 404 on a partial tile into `inclusion: unverified`. A 404 on a partial tile now falls back to the full tile. Over six minutes with full verification, Google tiles reported as unverifiable went from 81 to 0. A 429 or a timeout still reads as unverifiable, which is what remains for Geomys, Microsec and GoDaddy.
