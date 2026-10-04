@@ -392,12 +392,12 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
                     <tbody>
                         <tr><td><code>off</code></td><td>Nothing beyond the checkpoint signature</td><td>None</td></tr>
                         <tr><td><code>consistency</code></td><td>Each new checkpoint extends the previous one, so the log has not rewritten history</td><td>A few hash-tile fetches per checkpoint</td></tr>
-                        <tr><td><code>full</code></td><td>Consistency, plus that every ingested entry is in the signed tree</td><td>Fetches and hashing proportional to ingest</td></tr>
+                        <tr><td><code>full</code></td><td>Consistency, plus that every ingested entry is in the signed tree</td><td>Hash tile fetches for every data tile, from the same per-operator request budget as ingest</td></tr>
                     </tbody>
                 </table>
 <pre><code>CERTSTREAM_STATIC_CT_MERKLE_VERIFICATION=full certstream-server-rust</code></pre>
-                <p style="margin-top: 1rem;">If a tile cannot be fetched (a 429, or a partial tile the log has moved past), the entry is treated as unverified rather than invalid: it is marked <code>inclusion: unverified</code> and delivery continues. Only a hash mismatch drops the tile. The two outcomes are counted separately as <code>certstream_static_ct_inclusion_unavailable</code> and <code>certstream_static_ct_inclusion_failed</code>, with the same split for consistency.</p>
-                <p>Verification fetches use the same per-operator rate limiter as ingest, so enabling this does not increase the request rate an operator sees. Consistency is anchored on the first checkpoint of each process; the previous root is held in memory rather than the state file, so a restart re-anchors instead of proving continuity across it.</p>
+                <p style="margin-top: 1rem;">If a tile cannot be fetched (a 429, a timeout, or a partial tile at the head of the log that has no full tile yet), the entry is treated as unverified rather than invalid: it is marked <code>inclusion: unverified</code> and delivery continues. A partial tile the log has since deleted is read from the full tile instead. Only a hash mismatch drops the tile. The two outcomes are counted separately as <code>certstream_static_ct_inclusion_unavailable</code> and <code>certstream_static_ct_inclusion_failed</code>, with the same split for consistency.</p>
+                <p>Verification fetches use the same per-operator rate limiter as ingest, so enabling this does not increase the request rate an operator sees. The cost is that ingest gets a smaller share of that budget: in a 12 minute test with the default limits, the share of new static-CT entries read fell from about 100% to 47% for Let's Encrypt and 64% for IPng Networks. Consistency is anchored on the first checkpoint of each process; the previous root is held in memory rather than the state file, so a restart re-anchors instead of proving continuity across it.</p>
                 <p>Measured over 80 seconds against the live static-CT log set: 36,570 entries verified as included and 78 consistency proofs verified, with 11 tiles and 4 proofs unavailable and no mismatches.</p>
             </div>
         </section>
@@ -776,6 +776,18 @@ docker compose up -d</pre>
                     <div class="stat-cell"><div class="num">0</div><div class="lbl">Messages missed by subscribers</div></div>
                 </div>
                 <p style="margin-top: 1rem;">Throughput and resource use do not describe how current the stream is. Over the same run the median log sat about 20 minutes behind its head, and 19 of 45 logs were more than 5,000 entries behind, with no subscriber loss and no runaway growth. The delay rose during initial catch-up, peaked near 29 minutes, and then held. <code>certstream_ct_log_ingest_delay_seconds</code> and <code>certstream_ct_log_lag_entries</code> report both figures per log; <code>soak/measure.sh</code> samples them alongside CPU and RSS.</p>
+                <h3>Keeping up with the logs</h3>
+                <p>How fast the server can read a log is bounded by <code>ct_log.default_operator_rate_limit_ms</code> (500 ms), a single request budget shared by all of an operator's logs. In four 12 minute runs from a clean state, with no subscribers and full verification off, the share of new entries read was roughly half at the default, and the operators with many classic logs fell furthest behind. Lowering the budget to 250 ms for the large operators raised what was read from them noticeably, while 100 ms added little more and drew more 429 responses (408 against 295 at the default over the same period).</p>
+                <table class="endpoints-table">
+                    <thead><tr><th>Entries read per second</th><th>500 ms (default)</th><th>250 ms</th><th>100 ms</th></tr></thead>
+                    <tbody>
+                        <tr><td>Google</td><td>192</td><td>464</td><td>499</td></tr>
+                        <tr><td>DigiCert</td><td>16</td><td>89</td><td>105</td></tr>
+                        <tr><td>Let's Encrypt</td><td>306</td><td>403</td><td>429</td></tr>
+                        <tr><td>IPng Networks</td><td>187</td><td>194</td><td>201</td></tr>
+                    </tbody>
+                </table>
+                <p>The limit was changed only for Google, DigiCert, Sectigo, Cloudflare, Let's Encrypt and TrustAsia, through <code>ct_log.operator_rate_limits</code>. Geomys read little at any setting because it answers with 429 regardless; its limits are higher for clients that send a contact address in <code>CERTSTREAM_USER_AGENT</code>. Lowering the budget raises the request rate an operator sees, so do it for operators that serve heavy monitoring traffic and watch <code>certstream_ct_log_rate_limited_total</code>.</p>
                 <p style="margin-top: 24px; color: var(--ink-3); font-size: 0.9rem; max-width: 70ch;">
                     Results are specific to this benchmark and will vary by host and workload.
                 </p>
