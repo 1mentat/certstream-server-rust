@@ -2,7 +2,7 @@
 
 ## v1.6.1: Shutdown, catalog refresh and verification fixes
 
-**Release date:** unreleased
+**Release date:** October 4, 2026
 
 Fixes found by running v1.6.0 for almost four hours against the live logs with every feature enabled.
 
