@@ -46,6 +46,7 @@ async fn start() -> Harness {
         streams: Arc::new(StreamConfig::default()),
         stats: Arc::new(ServerStats::new()),
         filters: Arc::clone(&filters),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     });
 
     let app = Router::new()

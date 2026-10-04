@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_util::sync::WaitForCancellationFutureOwned;
 use tracing::{debug, info};
 
 use crate::lag_policy::LagWindow;
@@ -94,6 +95,7 @@ pub async fn handle_sse_stream(
         pending_bytes: 0,
         lag: LagWindow::new(Instant::now()),
         closing: false,
+        shutdown: Box::pin(state.shutdown.clone().cancelled_owned()),
         _slot: slot,
     };
 
@@ -134,6 +136,9 @@ struct SseStreamWrapper {
     lag: LagWindow,
     /// Set once the drop budget is spent; the next poll ends the stream.
     closing: bool,
+    /// Ends the stream when the server is stopping, so graceful shutdown does
+    /// not wait for a client that would otherwise stay connected indefinitely.
+    shutdown: std::pin::Pin<Box<WaitForCancellationFutureOwned>>,
     _slot: ConnectionGuard,
 }
 
@@ -168,9 +173,10 @@ impl futures_util::Stream for SseStreamWrapper {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
         use std::task::Poll;
 
-        if self.closing {
+        if self.closing || self.shutdown.as_mut().poll(cx).is_ready() {
             return Poll::Ready(None);
         }
 

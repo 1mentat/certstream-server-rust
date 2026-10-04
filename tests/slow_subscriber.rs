@@ -23,6 +23,7 @@ use certstream_server_rust::models::PreSerializedMessage;
 use certstream_server_rust::sse::handle_sse_stream;
 use certstream_server_rust::websocket::{handle_lite_stream, AppState, ConnectionCounter};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// Smaller than any real deployment so a burst overruns it immediately —
 /// what matters is that the receiver falls behind, not by how much.
@@ -40,6 +41,8 @@ struct Harness {
     addr: SocketAddr,
     tx: broadcast::Sender<Arc<PreSerializedMessage>>,
     limiter: Arc<ConnectionLimiter>,
+    shutdown: CancellationToken,
+    server: tokio::task::JoinHandle<()>,
 }
 
 impl Harness {
@@ -56,7 +59,9 @@ impl Harness {
             None,
         );
 
+        let shutdown = CancellationToken::new();
         let state = Arc::new(AppState {
+            shutdown: shutdown.clone(),
             tx: tx.clone(),
             connections: ConnectionCounter::new(),
             limiter: Arc::clone(&limiter),
@@ -72,15 +77,23 @@ impl Harness {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let stop = shutdown.clone();
+        let server = tokio::spawn(async move {
             let _ = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
+            .with_graceful_shutdown(async move { stop.cancelled().await })
             .await;
         });
 
-        Self { addr, tx, limiter }
+        Self {
+            addr,
+            tx,
+            limiter,
+            shutdown,
+            server,
+        }
     }
 
     /// `broadcast::Sender::send` is synchronous and non-blocking, so this
@@ -345,4 +358,37 @@ async fn aborted_websocket_handshake_does_not_leak_a_slot() {
         0,
         "aborted handshakes must not accumulate connection slots"
     );
+}
+
+/// SIGTERM with clients attached: axum's graceful shutdown waits for every
+/// connection to finish, and a WebSocket or SSE stream never does on its own,
+/// so the process used to sit there until the clients went away (observed:
+/// more than four minutes). Both stream kinds must end when the server is told
+/// to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_streams_end_when_the_server_shuts_down() {
+    let h = Harness::start().await;
+
+    let mut ws = connect(h.addr, &ws_request(h.addr));
+    assert!(read_response_head(&mut ws).starts_with("HTTP/1.1 101"));
+    let mut sse = connect(h.addr, &sse_request(h.addr, "lite"));
+    assert!(read_response_head(&mut sse).starts_with("HTTP/1.1 200"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    h.shutdown.cancel();
+
+    let (ws_closed, sse_closed) = tokio::task::spawn_blocking(move || {
+        let (_, ws_closed) = read_until_end(&mut ws, Duration::from_secs(5));
+        let (_, sse_closed) = read_until_end(&mut sse, Duration::from_secs(5));
+        (ws_closed, sse_closed)
+    })
+    .await
+    .unwrap();
+
+    assert!(ws_closed, "the WebSocket must be closed on shutdown");
+    assert!(sse_closed, "the SSE response must end on shutdown");
+    tokio::time::timeout(Duration::from_secs(5), h.server)
+        .await
+        .expect("the server must finish shutting down with clients attached")
+        .unwrap();
 }

@@ -1,6 +1,6 @@
 use axum::{
     extract::{
-        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+        ws::{close_code, CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
         ConnectInfo, Query, State,
     },
     http::StatusCode,
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::{interval, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::config::StreamConfig;
@@ -31,6 +32,10 @@ pub struct AppState {
     pub streams: Arc<StreamConfig>,
     pub stats: Arc<crate::api::ServerStats>,
     pub filters: Arc<FilterHub>,
+    /// Cancelled when the server is asked to stop. Streams never finish on
+    /// their own, so each one ends itself on this; otherwise graceful
+    /// shutdown waits for the last client to leave.
+    pub shutdown: CancellationToken,
 }
 
 /// What a streaming endpoint reads from.
@@ -268,6 +273,15 @@ async fn handle_socket(
     loop {
         tokio::select! {
             biased;
+
+            _ = state.shutdown.cancelled() => {
+                let going_away = Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: Utf8Bytes::from_static("server shutting down"),
+                }));
+                send_with_deadline(&mut sender, going_away, WRITE_TIMEOUT).await;
+                break;
+            }
 
             msg = receiver.next() => {
                 match msg {
