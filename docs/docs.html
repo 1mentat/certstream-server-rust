@@ -856,15 +856,19 @@ docker compose up -d</pre>
             <div class="wrap">
                 <div class="section-header">
                     <h2>CT logs monitored</h2>
-                    <p>The server monitors Chrome- and Apple-trusted Certificate Transparency logs and deduplicates certificates that appear in more than one log.</p>
+                    <p>The server monitors Chrome- and Apple-trusted Certificate Transparency logs and deduplicates certificates that appear in more than one log. The list below is the set at the time of writing; the catalogs change and the server follows them hourly.</p>
                 </div>
                 <div class="features-list">
-                    <div class="feature-item"><h3>Google</h3><p>Argon, Xenon</p></div>
-                    <div class="feature-item"><h3>Cloudflare</h3><p>Nimbus, Raio (static CT)</p></div>
+                    <div class="feature-item"><h3>Google</h3><p>Argon, Xenon, ParcelYard (static CT), PlumbersArms (static CT)</p></div>
+                    <div class="feature-item"><h3>Cloudflare</h3><p>Nimbus</p></div>
                     <div class="feature-item"><h3>DigiCert</h3><p>Wyvern, Sphinx</p></div>
                     <div class="feature-item"><h3>Sectigo</h3><p>Elephant, Tiger, Mammoth, Sabre</p></div>
                     <div class="feature-item"><h3>Let's Encrypt</h3><p>Willow, Sycamore (static CT)</p></div>
-                    <div class="feature-item"><h3>TrustAsia · Geomys · IPng</h3><p>HETU, Luoshu, Tuscolo, Halloumi, Gouda</p></div>
+                    <div class="feature-item"><h3>TrustAsia</h3><p>log2026a and b, HETU, Luoshu (static CT)</p></div>
+                    <div class="feature-item"><h3>Geomys</h3><p>Tuscolo, Trastevere (static CT)</p></div>
+                    <div class="feature-item"><h3>IPng Networks</h3><p>Halloumi, Gouda (static CT)</p></div>
+                    <div class="feature-item"><h3>Microsec</h3><p>Eszigno (static CT)</p></div>
+                    <div class="feature-item"><h3>GoDaddy</h3><p>Aquamarine (static CT)</p></div>
                 </div>
             </div>
         </section>
