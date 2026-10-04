@@ -1,5 +1,37 @@
 # Release Notes
 
+## v1.6.1: Shutdown, catalog refresh and verification fixes
+
+**Release date:** unreleased
+
+Fixes found by running v1.6.0 for almost four hours against the live logs with every feature enabled.
+
+### Shutdown
+
+SIGTERM with a WebSocket or SSE client connected left the process running until the client went away. In the test run it needed SIGKILL after 247 seconds, and Docker stops a container after 10. Open streams now end when the server is told to stop: WebSocket clients receive a going away close frame, SSE responses end. With both kinds connected the process exits in about 0.1 seconds.
+
+### Log list refresh
+
+The hourly refresh probes every catalog log and dropped the ones that did not answer, so a log that was slow or rate limiting looked delisted and its watcher was stopped for good. Five Microsec logs and Argon2026h2 were lost this way while the catalog still listed them. A log that fails the probe is now kept in the listed set: it blocks starting a new watcher, and it never stops a running one.
+
+Google's `all_logs_list.json` omits `description` on test and pending logs, and one such entry made the whole list fail to parse (147 entries). Entries without a description are now named by their URL. The list is informational and was never authoritative, so watchers were not affected.
+
+### Static-CT inclusion verification
+
+A log may delete a partial hash tile once the full tile exists, and the verifier turned every 404 on a partial tile into `inclusion: unverified`. A 404 on a partial tile now falls back to the full tile. Over six minutes with full verification, Google tiles reported as unverifiable went from 81 to 0. A 429 or a timeout still reads as unverifiable, which is what remains for Geomys, Microsec and GoDaddy.
+
+### Domains-only stream
+
+Certificates that carry only IP address SANs, which Let's Encrypt now issues, have no DNS names. The domains-only stream sent them as `dns_entries` with an empty array, about 1.2% of its messages. They are no longer sent there. The lite and full streams are unchanged.
+
+### Dependencies
+
+`h2` 0.4.14 (RUSTSEC-2026-0258) and `rustls` 0.23.40 (RUSTSEC-2026-0285) are updated, along with `crossbeam-epoch` and two lockfile-only entries. `paste` and `rsa` remain flagged by advisory databases and have no fixed release; `rsa` is used only to verify signatures.
+
+### Documentation
+
+The list of monitored logs is current, and the performance page now measures how the per-operator request budget limits catch-up speed and what full verification costs.
+
 ## v1.6.0: Verification, filtering, and durable output
 
 **Release date:** September 5, 2026
