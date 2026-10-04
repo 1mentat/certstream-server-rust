@@ -670,6 +670,21 @@ struct WatcherPool {
 struct ResolvedLogs {
     logs: Vec<ct::CtLog>,
     local_keys: std::collections::HashSet<String>,
+    /// Catalog logs that did not answer the availability probe. No watcher is
+    /// started for them, but they are still listed, so one that is already
+    /// running is not mistaken for a delisted log.
+    unreachable_keys: std::collections::HashSet<String>,
+}
+
+impl ResolvedLogs {
+    /// Every log the catalog currently lists, answering or not.
+    fn listed_keys(&self) -> std::collections::HashSet<String> {
+        self.logs
+            .iter()
+            .map(watcher_key)
+            .chain(self.unreachable_keys.iter().cloned())
+            .collect()
+    }
 }
 
 async fn resolve_logs(config: &Config, ctx: &WatcherContext) -> Result<ResolvedLogs, String> {
@@ -677,7 +692,7 @@ async fn resolve_logs(config: &Config, ctx: &WatcherContext) -> Result<ResolvedL
 
     // Drive the signed-catalog registry. Per-source authority comes from
     // ct_log.catalog_authority_overrides; signature verification gates auto-spawn.
-    let mut all_logs = fetch_log_list(
+    let discovered = fetch_log_list(
         &ctx.client,
         &ct::catalog::catalog_registry(),
         &config.ct_log.catalog_authority_overrides,
@@ -687,6 +702,9 @@ async fn resolve_logs(config: &Config, ctx: &WatcherContext) -> Result<ResolvedL
     )
     .await
     .map_err(|e| format!("failed to fetch any CT log list: {e}"))?;
+    let unreachable_keys: std::collections::HashSet<String> =
+        discovered.unreachable.iter().map(watcher_key).collect();
+    let mut all_logs = discovered.reachable;
 
     // Splice in configured static logs by expected CT log ID when provided.
     // A configured static log with the same CT log ID as a discovered log
@@ -753,6 +771,7 @@ async fn resolve_logs(config: &Config, ctx: &WatcherContext) -> Result<ResolvedL
     Ok(ResolvedLogs {
         logs: all_logs,
         local_keys,
+        unreachable_keys,
     })
 }
 
@@ -795,9 +814,9 @@ fn reconcile_pool(
 ) -> (usize, usize, usize, usize) {
     use ct::LogType;
 
-    let ResolvedLogs { logs, local_keys } = resolved;
+    let present = resolved.listed_keys();
+    let ResolvedLogs { logs, local_keys, .. } = resolved;
     let local_keys = &local_keys;
-    let present: std::collections::HashSet<String> = logs.iter().map(watcher_key).collect();
 
     // Partition by type — the two watcher pools differ in protocol.
     let (rfc_logs, static_logs): (Vec<_>, Vec<_>) =
@@ -898,6 +917,7 @@ async fn discover_and_spawn(
             ResolvedLogs {
                 logs: Vec::new(),
                 local_keys: std::collections::HashSet::new(),
+                unreachable_keys: std::collections::HashSet::new(),
             }
         }
     };
@@ -1025,9 +1045,10 @@ async fn run_backfill(request: Result<cli::BackfillArgs, String>, config: &Confi
     )
     .await
     {
-        Ok(mut discovered) => {
-            discovered.extend(config.static_logs.iter().cloned().map(ct::CtLog::from));
-            discovered
+        Ok(discovered) => {
+            let mut logs = discovered.reachable;
+            logs.extend(config.static_logs.iter().cloned().map(ct::CtLog::from));
+            logs
         }
         Err(e) => {
             eprintln!("failed to fetch the CT log list: {e}");
@@ -1629,6 +1650,37 @@ mod tests {
 
         assert_eq!(stopped, 0);
         assert!(!delisted.is_cancelled());
+    }
+
+    /// A log the catalog still lists but that failed this cycle's availability
+    /// probe is slow or throttling us, not delisted. Stopping its watcher
+    /// would lose the log until the next restart.
+    #[test]
+    fn a_listed_log_that_failed_the_probe_keeps_its_watcher() {
+        let tracker = LogTracker::new();
+        let mut pool = WatcherPool::default();
+        let throttled = test_log("Eszigno", "https://eszigno.example/2026h2/", Some("abc="));
+        let watcher = running(
+            &mut pool,
+            &watcher_key(&throttled),
+            &throttled.normalized_url(),
+            false,
+        );
+        let resolved = ResolvedLogs {
+            logs: Vec::new(),
+            local_keys: HashSet::new(),
+            unreachable_keys: HashSet::from([watcher_key(&throttled)]),
+        };
+
+        let stopped = retire_absent(
+            &mut pool,
+            &resolved.listed_keys(),
+            RemovedLogPolicy::Stop,
+            &tracker,
+        );
+
+        assert_eq!(stopped, 0);
+        assert!(!watcher.is_cancelled());
     }
 
     /// Retiring a watcher has to take the log out of the tracker too, or

@@ -521,6 +521,15 @@ fn count_unknown_state_enum(source_name: &str, state: Option<&LogState>) {
     }
 }
 
+/// What discovery resolved: the logs to run watchers for, and the catalog logs
+/// that did not answer the availability probe. The second set is kept apart
+/// rather than discarded, so a refresh can tell a log that is slow or
+/// throttling from one the catalog dropped.
+pub struct DiscoveredLogs {
+    pub reachable: Vec<CtLog>,
+    pub unreachable: Vec<CtLog>,
+}
+
 /// Discover CT logs from the signed catalog registry and append the operator's
 /// `custom_logs`. Each catalog is fetched and signature-verified; only entries
 /// whose source resolves to runtime-authoritative drive auto-spawn.
@@ -537,7 +546,7 @@ pub async fn fetch_log_list(
     custom_logs: Vec<CustomCtLog>,
     request_timeout: Duration,
     user_agent: &str,
-) -> Result<Vec<CtLog>, LogListError> {
+) -> Result<DiscoveredLogs, LogListError> {
     // Apple has no detached signature, so it is fetched through a dedicated
     // client that pins the issuer-CA SPKI on top of WebPKI validation. If that
     // client cannot be built, Apple is skipped this cycle rather than fetched
@@ -629,21 +638,22 @@ pub async fn fetch_log_list(
         .map(|log| {
             let client = client.clone();
             async move {
-                if probe_log(&client, &log).await {
-                    Some(log)
-                } else {
-                    None
-                }
+                let reachable = probe_log(&client, &log).await;
+                (log, reachable)
             }
         })
         .collect();
 
-    let results = join_all(health_checks).await;
-    let mut logs: Vec<CtLog> = results.into_iter().flatten().collect();
+    let (reachable, unreachable): (Vec<_>, Vec<_>) = join_all(health_checks)
+        .await
+        .into_iter()
+        .partition(|(_, reachable)| *reachable);
+    let mut logs: Vec<CtLog> = reachable.into_iter().map(|(log, _)| log).collect();
+    let unreachable: Vec<CtLog> = unreachable.into_iter().map(|(log, _)| log).collect();
 
-    let filtered_count = logs.len();
     info!(
-        reachable = filtered_count,
+        reachable = logs.len(),
+        unreachable = unreachable.len(),
         "CT log availability check complete"
     );
 
@@ -655,7 +665,10 @@ pub async fn fetch_log_list(
         return Err(LogListError::NoLogs);
     }
 
-    Ok(logs)
+    Ok(DiscoveredLogs {
+        reachable: logs,
+        unreachable,
+    })
 }
 
 #[cfg(test)]
