@@ -1265,6 +1265,7 @@ fn build_router(protocols: &config::ProtocolConfig, config: &Config, deps: Route
         limiter: connection_limiter.clone(),
         streams: streams.clone(),
         stats: server_stats.clone(),
+        shutdown: shutdown_token.clone(),
     });
     let auth_middleware_state = Arc::new(AuthMiddleware::new(
         &config.auth,
