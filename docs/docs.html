@@ -19,12 +19,11 @@
     <meta property="og:url" content="https://certstream.dev/docs.html">
     <meta property="og:title" content="certstream-server-rust API documentation">
     <meta property="og:description" content="WebSocket and SSE API documentation for certstream-server-rust, including message formats, configuration, metrics, and REST endpoints.">
-    <meta name="theme-color" content="#b7410e">
+    <meta name="theme-color" content="#ffffff">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
-    <link rel="alternate" type="application/rss+xml" title="certstream-server-rust blog" href="/feed.xml">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
     <script>
       // Applied before first paint so the page never flashes the wrong theme.
       (function () {
@@ -82,14 +81,13 @@
 <body>
     <header>
         <div class="wrap">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <nav>
                 <ul class="nav-links">
                     <li><a href="/">Home</a></li>
                     <li><a href="docs.html" class="active">API Docs</a></li>
                     <li><a href="quickstart.html">Quick Start</a></li>
                     <li><a href="architecture.html">Architecture</a></li>
-                    <li><a href="/blog/">Blog</a></li>
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
@@ -105,7 +103,7 @@
     </header>
     <div class="mobile-nav" id="mobile-nav">
         <div class="mobile-nav-header">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <button class="mobile-nav-close" onclick="document.getElementById('mobile-nav').classList.remove('active')">&times;</button>
         </div>
         <ul class="mobile-nav-links">
@@ -113,7 +111,6 @@
             <li><a href="docs.html" class="active">API Docs</a></li>
             <li><a href="quickstart.html">Quick Start</a></li>
             <li><a href="architecture.html">Architecture</a></li>
-            <li><a href="/blog/">Blog</a></li>
             <li><a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
@@ -121,7 +118,6 @@
     <main>
         <div class="wrap">
             <div class="page-header">
-                <span class="eyebrow">API reference</span>
                 <h1>Certstream API</h1>
                 <p>WebSocket and SSE endpoints for consuming the certificate stream, plus configuration for self-hosted instances.</p>
             </div>
@@ -130,17 +126,15 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Overview</span>
                     <h2>What is Certstream?</h2>
-                    <p>Certificate Transparency log aggregation over WebSocket and SSE.</p>
                 </div>
                 <div class="features-list cols-2">
                     <div class="feature-item">
                         <h3>What it does</h3>
-                        <p>Certstream reads certificates from Certificate Transparency logs and streams them to connected clients. This Rust implementation speaks the same message format as certstream-server (Elixir) and certstream-server-go, so existing clients work against it unchanged.</p>
+                        <p>Certstream reads certificates from Certificate Transparency logs and streams them to connected clients. This Rust server uses the same message format as certstream-server (Elixir) and certstream-server-go, so existing clients work unchanged.</p>
                     </div>
                     <div class="feature-item">
-                        <h3>Avoiding repeated work</h3>
+                        <h3>Implementation notes</h3>
                         <ul>
                             <li>Messages are serialized once and shared between subscribers through <code>Arc&lt;PreSerializedMessage&gt;</code></li>
                             <li>JSON serialization is skipped when no clients are connected</li>
@@ -156,7 +150,6 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Message format</span>
                     <h2>certificate_update</h2>
                     <p>The default and full streams use the <code>certificate_update</code> message type.</p>
                 </div>
@@ -225,7 +218,6 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Message format</span>
                     <h2>dns_entries</h2>
                     <p>The <code>/domains-only</code> WebSocket endpoint and <code>/sse?stream=domains</code> use a smaller schema.</p>
                 </div>
@@ -254,9 +246,7 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Stream types</span>
                     <h2>Stream types</h2>
-                    <p>Three output formats, at three levels of detail.</p>
                 </div>
                 <div class="features-list">
                     <div class="feature-item">
@@ -278,9 +268,7 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Endpoints</span>
                     <h2>WebSocket, SSE, and HTTP</h2>
-                    <p>Endpoints exposed by the server.</p>
                 </div>
                 <h3>WebSocket</h3>
                 <table class="endpoints-table">
@@ -329,7 +317,6 @@
         <section id="filters">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Filtering</span>
                     <h2>Server-side filters</h2>
                 </div>
                 <p style="margin-bottom: 1rem;">Every WebSocket and SSE endpoint accepts <code>domain</code> and <code>issuer</code> query parameters. Terms inside one parameter are alternatives; the two parameters narrow together.</p>
@@ -350,9 +337,7 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
         <section id="v2">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Output v2</span>
                     <h2>Version 2 messages</h2>
-                    <p>Source and verification details for each record.</p>
                 </div>
                 <p style="margin-bottom: 1rem;">Off by default. Enable with <code>CERTSTREAM_STREAM_V2_ENABLED=true</code>, then connect to <code>ws://host:8080/v2</code> or <code>/sse?stream=v2</code>. The v1 streams are the CertStream shape and are unchanged; these fields appear only in v2.</p>
 <pre><code>{
@@ -389,7 +374,7 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
                         <tr><td><code>verified</code></td><td>The check ran and passed</td></tr>
                         <tr><td><code>unverified</code></td><td>The check did not run, or could not run on this input</td></tr>
                         <tr><td><code>failed</code></td><td>The check ran and failed; <code>checkpoint_signature_mode</code> decides whether the entry is still ingested</td></tr>
-                        <tr><td><code>not_applicable</code></td><td>The check does not apply &mdash; an RFC 6962 log serves no checkpoint</td></tr>
+                        <tr><td><code>not_applicable</code></td><td>The check does not apply: an RFC 6962 log serves no checkpoint</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -398,7 +383,6 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
         <section id="merkle">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Verification</span>
                     <h2>Merkle verification</h2>
                     <p>Verify that fetched entries belong to the tree represented by the signed checkpoint.</p>
                 </div>
@@ -412,7 +396,7 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
                     </tbody>
                 </table>
 <pre><code>CERTSTREAM_STATIC_CT_MERKLE_VERIFICATION=full certstream-server-rust</code></pre>
-                <p style="margin-top: 1rem;">If a tile cannot be fetched — a 429, or a partial tile the log has moved past — the entry is treated as unverified rather than invalid: it is marked <code>inclusion: unverified</code> and delivery continues. Only a hash mismatch drops the tile. The two outcomes are counted separately as <code>certstream_static_ct_inclusion_unavailable</code> and <code>certstream_static_ct_inclusion_failed</code>, with the same split for consistency.</p>
+                <p style="margin-top: 1rem;">If a tile cannot be fetched (a 429, or a partial tile the log has moved past), the entry is treated as unverified rather than invalid: it is marked <code>inclusion: unverified</code> and delivery continues. Only a hash mismatch drops the tile. The two outcomes are counted separately as <code>certstream_static_ct_inclusion_unavailable</code> and <code>certstream_static_ct_inclusion_failed</code>, with the same split for consistency.</p>
                 <p>Verification fetches use the same per-operator rate limiter as ingest, so enabling this does not increase the request rate an operator sees. Consistency is anchored on the first checkpoint of each process; the previous root is held in memory rather than the state file, so a restart re-anchors instead of proving continuity across it.</p>
                 <p>Measured over 80 seconds against the live static-CT log set: 36,570 entries verified as included and 78 consistency proofs verified, with 11 tiles and 4 proofs unavailable and no mismatches.</p>
             </div>
@@ -421,7 +405,6 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
         <section id="names-tiles">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Collection</span>
                     <h2>Names tiles</h2>
                 </div>
                 <p style="margin-bottom: 1rem;">Some static-CT logs serve an optional extension that publishes the names on the certificates in a data tile as compact JSON lines. Set <code>CERTSTREAM_STATIC_CT_NAMES_TILES=prefer</code> to read those instead of parsing data tiles; logs that do not serve the extension fall back to the normal path automatically.</p>
@@ -434,7 +417,6 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
         <section id="jetstream">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Durable output</span>
                     <h2>NATS JetStream</h2>
                     <p>Durable delivery for consumers that may disconnect.</p>
                 </div>
@@ -454,7 +436,6 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
         <section id="backfill">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Backfill</span>
                     <h2>Historical range export</h2>
                 </div>
 <pre><code>certstream-server-rust --backfill --log "Sycamore2026h2" --start 1000 --end 2000 --out range.jsonl</code></pre>
@@ -473,9 +454,7 @@ curl -N 'http://localhost:8080/sse?stream=lite&amp;domain=example.com&amp;issuer
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Client examples</span>
                     <h2>Client examples</h2>
-                    <p>Consuming the stream from Python, Go, JavaScript, and the command line.</p>
                 </div>
                 <div class="code-examples">
                     <div class="code-example">
@@ -538,9 +517,7 @@ curl -H <span class="str">"Authorization: Bearer your-token"</span> http://local
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Self-hosting</span>
                     <h2>Run your own instance</h2>
-                    <p>Docker, Docker Compose, or a build from source.</p>
                 </div>
                 <div class="code-examples">
                     <div class="code-example">
@@ -592,7 +569,6 @@ docker compose up -d</pre>
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Configuration</span>
                     <h2>Environment variables</h2>
                     <p>All of the settings below can be set through environment variables.</p>
                 </div>
@@ -676,7 +652,7 @@ docker compose up -d</pre>
                         <tr><td><code>CERTSTREAM_DEDUP_TTL_SECS</code></td><td>900</td><td>Dedup window (seconds)</td></tr>
                     </tbody>
                 </table>
-                <p style="margin-bottom: 1rem;"><code>CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS</code> changes how many TCP connections concurrent fetches use. On its own it does not imply higher throughput; see <a href="/blog/http2-multiplexing-vs-per-connection-rate-limits.html">the measurements</a>.</p>
+                <p style="margin-bottom: 1rem;"><code>CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS</code> changes how many TCP connections concurrent fetches use. On its own it does not imply higher throughput.</p>
 
                 <h3>Verification and collection</h3>
                 <table class="endpoints-table">
@@ -716,9 +692,7 @@ docker compose up -d</pre>
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Configuration</span>
                     <h2>YAML config file</h2>
-                    <p>An example covering every section.</p>
                 </div>
                 <div class="code-example" style="max-width: 900px;">
                     <div class="code-example-header">
@@ -789,10 +763,9 @@ docker compose up -d</pre>
             </div>
         </section>
 
-        <section>
+        <section id="performance">
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Performance</span>
                     <h2>Performance</h2>
                     <p>v1.6.0 measured over a 3-hour run with the default configuration, all four stream formats enabled, and two WebSocket subscribers (one filtered).</p>
                 </div>
@@ -812,9 +785,7 @@ docker compose up -d</pre>
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Observability</span>
                     <h2>Prometheus metrics</h2>
-                    <p>Series exposed at the <code>/metrics</code> endpoint.</p>
                 </div>
                 <h3>Core</h3>
                 <table class="endpoints-table">
@@ -877,14 +848,13 @@ docker compose up -d</pre>
                         <tr><td><code>certstream_jemalloc_metadata_bytes</code></td><td>gauge</td><td>jemalloc metadata, which scales with the arena count</td></tr>
                     </tbody>
                 </table>
-                <p>The current workload settles at roughly 80 MB RSS while processing about 420 certificates per second. If process RSS is much higher than jemalloc's <code>allocated</code> or <code>resident</code> counters, check the host's Transparent Huge Pages setting with <code>cat /sys/kernel/mm/transparent_hugepage/enabled</code>. That case is described in <a href="/blog/jemalloc-transparent-huge-pages-rss.html">the jemalloc RSS write-up</a>.</p>
+                <p>The current workload settles at roughly 80 MB RSS while processing about 420 certificates per second. If process RSS is much higher than jemalloc's <code>allocated</code> or <code>resident</code> counters, check the host's Transparent Huge Pages setting with <code>cat /sys/kernel/mm/transparent_hugepage/enabled</code>.</p>
             </div>
         </section>
 
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Coverage</span>
                     <h2>CT logs monitored</h2>
                     <p>The server monitors Chrome- and Apple-trusted Certificate Transparency logs and deduplicates certificates that appear in more than one log.</p>
                 </div>
@@ -905,7 +875,6 @@ docker compose up -d</pre>
             <div class="links">
                 <a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener">Container Registry</a>
-                <a href="/blog/">Blog</a>
                 <a href="docs.html">Documentation</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
                 <a href="https://github.com/sponsors/reloading01" target="_blank" rel="noopener">Sponsor</a>

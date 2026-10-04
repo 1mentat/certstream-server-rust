@@ -19,12 +19,11 @@
     <meta property="og:url" content="https://certstream.dev/quickstart.html">
     <meta property="og:title" content="certstream-server-rust quick start">
     <meta property="og:description" content="Install certstream-server-rust, connect over WebSocket or SSE, and configure persistent CT log state. Examples for Python, JavaScript, and cURL.">
-    <meta name="theme-color" content="#b7410e">
+    <meta name="theme-color" content="#ffffff">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
-    <link rel="alternate" type="application/rss+xml" title="certstream-server-rust blog" href="/feed.xml">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
     <script>
       // Applied before first paint so the page never flashes the wrong theme.
       (function () {
@@ -70,14 +69,13 @@
 <body>
     <header>
         <div class="wrap">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <nav>
                 <ul class="nav-links">
                     <li><a href="/">Home</a></li>
                     <li><a href="docs.html">API Docs</a></li>
                     <li><a href="quickstart.html" class="active">Quick Start</a></li>
                     <li><a href="architecture.html">Architecture</a></li>
-                    <li><a href="/blog/">Blog</a></li>
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
@@ -93,7 +91,7 @@
     </header>
     <div class="mobile-nav" id="mobile-nav">
         <div class="mobile-nav-header">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <button class="mobile-nav-close" onclick="document.getElementById('mobile-nav').classList.remove('active')">&times;</button>
         </div>
         <ul class="mobile-nav-links">
@@ -101,7 +99,6 @@
             <li><a href="docs.html">API Docs</a></li>
             <li><a href="quickstart.html" class="active">Quick Start</a></li>
             <li><a href="architecture.html">Architecture</a></li>
-            <li><a href="/blog/">Blog</a></li>
             <li><a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
@@ -109,7 +106,6 @@
     <main>
         <div class="wrap">
             <div class="page-header">
-                <span class="eyebrow">Quick start</span>
                 <h1>Certstream quick start</h1>
                 <p>Run the server, connect to the stream, and configure persistent state.</p>
             </div>
@@ -118,7 +114,6 @@
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Step 01</span>
                     <h2>Run the server</h2>
                 </div>
                 <div class="code-examples">
@@ -163,11 +158,11 @@ sudo systemctl enable --now certstream-server-rust</pre>
                         <pre>cargo install certstream-server-rust</pre>
                     </div>
                 </div>
-                <p style="margin-top: 16px; color: var(--ink-3); font-size: 0.9rem;">
-                    The WebSocket stream is now available at <code>ws://localhost:8080/</code>. Packages and signed
+                <p>
+                    The stream is now on <code>ws://localhost:8080/</code>. Packages and signed
                     checksums are on the
                     <a href="https://github.com/reloading01/certstream-server-rust/releases/latest">releases page</a>.
-                    The .deb and .rpm packages install a systemd service and keep CT log positions across restarts.
+                    The .deb and .rpm packages install a systemd service and keep log positions across restarts.
                 </p>
             </div>
         </section>
@@ -175,9 +170,9 @@ sudo systemctl enable --now certstream-server-rust</pre>
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Step 02</span>
                     <h2>Connect</h2>
                 </div>
+                <h3>Full certificate stream</h3>
                 <div class="code-examples">
                     <div class="code-example">
                         <div class="code-example-header">
@@ -187,58 +182,68 @@ sudo systemctl enable --now certstream-server-rust</pre>
 
 def callback(message, context):
     if message["message_type"] == "certificate_update":
-        domains = message["data"]["leaf_cert"]["all_domains"]
-        print(domains)
+        cert = message["data"]["leaf_cert"]
+        print(cert["all_domains"])
 
-certstream.listen_for_events(callback, url="ws://localhost:8080/")</pre>
+certstream.listen_for_events(
+    callback, url="ws://localhost:8080/")</pre>
                     </div>
                     <div class="code-example">
                         <div class="code-example-header">
                             <span class="lang">JavaScript</span>
                         </div>
-                        <pre>const ws = new WebSocket("ws://localhost:8080/");
-
-ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.message_type === "certificate_update") {
-        console.log(data.data.leaf_cert.all_domains);
-    }
-};</pre>
-                    </div>
-                    <div class="code-example">
-                        <div class="code-example-header">
-                            <span class="lang">cURL</span>
-                            <span class="tag">SSE</span>
-                        </div>
-                        <pre>curl -N http://localhost:8080/sse</pre>
-                    </div>
-                    <div class="code-example">
-                        <div class="code-example-header">
-                            <span class="lang">websocat</span>
-                        </div>
-                        <pre>websocat ws://localhost:8080/</pre>
-                    </div>
-                    <div class="code-example">
-                        <div class="code-example-header">
-                            <span class="lang">JavaScript</span>
-                            <span class="tag">domains-only</span>
-                        </div>
-                        <pre class="wrap">const ws = new WebSocket("ws://localhost:8080/domains-only");
+                        <pre class="wrap">const ws = new WebSocket("ws://localhost:8080/");
 
 ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    // msg.message_type === "dns_entries"
-    // msg.data is a flat array of strings, not a nested object
-    if (msg.message_type === "dns_entries") {
-        console.log(msg.data); // ["example.com", "www.example.com"]
+    if (msg.message_type === "certificate_update") {
+        console.log(msg.data.leaf_cert.all_domains);
     }
 };</pre>
                     </div>
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Command line</span>
+                        </div>
+                        <pre class="wrap"><span class="cm"># WebSocket</span>
+websocat ws://localhost:8080/
+
+<span class="cm"># Server-Sent Events</span>
+curl -N http://localhost:8080/sse</pre>
+                    </div>
                 </div>
-                <p style="margin-top: 16px; color: var(--ink-3); font-size: 0.9rem;">
-                    The <code>/domains-only</code> stream uses <code>message_type: "dns_entries"</code>, and its
-                    <code>data</code> is a JSON array of domain names rather than a nested certificate object.
-                    For SSE, use <code>curl -N "http://localhost:8080/sse?stream=domains"</code>.
+
+                <h3>Domain names only</h3>
+                <div class="code-examples">
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">JavaScript</span>
+                        </div>
+                        <pre class="wrap">const ws = new WebSocket(
+    "ws://localhost:8080/domains-only");
+
+ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.message_type === "dns_entries") {
+        console.log(msg.data);
+        // ["example.com", "www.example.com"]
+    }
+};</pre>
+                    </div>
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Command line</span>
+                        </div>
+                        <pre class="wrap"><span class="cm"># WebSocket</span>
+websocat ws://localhost:8080/domains-only
+
+<span class="cm"># Server-Sent Events</span>
+curl -N "http://localhost:8080/sse?stream=domains"</pre>
+                    </div>
+                </div>
+                <p>
+                    The <code>/domains-only</code> stream sends <code>message_type: "dns_entries"</code>, and its
+                    <code>data</code> is a flat array of domain names instead of a nested certificate object.
                 </p>
             </div>
         </section>
@@ -246,7 +251,6 @@ ws.onmessage = (event) => {
         <section>
             <div class="wrap">
                 <div class="section-header">
-                    <span class="eyebrow">Step 03</span>
                     <h2>Persist state</h2>
                 </div>
                 <div class="code-examples" style="grid-template-columns: 1fr;">
@@ -264,9 +268,9 @@ ws.onmessage = (event) => {
   ghcr.io/reloading01/certstream-server-rust:latest</pre>
                     </div>
                 </div>
-                <p style="margin-top: 16px; color: var(--ink-3); font-size: 0.9rem;">
-                    The state file stores the current CT log positions so the server can resume after a restart.
-                    See the <a href="docs.html">API documentation</a> for the full configuration reference.
+                <p>
+                    The state file records how far each CT log has been read, so the server resumes after a restart.
+                    The full configuration reference is in the <a href="docs.html">API documentation</a>.
                 </p>
             </div>
         </section>
@@ -277,7 +281,6 @@ ws.onmessage = (event) => {
             <div class="links">
                 <a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener">Container Registry</a>
-                <a href="/blog/">Blog</a>
                 <a href="docs.html">Documentation</a>
                 <a href="https://github.com/reloading01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
                 <a href="https://github.com/sponsors/reloading01" target="_blank" rel="noopener">Sponsor</a>
