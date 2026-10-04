@@ -183,14 +183,6 @@ cargo install certstream-server-rust
 
 The Homebrew formula is updated automatically by the release workflow for each tag.
 
-### Engineering notes
-
-Operational write-ups are available at [certstream.dev/blog](https://certstream.dev/blog/), including:
-
-- [jemalloc, transparent huge pages, and retained RSS](https://certstream.dev/blog/jemalloc-transparent-huge-pages-rss.html)
-- [CT logs that serve tiles without checkpoints](https://certstream.dev/blog/ct-logs-tiles-without-checkpoint.html)
-- [HTTP/2 multiplexing and per-connection rate limits](https://certstream.dev/blog/http2-multiplexing-vs-per-connection-rate-limits.html)
-
 ### Upgrade
 
 No server-side migration is required. The binary is unchanged from v1.5.5.
