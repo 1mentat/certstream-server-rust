@@ -1047,6 +1047,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     .map_err(|e| e.to_string())
             } else {
                 match client.get(&checkpoint_url).timeout(timeout).send().await {
+                    Ok(resp) if !resp.status().is_success() => Err(format!("HTTP {}", resp.status())),
                     Ok(resp) => match resp.text().await {
                         Ok(text) => match parse_checkpoint(&text, &expected_origin) {
                             Some(cp) => {
@@ -1081,7 +1082,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             log = %log.description,
                             attempts = attempt,
                             error = %reason,
-                            "initial checkpoint fetch failed after retries, exiting watcher"
+                            "initial checkpoint fetch failed after retries; the supervisor will start the watcher again"
                         );
                         counter_checkpoint_errors.increment(1);
                         metrics::counter!("certstream_worker_init_failures").increment(1);

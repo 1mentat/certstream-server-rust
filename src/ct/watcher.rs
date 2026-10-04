@@ -398,7 +398,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             }
             // H-1 fix: do not silently start from 0 — let the supervisor restart us.
             Err(e) => {
-                error!(log = %log.description, error = %e, "failed to get initial tree size after retries, exiting watcher");
+                error!(log = %log.description, error = %e, "failed to get initial tree size after retries; the supervisor will start the watcher again");
                 metrics::counter!("certstream_worker_init_failures").increment(1);
                 return;
             }
