@@ -343,6 +343,9 @@ async fn handle_socket(
                             StreamType::DomainsOnly => msg.domains_only.clone(),
                             StreamType::V2 => msg.v2.clone(),
                         };
+                        if text.is_empty() {
+                            continue;
+                        }
                         let frame_len = text.len() as u64;
                         if !send_with_deadline(&mut sender, Message::Text(text), WRITE_TIMEOUT).await {
                             break;

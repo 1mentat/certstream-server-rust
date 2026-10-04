@@ -239,6 +239,8 @@ pub struct PreSerializedMessage {
     pub lite: Utf8Bytes,
     pub domains_only: Utf8Bytes,
     pub v2: Utf8Bytes,
+    // Each payload above is empty when its stream is disabled or the message
+    // has nothing to say on it; senders skip empty payloads.
     /// The parsed leaf, retained only while a server-side filter exists, so
     /// filter matching reads structured fields instead of substring-searching
     /// serialized JSON. An `Arc` bump rather than a copy, and the certificate
@@ -306,7 +308,9 @@ impl PreSerializedMessage {
             Utf8Bytes::from_static("")
         };
 
-        let domains_only = if streams.domains_only {
+        // An IP address certificate carries no DNS names. Left empty, the
+        // fan-out paths skip it rather than send `"data": []`.
+        let domains_only = if streams.domains_only && !msg.data.leaf_cert.all_domains.is_empty() {
             serialize_utf8(&msg.to_domains_only(), 512)?
         } else {
             Utf8Bytes::from_static("")
@@ -751,6 +755,18 @@ mod tests {
         let pre = msg.pre_serialize(&StreamConfig::default(), false).unwrap();
         let domains_str = pre.domains_only.as_str();
         assert!(domains_str.contains("dns_entries"));
+    }
+
+    #[test]
+    fn test_pre_serialize_leaves_domains_empty_without_dns_names() {
+        let mut msg = make_test_message();
+        let mut leaf = (*msg.data.leaf_cert).clone();
+        leaf.all_domains.clear();
+        msg.data.leaf_cert = Arc::new(leaf);
+
+        let pre = msg.pre_serialize(&StreamConfig::default(), false).unwrap();
+        assert!(pre.domains_only.is_empty());
+        assert!(pre.lite.as_str().contains("certificate_update"));
     }
 
     #[test]

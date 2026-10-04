@@ -392,3 +392,53 @@ async fn open_streams_end_when_the_server_shuts_down() {
         .expect("the server must finish shutting down with clients attached")
         .unwrap();
 }
+
+/// A certificate with no DNS names (an IP address certificate) has nothing to
+/// say on the domains-only stream. Its payload is empty and every send path
+/// must skip it instead of putting an empty frame or event on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_payload_is_skipped_not_sent() {
+    let h = Harness::start().await;
+
+    let mut ws = connect(h.addr, &ws_request(h.addr));
+    assert!(read_response_head(&mut ws).starts_with("HTTP/1.1 101"));
+    let mut sse = connect(h.addr, &sse_request(h.addr, "lite"));
+    assert!(read_response_head(&mut sse).starts_with("HTTP/1.1 200"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let message = |lite: &'static str| {
+        Arc::new(PreSerializedMessage {
+            full: Utf8Bytes::from_static(""),
+            lite: Utf8Bytes::from_static(lite),
+            domains_only: Utf8Bytes::from_static(""),
+            v2: Utf8Bytes::from_static(""),
+            leaf: None,
+        })
+    };
+    h.tx.send(message("")).unwrap();
+    h.tx.send(message(r#"{"message_type":"after_the_empty_one"}"#))
+        .unwrap();
+
+    let (ws_bytes, sse_bytes) = tokio::task::spawn_blocking(move || {
+        let (ws_bytes, _) = read_until_end(&mut ws, Duration::from_secs(2));
+        let (sse_bytes, _) = read_until_end(&mut sse, Duration::from_secs(2));
+        (ws_bytes, sse_bytes)
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        String::from_utf8_lossy(&ws_bytes).contains("after_the_empty_one"),
+        "the message after the empty one must still arrive"
+    );
+    assert!(
+        !ws_bytes.windows(2).any(|w| w == [0x81, 0x00]),
+        "an empty text frame must not be sent"
+    );
+    let sse_body = String::from_utf8_lossy(&sse_bytes);
+    assert!(sse_body.contains("after_the_empty_one"));
+    assert!(
+        !sse_body.contains("data: \n\n"),
+        "an empty SSE event must not be sent, got:\n{sse_body}"
+    );
+}

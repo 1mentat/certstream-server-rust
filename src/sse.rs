@@ -206,6 +206,12 @@ impl futures_util::Stream for SseStreamWrapper {
                     SseStreamType::Lite => &msg.lite,
                     SseStreamType::V2 => &msg.v2,
                 };
+                if text.is_empty() {
+                    // Nothing to send for this stream; poll again for the next
+                    // message instead of emitting an empty event.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 // Payloads are pre-validated Utf8Bytes — no per-client UTF-8
                 // scan here. (Event::data still copies into the event's own
                 // buffer; that copy is inherent to axum's SSE Event API.)
