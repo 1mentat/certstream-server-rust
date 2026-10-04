@@ -1206,9 +1206,26 @@ fn spawn_pool(
     count
 }
 
-/// Supervisor that runs a watcher in a panic-resilient loop. On panic, logs
-/// the failure, bumps the `certstream_worker_panics` counter, sleeps 5s, and
-/// restarts. Exits cleanly on shutdown cancellation.
+/// How long a watcher that gave up waits before it is started again: first
+/// this, doubling up to the cap. A watcher that ran for `WATCHER_HEALTHY_AFTER`
+/// before giving up starts over from the first wait.
+const WATCHER_RESTART_INITIAL: Duration = Duration::from_secs(30);
+const WATCHER_RESTART_MAX: Duration = Duration::from_secs(15 * 60);
+const WATCHER_HEALTHY_AFTER: Duration = Duration::from_secs(10 * 60);
+
+fn restart_wait(previous: Option<Duration>, ran_for: Duration) -> Duration {
+    match previous {
+        Some(wait) if ran_for < WATCHER_HEALTHY_AFTER => (wait * 2).min(WATCHER_RESTART_MAX),
+        _ => WATCHER_RESTART_INITIAL,
+    }
+}
+
+/// Supervisor that keeps a watcher running. On panic it logs the failure,
+/// bumps the `certstream_worker_panics` counter, sleeps 5s, and restarts. A
+/// watcher that returns on its own gave up, usually because the log refused
+/// its first checkpoint, and is restarted after a growing wait: without that a
+/// log that is rate limiting at startup stays dead until the process restarts.
+/// Exits cleanly on shutdown cancellation.
 fn spawn_worker_loop(log: ct::CtLog, ctx: WatcherContext, startup_delay_ms: u64, kind: WorkerKind) {
     let cancel = ctx.shutdown.clone();
     tokio::spawn(async move {
@@ -1217,7 +1234,9 @@ fn spawn_worker_loop(log: ct::CtLog, ctx: WatcherContext, startup_delay_ms: u64,
         }
         let log_name = log.description.clone();
         let label = kind.label();
+        let mut last_wait: Option<Duration> = None;
         loop {
+            let started = std::time::Instant::now();
             let fut = std::panic::AssertUnwindSafe(async {
                 match kind {
                     WorkerKind::Rfc6962 => {
@@ -1236,7 +1255,16 @@ fn spawn_worker_loop(log: ct::CtLog, ctx: WatcherContext, startup_delay_ms: u64,
                 }
                 res = futures::FutureExt::catch_unwind(fut) => {
                     match res {
-                        Ok(_) => break,
+                        Ok(_) if cancel.is_cancelled() => break,
+                        Ok(_) => {
+                            let wait = restart_wait(last_wait, started.elapsed());
+                            last_wait = Some(wait);
+                            warn!(log = %log_name, kind = %label, wait_secs = wait.as_secs(), "worker stopped on its own, restarting");
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(wait) => {}
+                            }
+                        }
                         Err(_) => {
                             error!(log = %log_name, kind = %label, "worker panicked, restarting in 5s");
                             metrics::counter!("certstream_worker_panics").increment(1);
@@ -1650,6 +1678,29 @@ mod tests {
 
         assert_eq!(stopped, 0);
         assert!(!delisted.is_cancelled());
+    }
+
+    /// A watcher that returns without being cancelled gave up, usually because
+    /// the log refused its first checkpoint. It is restarted after a wait that
+    /// doubles up to a cap, and starts over once it has run for a while.
+    #[test]
+    fn a_giving_up_watcher_backs_off_and_resets_after_running() {
+        let quick = Duration::from_secs(1);
+        let first = restart_wait(None, quick);
+        assert_eq!(first, WATCHER_RESTART_INITIAL);
+        assert_eq!(restart_wait(Some(first), quick), first * 2);
+
+        let mut wait = first;
+        for _ in 0..20 {
+            wait = restart_wait(Some(wait), quick);
+        }
+        assert_eq!(wait, WATCHER_RESTART_MAX, "the wait must stop growing");
+
+        assert_eq!(
+            restart_wait(Some(WATCHER_RESTART_MAX), WATCHER_HEALTHY_AFTER),
+            WATCHER_RESTART_INITIAL,
+            "a watcher that ran for a while starts over"
+        );
     }
 
     /// A log the catalog still lists but that failed this cycle's availability
