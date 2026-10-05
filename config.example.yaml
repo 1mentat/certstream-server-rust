@@ -2,14 +2,34 @@ host: "0.0.0.0"
 port: 8080
 log_level: "info"
 buffer_size: 1000
-ct_logs_url: "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
+
+# CT log sources are loaded from a code-owned catalog registry:
+#   - google_v3_usable  (RSA-SHA256 verified; authoritative by default)
+#   - google_v3_all     (RSA-SHA256 verified; non-authoritative by default)
+#   - apple             (TLS-authenticated, no detached signature; non-authoritative by default)
+# Tune per-source authority via `ct_log.catalog_authority_overrides` below.
 
 protocols:
   websocket: true
-  sse: true
+  sse: false        # opt-in
   metrics: true
   health: true
   example_json: true
+  api: false
+
+# Stream types to serialize and serve.
+# Disabling a stream type skips JSON serialization for that format
+# and removes its WebSocket/SSE route entirely, saving CPU and bandwidth.
+streams:
+  full: true          # Full stream (includes DER + chain, ~4-5 KB/cert)
+  lite: true          # Lite stream (no DER/chain, ~1 KB/cert)
+  domains_only: true  # Domains-only stream (~200 B/cert)
+  # Version 2 output: the same certificate with an explicit source address
+  # (log_id + entry index), entry type, observation time, and what was
+  # actually verified. Off by default — it is a fourth serialization of every
+  # certificate. Served at ws://host/v2 and /sse?stream=v2.
+  # (env: CERTSTREAM_STREAM_V2_ENABLED)
+  v2: false
 
 ct_log:
   retry_max_attempts: 3
@@ -20,13 +40,106 @@ ct_log:
   unhealthy_threshold: 5
   health_check_interval_secs: 60
   state_file: "certstream_state.json"
-  batch_size: 256
+  # What to do when state_file exists but cannot be read or parsed.
+  #   fresh (default) — warn and restart every watcher from the log head
+  #   fail            — refuse to start, so a lost position is never silent
+  # A missing state file is a first run and starts fresh under both.
+  state_recovery: fresh
+  # Entries requested per get-entries call. Servers clamp to their own max;
+  # the watcher adapts to whatever the server actually returns.
+  batch_size: 1024
   poll_interval_ms: 1000
+  # Get-entries windows / tiles fetched concurrently per watcher during
+  # catch-up (1-16). The per-operator token bucket allows a burst of this
+  # size, so the sustained request rate still honours the operator rate
+  # limit. 1 = sequential. (env: CERTSTREAM_CT_LOG_FETCH_CONCURRENCY)
+  fetch_concurrency: 4
+  # Fresh static-CT watchers start this many leaves behind the checkpoint head.
+  # Default preserves the existing head-256 behavior while avoiding full-history replay.
+  start_overlap_leaves: 256
+  # How often the CT log list is re-fetched while the server runs, so a log
+  # added to the catalog is picked up without a restart. 0 disables refresh.
+  # (env: CERTSTREAM_CT_LOG_REFRESH_INTERVAL_SECS)
+  log_refresh_interval_secs: 3600
+  # What a refresh does with a running watcher whose log is no longer listed.
+  #   stop (default) — stop it; the saved position is kept, so a log that
+  #                    reappears resumes where it stopped
+  #   keep           — leave it running
+  # Never applies to custom_logs / static_logs entries: those come from this
+  # config, so the catalog delisting them says nothing.
+  # A refresh that fails or resolves zero logs changes nothing.
+  # (env: CERTSTREAM_CT_LOG_REMOVED_POLICY)
+  removed_log_policy: stop
+  # Merkle verification against a static-CT log's own hash tiles.
+  #   off (default)  — trust the checkpoint signature and read
+  #   consistency    — prove each new checkpoint extends the previous one
+  #   full           — consistency, plus prove every ingested entry is in the
+  #                    signed tree
+  # A tile the log will not serve (a 429, or a partial tile it has moved past)
+  # marks the entry `inclusion: unverified` and delivery continues; only a
+  # hash that actually disagrees drops data.
+  # (env: CERTSTREAM_STATIC_CT_MERKLE_VERIFICATION)
+  merkle_verification: off
+  # Read names from the Sunlight names-tiles extension where a log serves it:
+  # off (default) or prefer. Unauthenticated data, published as
+  # `dns_entries_unauthenticated`. Requires domains_only to be the only
+  # enabled stream, and cannot be combined with the NATS output.
+  # (env: CERTSTREAM_STATIC_CT_NAMES_TILES)
+  names_tiles: off
+  # Master switches per protocol family. Set `rfc6962_enabled: false` once
+  # you've fully cut over to static-ct logs (env: CERTSTREAM_RFC6962_ENABLED).
+  rfc6962_enabled: true
+  static_ct_enabled: true
+  # Per-operator outbound rate limit. default_operator_rate_limit_ms applies to
+  # any operator absent from operator_rate_limits. It is one budget per
+  # operator, shared by all of that operator's logs, and it is what bounds how
+  # fast the server can read a busy log. The default reads roughly half of what
+  # the CT ecosystem produces. Lowering it for operators that serve heavy
+  # monitoring traffic catches up faster, for example:
+  #   operator_rate_limits:
+  #     google: 250
+  #     digicert: 250
+  # Keep it higher for small operators, and watch certstream_ct_log_rate_limited_total.
+  default_operator_rate_limit_ms: 500
+  operator_rate_limits: {}
+  # User-Agent for all outbound HTTP. Some operators (e.g. Geomys) apply a
+  # more generous rate limit tier to clients that include a contact email.
+  # GoDaddy limits by the product and version at the start of the string
+  # (tested: certstream-server-rust/1.6.0 is refused with a 429 even with text
+  # after it, other names are accepted), and the default is shared by every
+  # install. Use a name of your own, for example
+  # "yourname-monitor/1.0 (you@example.com)".
+  # Unset or blank defaults to certstream-server-rust/{VERSION}.
+  # (env: CERTSTREAM_USER_AGENT)
+  user_agent: null
+  # Operators whose watchers fetch over HTTP/1.1 instead of HTTP/2. DigiCert
+  # throttles per TCP connection, and HTTP/2 puts every request for a host on
+  # one connection; under HTTP/1.1 each in-flight fetch needs its own
+  # connection and so carries its own quota. The per-operator rate limiter
+  # still gates every fetch, so this redistributes the request rate rather
+  # than raising it. Names are matched like operator_rate_limits keys.
+  # (env: CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS, comma-separated)
+  force_http1_operators: []
+  # Per-catalog-source runtime-authority overrides. Keys are
+  # google_v3_usable, google_v3_all, and apple. An override can only grant
+  # authority to a source that currently verifies; it cannot promote an
+  # unverified source. Example: opt into the broader Google all list with
+  # `google_v3_all: true`.
+  catalog_authority_overrides: {}
+
+# Cross-log certificate dedup. Defaults sized for the 2026 RFC6962/static-ct
+# transition where the same cert appears in 3-4 logs in tight 60s MMD windows.
+dedup:
+  capacity: 1000000   # max in-flight fingerprints
+  ttl_secs: 900       # 15-minute window — keep above max log MMD
 
 connection_limit:
   enabled: false
   max_connections: 10000
   per_ip_limit: null
+
+rate_limit:
+  enabled: false
 
 auth:
   enabled: false
@@ -37,6 +150,10 @@ hot_reload:
   enabled: false
   watch_path: null
 
+# Custom RFC6962 logs can optionally set `expected_log_id`, `batch_size`, and/or
+# `poll_interval_ms`. For custom logs, `expected_log_id` declares the CT log ID
+# used for runtime identity/metrics and duplicate-log detection; it does not
+# replace a catalog-discovered source.
 custom_logs: []
 
 # Named targets: reusable Delta table configurations for CLI operations
@@ -58,18 +175,50 @@ custom_logs: []
 #         secret_access_key: "..."
 #         provider: ""                    # S3 provider hint (auto-detected from endpoint if omitted)
 
-# Static CT logs (Sunlight / static-ct-api protocol)
-# These logs use checkpoint + tile-based fetching instead of get-sth/get-entries
-# Use monitoring prefix (mon.*) for read access to checkpoint and tile data
+# Static CT logs (Sunlight / static-ct-api protocol). These are merged with logs
+# discovered via the signed-catalog registry. When `expected_log_id` is set, it
+# must match the discovered CT log identity before replacement; id-less entries
+# keep URL-based replacement. This is also the only path to ingest an Apple-only
+# or otherwise non-authoritative log.
+#
+# `url` is the monitoring prefix (often `mon.*`) used to fetch checkpoint and
+# tile data. `log_origin` overrides the expected checkpoint origin when the
+# fetch URL host differs from the submission URL host (e.g. mon.* vs log.*).
+# When omitted, the origin is derived from the URL by stripping scheme and
+# trailing slash.
 static_logs:
-  - name: "Let's Encrypt 'Willow' 2026h1"
-    url: "https://mon.willow.ct.letsencrypt.org/2026h1/"
   - name: "Let's Encrypt 'Sycamore' 2026h1"
     url: "https://mon.sycamore.ct.letsencrypt.org/2026h1/"
-  - name: "Let's Encrypt 'Willow' 2025h2d"
-    url: "https://mon.willow.ct.letsencrypt.org/2025h2d/"
-  - name: "Let's Encrypt 'Sycamore' 2025h2d"
-    url: "https://mon.sycamore.ct.letsencrypt.org/2025h2d/"
+    log_origin: "log.sycamore.ct.letsencrypt.org/2026h1"
+    # expected_log_id: "base64-sha256-log-id"
+    # batch_size: 128
+    # poll_interval_ms: 2000
+
+  # Hybrid: an RFC 6962 log that serves tile data but no checkpoint.
+  # `tree_size_source: get_sth` reads the head from /ct/v1/get-sth and the
+  # entries from /tile/data. TrustAsia's log2026a, log2026b and hetu2027 are
+  # the logs this exists for; their get-entries takes 25-31s per 256 entries
+  # while the same entries come from a warm tile in under a second.
+  #
+  # There is no checkpoint to verify, so these logs are ingested unverified.
+  # The head is held at the last full tile because a log that publishes no
+  # checkpoint is not obliged to serve partial tiles, and these do not.
+  # Setting this on a log whose operator has not said they serve tiles will
+  # simply 404 on every tile fetch.
+  #
+  # Tiles near the head miss the CDN cache, so a busy log needs more in-flight
+  # fetches than the default 4 (which caps a watcher near 50 entries/s).
+  # `ct_log.fetch_concurrency: 16` measured ~276 entries/s across these three.
+  #
+  # `operator` is only needed for a log that exists in no catalog; an entry
+  # replacing a discovered log inherits that log's operator, which is what
+  # keeps it in the right rate-limit bucket.
+  #
+  # - name: "TrustAsia log2026a"
+  #   url: "https://ct2026-a.trustasia.com/log2026a"
+  #   expected_log_id: "dNudWPfUfp39eHoWKpkcGM9pjafHKZGMmhiwRQ26RLw="
+  #   tree_size_source: get_sth
+  #   # operator: "trustasia"
 
 # Delta Lake storage sink
 # Writes CT entries to a local Delta table for historical analysis
