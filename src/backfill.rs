@@ -675,9 +675,29 @@ pub async fn run_backfill(
     }
 
     // Step 1: Log discovery
-    let client = reqwest::Client::new();
-    let mut logs = match fetch_log_list(&client, &config.ct_logs_url, config.custom_logs.clone()).await {
-        Ok(logs) => logs,
+    let user_agent = config
+        .ct_log
+        .user_agent_override()
+        .unwrap_or(crate::cli::DEFAULT_USER_AGENT)
+        .to_string();
+    let client = match crate::build_ct_client(&config.ct_log, &user_agent, false) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("failed to build http client: {}", e);
+            return 1;
+        }
+    };
+    let mut logs = match fetch_log_list(
+        &client,
+        &crate::ct::catalog::catalog_registry(),
+        &config.ct_log.catalog_authority_overrides,
+        config.custom_logs.clone(),
+        Duration::from_secs(config.ct_log.request_timeout_secs),
+        &user_agent,
+    )
+    .await
+    {
+        Ok(discovered) => discovered.reachable,
         Err(e) => {
             warn!("failed to fetch CT log list: {}", e);
             return 1;
@@ -706,7 +726,16 @@ pub async fn run_backfill(
     info!(count = logs.len(), "backfilling logs");
 
     // Step 2: State file ceiling lookup
-    let state_manager = StateManager::new(config.ct_log.state_file.clone());
+    let state_manager = match StateManager::new(
+        config.ct_log.state_file.clone(),
+        config.ct_log.state_recovery,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("failed to load state file: {}", e);
+            return 1;
+        }
+    };
     let mut log_ceilings = Vec::new();
 
     for log in &logs {
@@ -779,16 +808,19 @@ pub async fn run_backfill(
     let mut fetcher_handles = Vec::new();
 
     for (source_url, work_items) in work_by_source {
-        // Find the log type for this source
-        let log_type = logs
-            .iter()
-            .find(|log| log.normalized_url() == source_url)
-            .map(|log| log.log_type.clone())
-            .unwrap_or(LogType::Rfc6962);
+        // Find the log this source belongs to
+        let log = logs.iter().find(|log| log.normalized_url() == source_url);
+        let log_type = log.map(|log| log.log_type.clone()).unwrap_or(LogType::Rfc6962);
 
         let source = Arc::new(Source {
             name: Arc::from(source_url.as_str()),
             url: Arc::from(source_url.as_str()),
+            log_id: log.and_then(|l| l.log_id.as_deref()).map(Arc::from),
+            operator: Arc::from(log.map(|l| l.operator_name()).unwrap_or_default()),
+            log_type: match log_type {
+                LogType::Rfc6962 => "rfc6962",
+                LogType::StaticCt => "static_ct",
+            },
         });
 
         let tx_clone = tx.clone();
@@ -1392,7 +1424,7 @@ mod tests {
     use std::fs;
 
     fn make_test_record(cert_index: u64, source_url: &str) -> DeltaCertRecord {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"submission_timestamp":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let mut record = DeltaCertRecord::from_json(json_str.as_bytes()).expect("failed to deserialize");
         record.cert_index = cert_index;
         record.source_url = source_url.to_string();
@@ -3177,6 +3209,7 @@ mod tests {
             show_version: false,
             show_help: false,
             backfill: false,
+            range_backfill: None,
             backfill_from: None,
             backfill_logs: None,
             backfill_sink: None,

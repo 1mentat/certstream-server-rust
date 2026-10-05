@@ -155,7 +155,7 @@ pub async fn run_zerobus_sink(
                 match result {
                     Ok(msg) => {
                         // Deserialize JSON bytes -> DeltaCertRecord -> CertRecord -> protobuf bytes
-                        let record = match DeltaCertRecord::from_json(&msg.full) {
+                        let record = match DeltaCertRecord::from_json(msg.full.as_bytes()) {
                             Ok(r) => r,
                             Err(e) => {
                                 debug!(error = %e, "failed to deserialize message, skipping");
@@ -460,6 +460,7 @@ mod tests {
                     "name": "example-log"
                 },
                 "seen": 1708454400.5,
+                "submission_timestamp": 1708454399.0,
                 "leaf_cert": {
                     "all_domains": ["example.com", "www.example.com"],
                     "fingerprint": "leaf_fingerprint",
@@ -545,6 +546,7 @@ mod tests {
                     "name": "test-log"
                 },
                 "seen": 1708454400.0,
+                "submission_timestamp": 1708454399.0,
                 "leaf_cert": {
                     "all_domains": ["test.com"],
                     "fingerprint": "test_fingerprint",

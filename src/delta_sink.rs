@@ -115,13 +115,13 @@ impl DeltaCertRecord {
             source_url: msg.data.source.url.to_string(),
             cert_link: msg.data.cert_link.clone(),
             serial_number: msg.data.leaf_cert.serial_number.clone(),
-            fingerprint: msg.data.leaf_cert.fingerprint.clone(),
+            fingerprint: msg.data.leaf_cert.fingerprint.to_string(),
             sha256: msg.data.leaf_cert.sha256.clone(),
             sha1: msg.data.leaf_cert.sha1.clone(),
             not_before: msg.data.leaf_cert.not_before,
             not_after: msg.data.leaf_cert.not_after,
             is_ca: msg.data.leaf_cert.is_ca,
-            signature_algorithm: msg.data.leaf_cert.signature_algorithm.clone(),
+            signature_algorithm: msg.data.leaf_cert.signature_algorithm.to_string(),
             subject_aggregated: msg.data.leaf_cert.subject.aggregated.clone().unwrap_or_default(),
             issuer_aggregated: msg.data.leaf_cert.issuer.aggregated.clone().unwrap_or_default(),
             all_domains,
@@ -767,7 +767,7 @@ pub async fn run_delta_sink(
                 match result {
                     Ok(msg) => {
                         // Deserialize msg.full into DeltaCertRecord
-                        match DeltaCertRecord::from_json(&msg.full) {
+                        match DeltaCertRecord::from_json(msg.full.as_bytes()) {
                             Ok(record) => {
                                 buffer.push(record);
 
@@ -865,14 +865,14 @@ pub async fn run_delta_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use axum::extract::ws::Utf8Bytes;
     use deltalake::datafusion::prelude::*;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use std::fs;
 
     fn make_test_json_bytes() -> Vec<u8> {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":[{"subject":{"CN":"Intermediate CA","aggregated":"/CN=Intermediate CA"},"issuer":{"CN":"Root CA","aggregated":"/CN=Root CA"},"serial_number":"02","not_before":1600000000,"not_after":1800000000,"fingerprint":"GG:HH","sha1":"II:JJ","sha256":"KK:LL","signature_algorithm":"sha256, rsa","is_ca":true,"as_der":null,"extensions":{"ctlPoisonByte":false}}],"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"submission_timestamp":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         json_str.as_bytes().to_vec()
     }
 
@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     fn test_from_json_with_empty_chain() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"submission_timestamp":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_from_json_with_empty_as_der() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":null,"extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":["example.com","www.example.com"],"as_der":null,"extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"submission_timestamp":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_from_json_with_empty_domains() {
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":"AQID","extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"submission_timestamp":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -1194,7 +1194,7 @@ mod tests {
     #[test]
     fn test_records_to_batch_with_empty_domains_and_chain() {
         let schema = delta_schema();
-        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":null,"extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
+        let json_str = r#"{"message_type":"certificate_update","data":{"update_type":"X509LogEntry","leaf_cert":{"subject":{"CN":"example.com","aggregated":"/CN=example.com"},"issuer":{"CN":"Test CA","aggregated":"/CN=Test CA"},"serial_number":"01","not_before":1700000000,"not_after":1730000000,"fingerprint":"AA:BB","sha1":"CC:DD","sha256":"EE:FF","signature_algorithm":"sha256, rsa","is_ca":false,"all_domains":[],"as_der":null,"extensions":{"ctlPoisonByte":false}},"chain":null,"cert_index":12345,"cert_link":"https://ct.example.com/entry/12345","seen":1700000000.0,"submission_timestamp":1700000000.0,"source":{"name":"Test Log","url":"https://ct.example.com/"}}}"#;
         let json_bytes = json_str.as_bytes();
         let record = DeltaCertRecord::from_json(json_bytes).expect("deserialization failed");
 
@@ -1526,17 +1526,19 @@ mod tests {
         // Send a few messages (less than batch_size)
         let msg = make_test_json_bytes();
         let pre_serialized = PreSerializedMessage {
-            full: Bytes::from(msg),
-            lite: Bytes::new(),
-            domains_only: Bytes::new(),
+            full: Utf8Bytes::from(String::from_utf8(msg).unwrap()),
+            lite: Utf8Bytes::from(""),
+            domains_only: Utf8Bytes::from(""),
+            v2: Utf8Bytes::from(""),
+            leaf: None,
         };
 
         for i in 0..3 {
             let mut psm = pre_serialized.clone();
             let mut json_msg: serde_json::Value =
-                serde_json::from_slice(&psm.full).expect("valid json");
+                serde_json::from_str(psm.full.as_str()).expect("valid json");
             json_msg["data"]["cert_index"] = serde_json::json!(i);
-            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+            psm.full = Utf8Bytes::from(serde_json::to_string(&json_msg).unwrap());
 
             let _ = tx.send(Arc::new(psm));
         }
@@ -1586,17 +1588,19 @@ mod tests {
         // Send a few messages (less than batch_size, so timer won't trigger)
         let msg = make_test_json_bytes();
         let pre_serialized = PreSerializedMessage {
-            full: Bytes::from(msg),
-            lite: Bytes::new(),
-            domains_only: Bytes::new(),
+            full: Utf8Bytes::from(String::from_utf8(msg).unwrap()),
+            lite: Utf8Bytes::from(""),
+            domains_only: Utf8Bytes::from(""),
+            v2: Utf8Bytes::from(""),
+            leaf: None,
         };
 
         for i in 0..5 {
             let mut psm = pre_serialized.clone();
             let mut json_msg: serde_json::Value =
-                serde_json::from_slice(&psm.full).expect("valid json");
+                serde_json::from_str(psm.full.as_str()).expect("valid json");
             json_msg["data"]["cert_index"] = serde_json::json!(i);
-            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+            psm.full = Utf8Bytes::from(serde_json::to_string(&json_msg).unwrap());
 
             let _ = tx.send(Arc::new(psm));
         }
@@ -1719,26 +1723,30 @@ mod tests {
 
         // Send malformed JSON
         let malformed_psm = Arc::new(PreSerializedMessage {
-            full: Bytes::from(Vec::from(&b"not valid json"[..])),
-            lite: Bytes::new(),
-            domains_only: Bytes::new(),
+            full: Utf8Bytes::from(String::from("not valid json")),
+            lite: Utf8Bytes::from(""),
+            domains_only: Utf8Bytes::from(""),
+            v2: Utf8Bytes::from(""),
+            leaf: None,
         });
         let _ = tx.send(malformed_psm);
 
         // Send valid JSON
         let valid_msg = make_test_json_bytes();
         let valid_psm = Arc::new(PreSerializedMessage {
-            full: Bytes::from(valid_msg),
-            lite: Bytes::new(),
-            domains_only: Bytes::new(),
+            full: Utf8Bytes::from(String::from_utf8(valid_msg).unwrap()),
+            lite: Utf8Bytes::from(""),
+            domains_only: Utf8Bytes::from(""),
+            v2: Utf8Bytes::from(""),
+            leaf: None,
         });
 
         for i in 0..5 {
             let mut psm_clone = (*valid_psm).clone();
             let mut json_msg: serde_json::Value =
-                serde_json::from_slice(&psm_clone.full).expect("valid json");
+                serde_json::from_str(psm_clone.full.as_str()).expect("valid json");
             json_msg["data"]["cert_index"] = serde_json::json!(i);
-            psm_clone.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+            psm_clone.full = Utf8Bytes::from(serde_json::to_string(&json_msg).unwrap());
 
             let _ = tx.send(Arc::new(psm_clone));
         }
@@ -1816,16 +1824,18 @@ mod tests {
         let valid_msg = make_test_json_bytes();
         for i in 0..5 {
             let mut psm = PreSerializedMessage {
-                full: Bytes::from(valid_msg.clone()),
-                lite: Bytes::new(),
-                domains_only: Bytes::new(),
+                full: Utf8Bytes::from(String::from_utf8(valid_msg.clone()).unwrap()),
+                lite: Utf8Bytes::from(""),
+                domains_only: Utf8Bytes::from(""),
+                v2: Utf8Bytes::from(""),
+                leaf: None,
             };
 
             // Vary cert_index to avoid dedup
             let mut json_msg: serde_json::Value =
-                serde_json::from_slice(&psm.full).expect("valid json");
+                serde_json::from_str(psm.full.as_str()).expect("valid json");
             json_msg["data"]["cert_index"] = serde_json::json!(i);
-            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+            psm.full = Utf8Bytes::from(serde_json::to_string(&json_msg).unwrap());
 
             let _ = tx.send(Arc::new(psm));
         }
@@ -1902,15 +1912,17 @@ mod tests {
         let valid_msg = make_test_json_bytes();
         for i in 0..20 {
             let mut psm = PreSerializedMessage {
-                full: Bytes::from(valid_msg.clone()),
-                lite: Bytes::new(),
-                domains_only: Bytes::new(),
+                full: Utf8Bytes::from(String::from_utf8(valid_msg.clone()).unwrap()),
+                lite: Utf8Bytes::from(""),
+                domains_only: Utf8Bytes::from(""),
+                v2: Utf8Bytes::from(""),
+                leaf: None,
             };
 
             let mut json_msg: serde_json::Value =
-                serde_json::from_slice(&psm.full).expect("valid json");
+                serde_json::from_str(psm.full.as_str()).expect("valid json");
             json_msg["data"]["cert_index"] = serde_json::json!(i);
-            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+            psm.full = Utf8Bytes::from(serde_json::to_string(&json_msg).unwrap());
 
             let _ = tx.send(Arc::new(psm));
             // Use std::thread::sleep (blocking) instead of tokio::time::sleep (async) to intentionally
@@ -2049,15 +2061,17 @@ mod tests {
         let valid_msg = make_test_json_bytes();
         for i in 0..25 {
             let mut psm = PreSerializedMessage {
-                full: Bytes::from(valid_msg.clone()),
-                lite: Bytes::new(),
-                domains_only: Bytes::new(),
+                full: Utf8Bytes::from(String::from_utf8(valid_msg.clone()).unwrap()),
+                lite: Utf8Bytes::from(""),
+                domains_only: Utf8Bytes::from(""),
+                v2: Utf8Bytes::from(""),
+                leaf: None,
             };
 
             let mut json_msg: serde_json::Value =
-                serde_json::from_slice(&psm.full).expect("valid json");
+                serde_json::from_str(psm.full.as_str()).expect("valid json");
             json_msg["data"]["cert_index"] = serde_json::json!(i);
-            psm.full = bytes::Bytes::from(serde_json::to_vec(&json_msg).unwrap());
+            psm.full = Utf8Bytes::from(serde_json::to_string(&json_msg).unwrap());
 
             let _ = tx.send(Arc::new(psm));
         }

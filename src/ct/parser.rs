@@ -1,10 +1,13 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
+use ahash::AHashSet;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::cell::RefCell;
 use std::fmt::Write;
 use std::net::IpAddr;
+use std::sync::Arc;
 use x509_parser::der_parser::oid;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::oid_registry::Oid;
@@ -12,13 +15,100 @@ use x509_parser::prelude::*;
 
 use crate::models::{ChainCert, DomainList, Extensions, LeafCert, Subject};
 
+// DN attribute OIDs, compared against the certificate's OIDs directly rather
+// than by rendering each attribute to a string.
+const OID_CN: Oid<'static> = oid!(2.5.4.3);
+const OID_C: Oid<'static> = oid!(2.5.4.6);
+const OID_L: Oid<'static> = oid!(2.5.4.7);
+const OID_ST: Oid<'static> = oid!(2.5.4.8);
+const OID_O: Oid<'static> = oid!(2.5.4.10);
+const OID_OU: Oid<'static> = oid!(2.5.4.11);
+const OID_EMAIL: Oid<'static> = oid!(1.2.840.113549.1.9.1);
+
+const OID_MD2_RSA: Oid<'static> = oid!(1.2.840.113549.1.1.2);
+const OID_MD5_RSA: Oid<'static> = oid!(1.2.840.113549.1.1.4);
+const OID_SHA1_RSA: Oid<'static> = oid!(1.2.840.113549.1.1.5);
+const OID_SHA256_RSA: Oid<'static> = oid!(1.2.840.113549.1.1.11);
+const OID_SHA384_RSA: Oid<'static> = oid!(1.2.840.113549.1.1.12);
+const OID_SHA512_RSA: Oid<'static> = oid!(1.2.840.113549.1.1.13);
+const OID_SHA256_RSA_PSS: Oid<'static> = oid!(1.2.840.113549.1.1.10);
+const OID_DSA_SHA1: Oid<'static> = oid!(1.2.840.10040.4.3);
+const OID_DSA_SHA256: Oid<'static> = oid!(2.16.840.1.101.3.4.3.2);
+const OID_ECDSA_SHA1: Oid<'static> = oid!(1.2.840.10045.4.1);
+const OID_ECDSA_SHA256: Oid<'static> = oid!(1.2.840.10045.4.3.2);
+const OID_ECDSA_SHA384: Oid<'static> = oid!(1.2.840.10045.4.3.3);
+const OID_ECDSA_SHA512: Oid<'static> = oid!(1.2.840.10045.4.3.4);
+const OID_ED25519: Oid<'static> = oid!(1.3.101.112);
+
 pub struct ParsedEntry {
     pub update_type: Cow<'static, str>,
     pub leaf_cert: LeafCert,
-    pub chain: Vec<ChainCert>,
+    /// Submission timestamp: the moment the CT log issued the SCT for this entry
+    /// (RFC 6962 §3.1, `TimestampedEntry.timestamp`).  Extracted from bytes 2–9
+    /// of the decoded `leaf_input` as a uint64 big-endian milliseconds value and
+    /// converted to seconds with millisecond precision.  This records when the
+    /// certificate was submitted to and accepted by the log — not when the cert
+    /// was issued or when the Merkle tree was updated.
+    pub submission_timestamp: f64,
+    /// Raw extra_data bytes and the offset where chain parsing should begin.
+    /// Chain parsing is deferred so that duplicate certificates (caught by the
+    /// dedup filter) never pay the cost of DER-parsing 2-4 chain certs.
+    chain_extra_bytes: Vec<u8>,
+    chain_offset: usize,
+    /// Inherited from `parse_leaf_input_with_options`: chain certs honour the
+    /// same `parse_extensions` choice as the leaf, so a domains_only-only
+    /// deployment skips chain extension parsing too.
+    parse_opts: ParseOptions,
 }
 
+impl ParsedEntry {
+    /// Parse the certificate chain from the stored extra_data.
+    /// Call this only after confirming the leaf cert passes dedup filtering.
+    pub fn parse_chain(&self) -> Vec<Arc<ChainCert>> {
+        parse_chain_from_bytes(&self.chain_extra_bytes, self.chain_offset, self.parse_opts)
+    }
+}
+
+/// §1.5a: options controlling optional parser work. Construct via
+/// [`ParseOptions::default`] (matches the historical [`parse_certificate`]
+/// and [`parse_leaf_input`] behaviour) and tweak fields as needed.
+#[derive(Debug, Clone, Copy)]
+pub struct ParseOptions {
+    /// If true, populate `LeafCert::as_der` with the base64-encoded DER input.
+    /// Set false on chain certs (the runtime doesn't broadcast chain DERs).
+    pub include_der: bool,
+    /// If true, run the full extension-display-string pass (SAN, AIA, policy,
+    /// AKI, SKI, KU, EKU, BasicConstraints). Setting false leaves the
+    /// `Extensions` block defaulted — useful when only the `domains_only`
+    /// stream is subscribed since that variant doesn't emit `extensions`.
+    /// `all_domains` (which feeds the DNS list and the domains_only payload)
+    /// is still populated from the SAN extension regardless of this flag.
+    pub parse_extensions: bool,
+}
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        Self {
+            include_der: true,
+            parse_extensions: true,
+        }
+    }
+}
+
+/// Backwards-compat wrapper: equivalent to `parse_leaf_input_with_options`
+/// with `ParseOptions::default()`. Retained as part of the public lib surface
+/// for external integration tests and the fuzz harness — the bin's hot path
+/// uses `parse_leaf_input_with_options` directly to honour StreamConfig.
+#[allow(dead_code)]
 pub fn parse_leaf_input(leaf_input: &str, extra_data: &str) -> Option<ParsedEntry> {
+    parse_leaf_input_with_options(leaf_input, extra_data, ParseOptions::default())
+}
+
+pub fn parse_leaf_input_with_options(
+    leaf_input: &str,
+    extra_data: &str,
+    opts: ParseOptions,
+) -> Option<ParsedEntry> {
     let leaf_bytes = STANDARD.decode(leaf_input).ok()?;
     let extra_bytes = STANDARD.decode(extra_data).ok()?;
 
@@ -26,16 +116,37 @@ pub fn parse_leaf_input(leaf_input: &str, extra_data: &str) -> Option<ParsedEntr
         return None;
     }
 
+    // The length check above (< 15) guarantees at least 15 bytes, so indexing
+    // into [2..10] (the 8-byte timestamp) and [10..12] (the entry type) is safe.
+    // RFC 6962 MerkleTreeLeaf: byte 0 = version, byte 1 = leaf_type,
+    // bytes 2–9 = uint64 big-endian timestamp (milliseconds since Unix epoch).
+    let ts_ms = u64::from_be_bytes([
+        leaf_bytes[2],
+        leaf_bytes[3],
+        leaf_bytes[4],
+        leaf_bytes[5],
+        leaf_bytes[6],
+        leaf_bytes[7],
+        leaf_bytes[8],
+        leaf_bytes[9],
+    ]);
+    let submission_timestamp = ts_ms as f64 / 1000.0;
+
     let entry_type = u16::from_be_bytes([leaf_bytes[10], leaf_bytes[11]]);
 
     match entry_type {
-        0 => parse_x509_entry(&leaf_bytes, &extra_bytes),
-        1 => parse_precert_entry(&extra_bytes),
+        0 => parse_x509_entry(&leaf_bytes, extra_bytes, submission_timestamp, opts),
+        1 => parse_precert_entry(extra_bytes, submission_timestamp, opts),
         _ => None,
     }
 }
 
-fn parse_x509_entry(leaf_bytes: &[u8], extra_bytes: &[u8]) -> Option<ParsedEntry> {
+fn parse_x509_entry(
+    leaf_bytes: &[u8],
+    extra_bytes: Vec<u8>,
+    submission_timestamp: f64,
+    opts: ParseOptions,
+) -> Option<ParsedEntry> {
     if leaf_bytes.len() < 15 {
         return None;
     }
@@ -51,17 +162,23 @@ fn parse_x509_entry(leaf_bytes: &[u8], extra_bytes: &[u8]) -> Option<ParsedEntry
     }
 
     let cert_bytes = &cert_data[3..3 + cert_len];
-    let leaf_cert = parse_certificate(cert_bytes, true)?;
-    let chain = parse_chain_from_bytes(extra_bytes, 0);
+    let leaf_cert = parse_certificate_with_options(cert_bytes, opts)?;
 
     Some(ParsedEntry {
         update_type: Cow::Borrowed("X509LogEntry"),
         leaf_cert,
-        chain,
+        submission_timestamp,
+        chain_extra_bytes: extra_bytes,
+        chain_offset: 0,
+        parse_opts: opts,
     })
 }
 
-fn parse_precert_entry(extra_bytes: &[u8]) -> Option<ParsedEntry> {
+fn parse_precert_entry(
+    extra_bytes: Vec<u8>,
+    submission_timestamp: f64,
+    opts: ParseOptions,
+) -> Option<ParsedEntry> {
     // RFC 6962: extra_data for precert contains:
     // - 3 bytes: pre-certificate length
     // - pre-certificate (full X509 with CT poison extension)
@@ -79,20 +196,36 @@ fn parse_precert_entry(extra_bytes: &[u8]) -> Option<ParsedEntry> {
     }
 
     let precert_bytes = &extra_bytes[3..3 + precert_len];
-    let mut leaf_cert = parse_certificate(precert_bytes, true)?;
+    let mut leaf_cert = parse_certificate_with_options(precert_bytes, opts)?;
     leaf_cert.extensions.ctl_poison_byte = true;
 
     let chain_offset = 3 + precert_len;
-    let chain = parse_chain_from_bytes(extra_bytes, chain_offset);
 
     Some(ParsedEntry {
         update_type: Cow::Borrowed("PrecertLogEntry"),
         leaf_cert,
-        chain,
+        submission_timestamp,
+        chain_extra_bytes: extra_bytes,
+        chain_offset,
+        parse_opts: opts,
     })
 }
 
+/// Backwards-compat wrapper: equivalent to `parse_certificate_with_options`
+/// with `parse_extensions: true` and the caller's `include_der`. See
+/// [`parse_leaf_input`] for the rationale on why this still exists.
+#[allow(dead_code)]
 pub fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert> {
+    parse_certificate_with_options(
+        der_bytes,
+        ParseOptions {
+            include_der,
+            parse_extensions: true,
+        },
+    )
+}
+
+pub fn parse_certificate_with_options(der_bytes: &[u8], opts: ParseOptions) -> Option<LeafCert> {
     let (_, cert) = X509Certificate::from_der(der_bytes).ok()?;
 
     let mut subject = extract_name(cert.subject());
@@ -103,25 +236,36 @@ pub fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert
     let serial_number = format_serial_number(cert.serial.to_bytes_be());
 
     let sha1_hash = calculate_sha1(der_bytes);
-    let sha256_hash = calculate_sha256(der_bytes);
-    let fingerprint = sha1_hash.clone();
+    let (sha256_raw, sha256_hash) = calculate_sha256(der_bytes);
+    // `fingerprint` and `sha1` are the same value; sharing one allocation
+    // between them keeps a single copy per certificate.
+    let fingerprint: Arc<str> = Arc::from(sha1_hash.as_str());
 
     let signature_algorithm = parse_signature_algorithm(&cert);
     let is_ca = cert.is_ca();
 
     let mut all_domains = DomainList::new();
-    let mut seen_domains: HashSet<String> = HashSet::new();
+    // Borrows from the parsed certificate rather than owning, so deduplicating
+    // SANs costs nothing until a name is actually kept. Sized for the common
+    // case of fewer than 16 SANs.
+    let mut seen_domains: AHashSet<&str> = AHashSet::with_capacity(8);
 
-    if let Some(ref cn) = subject.cn {
-        if !cn.is_empty() && !is_ca {
-            seen_domains.insert(cn.clone());
-            all_domains.push(cn.clone());
-        }
+    if let Some(ref cn) = subject.cn
+        && !cn.is_empty()
+        && !is_ca
+    {
+        seen_domains.insert(cn.as_str());
+        all_domains.push(cn.clone());
     }
 
-    let extensions = parse_extensions(&cert, &mut all_domains, &mut seen_domains);
+    let extensions = parse_extensions(
+        &cert,
+        &mut all_domains,
+        &mut seen_domains,
+        opts.parse_extensions,
+    );
 
-    let as_der = if include_der {
+    let as_der = if opts.include_der {
         Some(STANDARD.encode(der_bytes))
     } else {
         None
@@ -136,7 +280,8 @@ pub fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert
         fingerprint,
         sha1: sha1_hash,
         sha256: sha256_hash,
-        signature_algorithm,
+        sha256_raw,
+        signature_algorithm: Cow::Borrowed(signature_algorithm),
         is_ca,
         all_domains,
         as_der,
@@ -144,41 +289,50 @@ pub fn parse_certificate(der_bytes: &[u8], include_der: bool) -> Option<LeafCert
     })
 }
 
-fn parse_chain_from_bytes(bytes: &[u8], start_offset: usize) -> Vec<ChainCert> {
+fn parse_chain_from_bytes(
+    bytes: &[u8],
+    start_offset: usize,
+    opts: ParseOptions,
+) -> Vec<Arc<ChainCert>> {
     let mut chain = Vec::with_capacity(4);
 
     if bytes.len() <= start_offset + 3 {
         return chain;
     }
 
-    // Skip the 3-byte chain length prefix
+    // RFC 6962 §3.1 `Certificate certificate_chain<0..2^24-1>`: the 3-byte
+    // prefix is the BYTE length of the chain blob, and parsing must stop
+    // there. Running to `bytes.len()` instead would let a server pad
+    // `extra_data` with further certificate structures past the declared
+    // boundary and have them surface as part of the chain.
+    let chain_byte_len = u32::from_be_bytes([
+        0,
+        bytes[start_offset],
+        bytes[start_offset + 1],
+        bytes[start_offset + 2],
+    ]) as usize;
     let mut offset = start_offset + 3;
+    let chain_end = offset.saturating_add(chain_byte_len).min(bytes.len());
 
-    while offset + 3 < bytes.len() {
+    while offset + 3 < chain_end {
         let cert_len =
             u32::from_be_bytes([0, bytes[offset], bytes[offset + 1], bytes[offset + 2]]) as usize;
         offset += 3;
 
-        if offset + cert_len > bytes.len() {
+        if offset + cert_len > chain_end {
             break;
         }
 
         let cert_bytes = &bytes[offset..offset + cert_len];
-        if let Some(leaf) = parse_certificate(cert_bytes, false) {
-            chain.push(ChainCert {
-                subject: leaf.subject,
-                issuer: leaf.issuer,
-                serial_number: leaf.serial_number,
-                not_before: leaf.not_before,
-                not_after: leaf.not_after,
-                fingerprint: leaf.fingerprint,
-                sha1: leaf.sha1,
-                sha256: leaf.sha256,
-                signature_algorithm: leaf.signature_algorithm,
-                is_ca: leaf.is_ca,
-                as_der: leaf.as_der,
-                extensions: leaf.extensions,
-            });
+        // Chain certs never include their DER in the broadcast payload, but
+        // honour the caller's parse_extensions choice for consistency with
+        // the leaf cert.
+        let chain_opts = ParseOptions {
+            include_der: false,
+            parse_extensions: opts.parse_extensions,
+        };
+        if let Some(leaf) = parse_certificate_with_options(cert_bytes, chain_opts) {
+            chain.push(Arc::new(ChainCert::from(leaf)));
         }
 
         offset += cert_len;
@@ -187,27 +341,34 @@ fn parse_chain_from_bytes(bytes: &[u8], start_offset: usize) -> Vec<ChainCert> {
     chain
 }
 
+/// Reads a DN by comparing attribute OIDs directly, rather than rendering
+/// each attribute to a string first.
 fn extract_name(name: &X509Name) -> Subject {
     let mut subject = Subject::default();
 
     for rdn in name.iter() {
         for attr in rdn.iter() {
-            let oid_str = attr.attr_type().to_id_string();
+            let oid = attr.attr_type();
             let value = attr.attr_value();
             let value_str = value
                 .as_str()
                 .ok()
                 .or_else(|| std::str::from_utf8(value.data).ok());
             if let Some(value) = value_str {
-                match oid_str.as_str() {
-                    "2.5.4.3" => subject.cn = Some(value.to_string()),
-                    "2.5.4.6" => subject.c = Some(value.to_string()),
-                    "2.5.4.7" => subject.l = Some(value.to_string()),
-                    "2.5.4.8" => subject.st = Some(value.to_string()),
-                    "2.5.4.10" => subject.o = Some(value.to_string()),
-                    "2.5.4.11" => subject.ou = Some(value.to_string()),
-                    "1.2.840.113549.1.9.1" => subject.email_address = Some(value.to_string()),
-                    _ => {}
+                if oid == &OID_CN {
+                    subject.cn = Some(value.to_string());
+                } else if oid == &OID_C {
+                    subject.c = Some(value.to_string());
+                } else if oid == &OID_L {
+                    subject.l = Some(value.to_string());
+                } else if oid == &OID_ST {
+                    subject.st = Some(value.to_string());
+                } else if oid == &OID_O {
+                    subject.o = Some(value.to_string());
+                } else if oid == &OID_OU {
+                    subject.ou = Some(value.to_string());
+                } else if oid == &OID_EMAIL {
+                    subject.email_address = Some(value.to_string());
                 }
             }
         }
@@ -216,12 +377,86 @@ fn extract_name(name: &X509Name) -> Subject {
     subject
 }
 
-fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList, seen_domains: &mut HashSet<String>) -> Extensions {
+// §1.5b: thread-local scratch buffer for extension display-string building.
+// `format!` on each SAN / AIA / policy entry was producing one fresh String
+// per call with the macro-internal Vec growth pattern. Reusing a per-thread
+// String + writing into it + cloning once at exact size eliminates the
+// realloc churn — the clone alloc remains (we still need a heap String to
+// push), but the buffer reuse avoids repeated mid-grow reallocs.
+thread_local! {
+    static EXT_SCRATCH: RefCell<String> = RefCell::new(String::with_capacity(128));
+}
+
+/// Push `format!(...)` output into `dest`, going through the thread-local
+/// scratch to avoid the format!-macro internal realloc churn. The final
+/// clone is unavoidable (dest stores owned Strings).
+#[inline]
+fn push_formatted<A: smallvec::Array<Item = String>>(
+    dest: &mut SmallVec<A>,
+    args: std::fmt::Arguments<'_>,
+) {
+    EXT_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        // write! into a String is infallible.
+        let _ = std::fmt::Write::write_fmt(&mut *buf, args);
+        dest.push(buf.clone());
+    });
+}
+
+/// SAN deduplication borrows `&str` from the parsed certificate, so a
+/// duplicate name costs a lookup and a new name costs one `to_string` into
+/// `all_domains`.
+///
+/// §1.5a: `with_display_strings` controls whether to build the display-only
+/// extension fields (subject_alt_name, AIA, policies, KU, EKU, AKI, SKI,
+/// basicConstraints, ctl_poison_byte). When false, only `all_domains` is
+/// populated from the SAN extension (still needed by the `domains_only`
+/// stream); every other extension is left at its default. Deployments with
+/// `full=false, lite=false, domains_only=true` therefore skip the bulk of
+/// the per-cert allocation churn.
+fn parse_extensions<'cert>(
+    cert: &'cert X509Certificate,
+    all_domains: &mut DomainList,
+    seen_domains: &mut AHashSet<&'cert str>,
+    with_display_strings: bool,
+) -> Extensions {
     let mut ext = Extensions::default();
-    let mut san_parts: Vec<String> = Vec::new();
+    // §1.5c: SmallVec with inline capacity for the common cases (most certs
+    // have a handful of SANs; AIA / policy lists are typically ≤2-3 entries).
+    // Spills to heap transparently for high-SAN certs.
+    let mut san_parts: SmallVec<[String; 4]> = SmallVec::new();
 
     for extension in cert.extensions() {
         match extension.parsed_extension() {
+            // SAN must always run (it feeds `all_domains` for domains_only).
+            // Display strings inside the loop are gated.
+            ParsedExtension::SubjectAlternativeName(san) => {
+                for name in &san.general_names {
+                    match name {
+                        GeneralName::DNSName(dns) => {
+                            if seen_domains.insert(*dns) {
+                                all_domains.push(dns.to_string());
+                            }
+                            if with_display_strings {
+                                push_formatted(&mut san_parts, format_args!("DNS:{}", dns));
+                            }
+                        }
+                        GeneralName::RFC822Name(email) if with_display_strings => {
+                            push_formatted(&mut san_parts, format_args!("email:{}", email));
+                        }
+                        GeneralName::IPAddress(ip_bytes) if with_display_strings => {
+                            if let Some(ip) = parse_ip_address(ip_bytes) {
+                                push_formatted(&mut san_parts, format_args!("IP Address:{}", ip));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // All remaining extension types are display-only — skip when
+            // the caller has signalled no display strings are needed.
+            _ if !with_display_strings => {}
             ParsedExtension::AuthorityKeyIdentifier(aki) => {
                 if let Some(key_id) = &aki.key_identifier {
                     ext.authority_key_identifier = Some(format_key_id(key_id.0));
@@ -244,33 +479,11 @@ fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList, seen_d
                 };
                 ext.basic_constraints = Some(ca_str);
             }
-            ParsedExtension::SubjectAlternativeName(san) => {
-                for name in &san.general_names {
-                    match name {
-                        GeneralName::DNSName(dns) => {
-                            san_parts.push(format!("DNS:{}", dns));
-                            let domain = dns.to_string();
-                            if seen_domains.insert(domain.clone()) {
-                                all_domains.push(domain);
-                            }
-                        }
-                        GeneralName::RFC822Name(email) => {
-                            san_parts.push(format!("email:{}", email));
-                        }
-                        GeneralName::IPAddress(ip_bytes) => {
-                            if let Some(ip) = parse_ip_address(ip_bytes) {
-                                san_parts.push(format!("IP Address:{}", ip));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
             ParsedExtension::AuthorityInfoAccess(aia) => {
-                let mut aia_parts: Vec<String> = Vec::new();
+                let mut aia_parts: SmallVec<[String; 2]> = SmallVec::new();
                 for desc in &aia.accessdescs {
                     if let GeneralName::URI(uri) = &desc.access_location {
-                        aia_parts.push(format!("URI:{}", uri));
+                        push_formatted(&mut aia_parts, format_args!("URI:{}", uri));
                     }
                 }
                 if !aia_parts.is_empty() {
@@ -278,9 +491,12 @@ fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList, seen_d
                 }
             }
             ParsedExtension::CertificatePolicies(policies) => {
-                let mut policy_strs: Vec<String> = Vec::new();
+                let mut policy_strs: SmallVec<[String; 2]> = SmallVec::new();
                 for policy in policies.iter() {
-                    policy_strs.push(format!("Policy: {}\n", policy.policy_id));
+                    push_formatted(
+                        &mut policy_strs,
+                        format_args!("Policy: {}\n", policy.policy_id),
+                    );
                 }
                 if !policy_strs.is_empty() {
                     ext.certificate_policies = Some(policy_strs.concat());
@@ -295,7 +511,7 @@ fn parse_extensions(cert: &X509Certificate, all_domains: &mut DomainList, seen_d
         }
     }
 
-    if !san_parts.is_empty() {
+    if with_display_strings && !san_parts.is_empty() {
         ext.subject_alt_name = Some(san_parts.join(", "));
     }
 
@@ -352,38 +568,57 @@ fn calculate_sha1(data: &[u8]) -> String {
     hash
 }
 
-fn calculate_sha256(data: &[u8]) -> String {
+/// Returns the digest twice: raw bytes, which `DedupFilter` keys on without
+/// allocating, and the colon-hex form the wire format carries.
+fn calculate_sha256(data: &[u8]) -> ([u8; 32], String) {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let result = hasher.finalize();
+    let raw: [u8; 32] = result.into();
     let mut hash = String::with_capacity(32 * 3);
-    for (i, b) in result.iter().enumerate() {
+    for (i, b) in raw.iter().enumerate() {
         if i > 0 {
             hash.push(':');
         }
         let _ = write!(hash, "{:02X}", b);
     }
-    hash
+    (raw, hash)
 }
 
-fn parse_signature_algorithm(cert: &X509Certificate) -> String {
-    let oid = cert.signature_algorithm.algorithm.to_id_string();
-    match oid.as_str() {
-        "1.2.840.113549.1.1.2" => "md2, rsa".to_string(),
-        "1.2.840.113549.1.1.4" => "md5, rsa".to_string(),
-        "1.2.840.113549.1.1.5" => "sha1, rsa".to_string(),
-        "1.2.840.113549.1.1.11" => "sha256, rsa".to_string(),
-        "1.2.840.113549.1.1.12" => "sha384, rsa".to_string(),
-        "1.2.840.113549.1.1.13" => "sha512, rsa".to_string(),
-        "1.2.840.113549.1.1.10" => "sha256, rsa-pss".to_string(),
-        "1.2.840.10040.4.3" => "dsa, sha1".to_string(),
-        "2.16.840.1.101.3.4.3.2" => "dsa, sha256".to_string(),
-        "1.2.840.10045.4.1" => "ecdsa, sha1".to_string(),
-        "1.2.840.10045.4.3.2" => "ecdsa, sha256".to_string(),
-        "1.2.840.10045.4.3.3" => "ecdsa, sha384".to_string(),
-        "1.2.840.10045.4.3.4" => "ecdsa, sha512".to_string(),
-        "1.3.101.112" => "ed25519".to_string(),
-        _ => "unknown".to_string(),
+/// Maps the signature OID to a static name, so neither the OID nor the result
+/// is rendered to an owned string per certificate.
+fn parse_signature_algorithm(cert: &X509Certificate) -> &'static str {
+    let oid = &cert.signature_algorithm.algorithm;
+    if oid == &OID_SHA256_RSA {
+        "sha256, rsa"
+    } else if oid == &OID_ECDSA_SHA256 {
+        "ecdsa, sha256"
+    } else if oid == &OID_SHA384_RSA {
+        "sha384, rsa"
+    } else if oid == &OID_SHA512_RSA {
+        "sha512, rsa"
+    } else if oid == &OID_SHA1_RSA {
+        "sha1, rsa"
+    } else if oid == &OID_SHA256_RSA_PSS {
+        "sha256, rsa-pss"
+    } else if oid == &OID_ECDSA_SHA384 {
+        "ecdsa, sha384"
+    } else if oid == &OID_ECDSA_SHA512 {
+        "ecdsa, sha512"
+    } else if oid == &OID_ECDSA_SHA1 {
+        "ecdsa, sha1"
+    } else if oid == &OID_MD5_RSA {
+        "md5, rsa"
+    } else if oid == &OID_MD2_RSA {
+        "md2, rsa"
+    } else if oid == &OID_DSA_SHA1 {
+        "dsa, sha1"
+    } else if oid == &OID_DSA_SHA256 {
+        "dsa, sha256"
+    } else if oid == &OID_ED25519 {
+        "ed25519"
+    } else {
+        "unknown"
     }
 }
 
@@ -445,23 +680,35 @@ fn extended_key_usage_to_string(eku: &ExtendedKeyUsage) -> String {
     parts.join(", ")
 }
 
-const OID_X509_EXT_CT_POISON: Oid<'static> = oid!(1.3.6 .1 .4 .1 .11129 .2 .4 .3);
+const OID_X509_EXT_CT_POISON: Oid<'static> = oid!(1.3.6.1.4.1.11129.2.4.3);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     fn generate_self_signed_der(cn: &str) -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
-        params.distinguished_name.push(rcgen::DnType::OrganizationName, "Test Org");
-        params.distinguished_name.push(rcgen::DnType::CountryName, "US");
-        params.distinguished_name.push(rcgen::DnType::LocalityName, "San Francisco");
-        params.distinguished_name.push(rcgen::DnType::StateOrProvinceName, "California");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "Test Org");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CountryName, "US");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::LocalityName, "San Francisco");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::StateOrProvinceName, "California");
         params.is_ca = rcgen::IsCa::NoCa;
-        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
         cert.der().to_vec()
     }
 
@@ -469,18 +716,26 @@ mod tests {
         let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
         let mut params = rcgen::CertificateParams::new(san_strings).unwrap();
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
         params.is_ca = rcgen::IsCa::NoCa;
-        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
         cert.der().to_vec()
     }
 
     fn generate_ca_cert_der(cn: &str) -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
         cert.der().to_vec()
     }
 
@@ -504,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_format_serial_number_basic() {
-        assert_eq!(format_serial_number(&[0x00, 0xFF, 0x10]), "00FF10");
+        assert_eq!(format_serial_number([0x00, 0xFF, 0x10]), "00FF10");
     }
 
     #[test]
@@ -515,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_format_serial_number_single_byte() {
-        assert_eq!(format_serial_number(&[0x0A]), "0A");
+        assert_eq!(format_serial_number([0x0A]), "0A");
     }
 
     #[test]
@@ -531,11 +786,13 @@ mod tests {
     #[test]
     fn test_calculate_sha256_known_value() {
         // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-        let hash = calculate_sha256(b"");
+        let (raw, hash) = calculate_sha256(b"");
         assert_eq!(
             hash,
             "E3:B0:C4:42:98:FC:1C:14:9A:FB:F4:C8:99:6F:B9:24:27:AE:41:E4:64:9B:93:4C:A4:95:99:1B:78:52:B8:55"
         );
+        assert_eq!(raw[0], 0xe3);
+        assert_eq!(raw[1], 0xb0);
     }
 
     #[test]
@@ -630,7 +887,10 @@ mod tests {
     fn test_parse_certificate_valid_der() {
         let der = generate_self_signed_der("test.com");
         let result = parse_certificate(&der, true);
-        assert!(result.is_some(), "parse_certificate should succeed for a valid DER cert");
+        assert!(
+            result.is_some(),
+            "parse_certificate should succeed for a valid DER cert"
+        );
 
         let leaf = result.unwrap();
 
@@ -655,17 +915,26 @@ mod tests {
         );
 
         // Signature algorithm: rcgen uses ECDSA P-256 by default
-        assert_eq!(leaf.signature_algorithm, "ecdsa, sha256");
+        assert_eq!(leaf.signature_algorithm.as_ref(), "ecdsa, sha256");
 
         // is_ca should be false (we set IsCa::NoCa)
         assert!(!leaf.is_ca);
 
         // SHA1 and SHA256 fingerprints should be colon-separated hex
         assert!(leaf.sha1.contains(':'), "sha1 should be colon-separated");
-        assert!(leaf.sha256.contains(':'), "sha256 should be colon-separated");
+        assert!(
+            leaf.sha256.contains(':'),
+            "sha256 should be colon-separated"
+        );
+
+        // sha256_raw should be non-zero for a real cert
+        assert_ne!(
+            leaf.sha256_raw, [0u8; 32],
+            "sha256_raw should not be all zeros"
+        );
 
         // fingerprint == sha1
-        assert_eq!(leaf.fingerprint, leaf.sha1);
+        assert_eq!(&*leaf.fingerprint, leaf.sha1.as_str());
 
         // as_der should be present when include_der=true
         assert!(leaf.as_der.is_some());
@@ -680,9 +949,21 @@ mod tests {
 
         // Subject aggregated field should contain /CN=test.com
         let agg = leaf.subject.aggregated.as_ref().unwrap();
-        assert!(agg.contains("/CN=test.com"), "aggregated should contain /CN=test.com, got: {}", agg);
-        assert!(agg.contains("/O=Test Org"), "aggregated should contain /O=Test Org, got: {}", agg);
-        assert!(agg.contains("/C=US"), "aggregated should contain /C=US, got: {}", agg);
+        assert!(
+            agg.contains("/CN=test.com"),
+            "aggregated should contain /CN=test.com, got: {}",
+            agg
+        );
+        assert!(
+            agg.contains("/O=Test Org"),
+            "aggregated should contain /O=Test Org, got: {}",
+            agg
+        );
+        assert!(
+            agg.contains("/C=US"),
+            "aggregated should contain /C=US, got: {}",
+            agg
+        );
 
         // all_domains should include "test.com" from the CN (no SANs in this cert)
         assert!(
@@ -700,7 +981,11 @@ mod tests {
         // subject_key_identifier may or may not be present depending on rcgen version.
         // If present, it should start with "keyid:"
         if let Some(ref ski) = leaf.extensions.subject_key_identifier {
-            assert!(ski.starts_with("keyid:"), "SKI should start with keyid:, got: {}", ski);
+            assert!(
+                ski.starts_with("keyid:"),
+                "SKI should start with keyid:, got: {}",
+                ski
+            );
         }
     }
 
@@ -710,7 +995,10 @@ mod tests {
         let result = parse_certificate(&der, false);
         assert!(result.is_some());
         let leaf = result.unwrap();
-        assert!(leaf.as_der.is_none(), "as_der should be None when include_der=false");
+        assert!(
+            leaf.as_der.is_none(),
+            "as_der should be None when include_der=false"
+        );
     }
 
     #[test]
@@ -720,27 +1008,53 @@ mod tests {
         let b = parse_certificate(&der, true).unwrap();
         assert_eq!(a.sha1, b.sha1);
         assert_eq!(a.sha256, b.sha256);
+        assert_eq!(a.sha256_raw, b.sha256_raw);
         assert_eq!(a.serial_number, b.serial_number);
     }
 
     #[test]
     fn test_parse_certificate_with_sans() {
-        let der = generate_cert_with_sans("primary.com", &["alt1.com", "alt2.com", "*.wildcard.com"]);
+        let der =
+            generate_cert_with_sans("primary.com", &["alt1.com", "alt2.com", "*.wildcard.com"]);
         let leaf = parse_certificate(&der, true).unwrap();
 
         assert_eq!(leaf.subject.cn.as_deref(), Some("primary.com"));
 
         // all_domains should contain the CN plus all SANs (deduplicated)
-        assert!(leaf.all_domains.iter().any(|d| d == "primary.com"), "should contain CN");
-        assert!(leaf.all_domains.iter().any(|d| d == "alt1.com"), "should contain alt1.com SAN");
-        assert!(leaf.all_domains.iter().any(|d| d == "alt2.com"), "should contain alt2.com SAN");
-        assert!(leaf.all_domains.iter().any(|d| d == "*.wildcard.com"), "should contain wildcard SAN");
+        assert!(
+            leaf.all_domains.iter().any(|d| d == "primary.com"),
+            "should contain CN"
+        );
+        assert!(
+            leaf.all_domains.iter().any(|d| d == "alt1.com"),
+            "should contain alt1.com SAN"
+        );
+        assert!(
+            leaf.all_domains.iter().any(|d| d == "alt2.com"),
+            "should contain alt2.com SAN"
+        );
+        assert!(
+            leaf.all_domains.iter().any(|d| d == "*.wildcard.com"),
+            "should contain wildcard SAN"
+        );
 
         // SAN extension should be present
         let san = leaf.extensions.subject_alt_name.as_ref().unwrap();
-        assert!(san.contains("DNS:alt1.com"), "SAN should contain DNS:alt1.com, got: {}", san);
-        assert!(san.contains("DNS:alt2.com"), "SAN should contain DNS:alt2.com, got: {}", san);
-        assert!(san.contains("DNS:*.wildcard.com"), "SAN should contain DNS:*.wildcard.com, got: {}", san);
+        assert!(
+            san.contains("DNS:alt1.com"),
+            "SAN should contain DNS:alt1.com, got: {}",
+            san
+        );
+        assert!(
+            san.contains("DNS:alt2.com"),
+            "SAN should contain DNS:alt2.com, got: {}",
+            san
+        );
+        assert!(
+            san.contains("DNS:*.wildcard.com"),
+            "SAN should contain DNS:*.wildcard.com, got: {}",
+            san
+        );
     }
 
     #[test]
@@ -750,7 +1064,10 @@ mod tests {
 
         assert_eq!(leaf.subject.cn.as_deref(), Some("My Root CA"));
         assert!(leaf.is_ca, "CA cert should have is_ca=true");
-        assert_eq!(leaf.extensions.basic_constraints.as_deref(), Some("CA:TRUE"));
+        assert_eq!(
+            leaf.extensions.basic_constraints.as_deref(),
+            Some("CA:TRUE")
+        );
 
         // CA certs should NOT add the CN to all_domains
         assert!(
@@ -761,14 +1078,14 @@ mod tests {
 
     #[test]
     fn test_parse_chain_from_bytes_empty() {
-        let chain = parse_chain_from_bytes(&[], 0);
+        let chain = parse_chain_from_bytes(&[], 0, ParseOptions::default());
         assert!(chain.is_empty());
     }
 
     #[test]
     fn test_parse_chain_from_bytes_too_short() {
         // Only 3 bytes (the chain-length prefix) with zero length, no certs
-        let chain = parse_chain_from_bytes(&[0, 0, 0], 0);
+        let chain = parse_chain_from_bytes(&[0, 0, 0], 0, ParseOptions::default());
         assert!(chain.is_empty());
     }
 
@@ -779,19 +1096,19 @@ mod tests {
 
         // Build extra_bytes: 3-byte chain length + 3-byte cert length + cert DER
         let chain_total_len = 3 + cert_len;
-        let mut extra = Vec::new();
-        // 3-byte chain length (big-endian u24)
-        extra.push(((chain_total_len >> 16) & 0xFF) as u8);
-        extra.push(((chain_total_len >> 8) & 0xFF) as u8);
-        extra.push((chain_total_len & 0xFF) as u8);
-        // 3-byte cert length
-        extra.push(((cert_len >> 16) & 0xFF) as u8);
-        extra.push(((cert_len >> 8) & 0xFF) as u8);
-        extra.push((cert_len & 0xFF) as u8);
+        // 3-byte chain length (big-endian u24) + 3-byte cert length
+        let mut extra = vec![
+            ((chain_total_len >> 16) & 0xFF) as u8,
+            ((chain_total_len >> 8) & 0xFF) as u8,
+            (chain_total_len & 0xFF) as u8,
+            ((cert_len >> 16) & 0xFF) as u8,
+            ((cert_len >> 8) & 0xFF) as u8,
+            (cert_len & 0xFF) as u8,
+        ];
         // cert DER bytes
         extra.extend_from_slice(&cert_der);
 
-        let chain = parse_chain_from_bytes(&extra, 0);
+        let chain = parse_chain_from_bytes(&extra, 0, ParseOptions::default());
         assert_eq!(chain.len(), 1, "should parse exactly one chain cert");
         assert_eq!(chain[0].subject.cn.as_deref(), Some("chain-test.com"));
     }
