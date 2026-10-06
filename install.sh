@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install certstream-server-rust from GitHub releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/reloading01/certstream-server-rust/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/1mentat/certstream-server-rust/main/install.sh | sh
 #
 # Environment:
 #   VERSION   release to install, e.g. v1.5.5 (default: latest)
@@ -9,7 +9,7 @@
 #             /usr/local/bin); set PREFIX=$HOME/.local to avoid needing root
 set -eu
 
-REPO="reloading01/certstream-server-rust"
+REPO="1mentat/certstream-server-rust"
 PREFIX="${PREFIX:-/usr/local}"
 VERSION="${VERSION:-latest}"
 BIN="certstream-server-rust"
