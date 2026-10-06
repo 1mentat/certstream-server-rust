@@ -2,9 +2,7 @@
 name = "certstream-server-rust"
 version = "1.6.1"
 edition = "2024"
-repository = "https://github.com/reloading01/certstream-server-rust"
-homepage = "https://certstream.dev"
-documentation = "https://certstream.dev/docs.html"
+repository = "https://github.com/1mentat/certstream-server-rust"
 license = "MIT"
 readme = "README.md"
 description = "High-performance Certificate Transparency log streaming server"
@@ -121,8 +119,8 @@ smallvec = "1.15"
 # systemd unit and the example config. The unit uses DynamicUser, so there is
 # no account to create in a maintainer script.
 [package.metadata.deb]
-maintainer = "reloading01 <reloading01@users.noreply.github.com>"
-copyright = "2026, reloading01"
+maintainer = "1mentat <1mentat@users.noreply.github.com>"
+copyright = "2026, 1mentat"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 Monitors every Chrome- and Apple-trusted Certificate Transparency log and \

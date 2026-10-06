@@ -2,10 +2,9 @@
 
 A Certstream server written in Rust. It monitors Certificate Transparency (CT) logs and streams newly issued SSL/TLS certificates over WebSocket and Server-Sent Events (SSE).
 
-[![GHCR](https://img.shields.io/badge/ghcr.io-reloading01%2Fcertstream--server--rust-blue?logo=github)](https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust)
+[![GHCR](https://img.shields.io/badge/ghcr.io-1mentat%2Fcertstream--server--rust-blue?logo=github)](https://github.com/1mentat/certstream-server-rust/pkgs/container/certstream-server-rust)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ff69b4?logo=githubsponsors)](https://github.com/sponsors/reloading01)
 
 ## Overview
 
@@ -41,7 +40,7 @@ Prebuilt Linux binaries use static musl builds and do not depend on the host gli
 Linux and macOS, x86_64 and arm64:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/reloading01/certstream-server-rust/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/1mentat/certstream-server-rust/main/install.sh | sh
 ```
 
 The installer verifies the published checksum and refuses to install if one is unavailable.
@@ -49,58 +48,19 @@ The installer verifies the published checksum and refuses to install if one is u
 Use a custom prefix to avoid installing under `/usr/local`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/reloading01/certstream-server-rust/main/install.sh | PREFIX="$HOME/.local" sh
+curl -fsSL https://raw.githubusercontent.com/1mentat/certstream-server-rust/main/install.sh | PREFIX="$HOME/.local" sh
 ```
 
 Pin a release with `VERSION`, for example `VERSION=v1.6.0`.
 
-### Homebrew
-
-```bash
-brew install reloading01/tap/certstream-server-rust
-```
-
-### Debian / Ubuntu
-
-```bash
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://reloading01.github.io/packages/key.gpg | sudo tee /etc/apt/keyrings/certstream.asc > /dev/null
-
-echo "deb [signed-by=/etc/apt/keyrings/certstream.asc] https://reloading01.github.io/packages/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/certstream.list
-
-sudo apt update
-sudo apt install certstream-server-rust
-sudo systemctl enable --now certstream-server-rust
-```
-
-### Fedora / RHEL / openSUSE
-
-```bash
-sudo rpm --import https://reloading01.github.io/packages/key.gpg
-
-sudo tee /etc/yum.repos.d/certstream.repo > /dev/null <<'REPO'
-[certstream]
-name=certstream-server-rust
-baseurl=https://reloading01.github.io/packages/rpm
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://reloading01.github.io/packages/key.gpg
-REPO
-
-sudo dnf install certstream-server-rust
-sudo systemctl enable --now certstream-server-rust
-```
-
-Both package repositories are signed. `.deb` and `.rpm` files are also attached to each [GitHub release](https://github.com/reloading01/certstream-server-rust/releases/latest).
+`.deb` and `.rpm` packages are attached to each [GitHub release](https://github.com/1mentat/certstream-server-rust/releases/latest).
 
 The packaged systemd unit runs under `DynamicUser`, stores CT log positions in `/var/lib/certstream`, and reads settings from `/etc/default/certstream-server-rust`.
 
 ### Cargo
 
 ```bash
-cargo install certstream-server-rust
+cargo install --git https://github.com/1mentat/certstream-server-rust
 ```
 
 ### Docker
@@ -108,7 +68,7 @@ cargo install certstream-server-rust
 Minimal:
 
 ```bash
-docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest
+docker run -d -p 8080:8080 ghcr.io/1mentat/certstream-server-rust:latest
 ```
 
 With persistent state and connection limits:
@@ -121,7 +81,7 @@ docker run -d \
   -v certstream-state:/data \
   -e CERTSTREAM_CT_LOG_STATE_FILE=/data/state.json \
   -e CERTSTREAM_CONNECTION_LIMIT_ENABLED=true \
-  ghcr.io/reloading01/certstream-server-rust:latest
+  ghcr.io/1mentat/certstream-server-rust:latest
 ```
 
 No configuration is required for a basic deployment. The server discovers CT logs automatically, serves WebSocket on port `8080`, and persists its position so restarts resume instead of replaying log history.
@@ -349,7 +309,7 @@ jemalloc settings can be overridden without rebuilding:
 ```bash
 docker run \
   -e _RJEM_MALLOC_CONF=dirty_decay_ms:30000,muzzy_decay_ms:30000 \
-  ghcr.io/reloading01/certstream-server-rust:latest
+  ghcr.io/1mentat/certstream-server-rust:latest
 ```
 
 Useful allocator metrics include:
@@ -394,7 +354,7 @@ See [RELEASE_NOTES.md](RELEASE_NOTES.md) for version history.
 
 ## Support
 
-If the project is useful to you, starring the repository or sharing it with others is appreciated. You can also [sponsor the project on GitHub](https://github.com/sponsors/reloading01).
+If the project is useful to you, starring the repository or sharing it with others is appreciated.
 
 ## License
 
