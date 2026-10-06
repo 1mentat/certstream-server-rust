@@ -1,19 +1,31 @@
-FROM rust:1.86-alpine AS builder
+# syntax=docker/dockerfile:1.7
+FROM rust:1.95-alpine AS builder
+ARG TARGETPLATFORM
 
-RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
+# build-base + make: tikv-jemalloc-sys compiles jemalloc from source.
+# protoc: build.rs compiles proto/cert_record.proto (ZeroBus wire format).
+RUN apk add --no-cache build-base make musl-dev pkgconf openssl-dev openssl-libs-static protoc protobuf-dev
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
+COPY build.rs ./build.rs
+COPY proto ./proto
 COPY src ./src
 
 ENV OPENSSL_STATIC=1
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    case "$TARGETPLATFORM" in \
+      "linux/amd64"|"") export RUSTFLAGS="-C target-cpu=x86-64-v3" ;; \
+    esac && \
+    cargo build --release && \
+    cp target/release/certstream-server-rust /usr/local/bin/certstream-server-rust
 
 FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates curl
 
-COPY --from=builder /app/target/release/certstream-server-rust /usr/local/bin/
+COPY --from=builder /usr/local/bin/certstream-server-rust /usr/local/bin/
 
 EXPOSE 8080
 

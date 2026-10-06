@@ -6,15 +6,43 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
 
 env:
-  DOCKER_IMAGE: reloading01/certstream-server-rust
+  DOCKER_IMAGE: ghcr.io/1mentat/certstream-server-rust
+
+# Pushing twice in quick succession used to leave two multi-platform image
+# builds running against the same ref, each taking about two hours to produce
+# the same thing. Tags are excluded: a release build should never be cancelled
+# by a later one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # `contents: write` for the "Ensure release exists" step below, which
+    # creates the release the upload jobs then attach assets to. The workflow
+    # default stays `read`; the jobs that write to a release ask for it, as
+    # `binaries` and `packages` already do.
+    permissions:
+      contents: write
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      # build.rs compiles proto/cert_record.proto (ZeroBus wire format).
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install protobuf; \
+          else sudo apt-get update && sudo apt-get install -y protobuf-compiler; fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -34,12 +62,27 @@ jobs:
       - name: Run tests
         run: cargo test --release
 
+      # Pushing a tag does not create a release, and the upload steps in the
+      # jobs below need one to exist. Creating it here, once, avoids each of
+      # them racing to create it.
+      - name: Ensure release exists
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                 --title "${GITHUB_REF_NAME}" --generate-notes
+
   docker:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      (github.event_name == 'release' && github.event.action == 'published') ||
+      (github.event_name == 'workflow_dispatch')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -47,11 +90,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -72,3 +116,165 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Prebuilt binaries for people who do not want a container. Linux targets are
+  # static musl builds so they run on any glibc vintage; jemalloc is compiled
+  # from source, hence build-base on the musl runners.
+  #
+  # No `-C target-cpu` here on purpose. The Docker image builds with
+  # x86-64-v3 because the operator picks the host it runs on; a downloaded
+  # binary has to start on whatever CPU the user has.
+  binaries:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          # Cross-compiled from the arm64 runner: Intel macOS runners now sit
+          # in the queue for the better part of an hour, and the Apple
+          # toolchain targets both architectures from either host anyway.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # build.rs compiles proto/cert_record.proto (ZeroBus wire format).
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install protobuf; \
+          else sudo apt-get update && sudo apt-get install -y protobuf-compiler; fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Ubuntu's musl-tools cannot build jemalloc for aarch64: its configure
+      # cannot see the atomics through the unprefixed cross wrapper and fails
+      # with "Don't have atomics implemented on this platform". Building inside
+      # Alpine sidesteps it entirely, and it is the same environment the
+      # container image already builds in.
+      - name: Build (musl, inside Alpine)
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          docker run --rm -v "$PWD":/w -w /w -e CARGO_HOME=/w/.cargo-home \
+            rust:1.95-alpine sh -c \
+            'apk add --no-cache build-base musl-dev protoc && cargo build --release --locked'
+          sudo chown -R "$(id -u):$(id -g)" target .cargo-home
+          mkdir -p "target/${{ matrix.target }}/release"
+          cp target/release/certstream-server-rust "target/${{ matrix.target }}/release/"
+
+      - name: Build
+        if: "!endsWith(matrix.target, '-musl')"
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="certstream-server-rust-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/certstream-server-rust" "dist/${name}/"
+          cp README.md LICENSE config.example.yaml "dist/${name}/"
+          tar -czf "${name}.tar.gz" -C dist "${name}"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          else
+            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          fi
+          echo "archive=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "${{ steps.package.outputs.archive }}" "${{ steps.package.outputs.archive }}.sha256" --clobber
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: ${{ steps.package.outputs.archive }}*
+
+  # .deb and .rpm for people who install services rather than run containers.
+  # Both carry the systemd unit; it uses DynamicUser, so neither package needs
+  # a maintainer script to create an account.
+  packages:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # build.rs compiles proto/cert_record.proto (ZeroBus wire format).
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install protobuf; \
+          else sudo apt-get update && sudo apt-get install -y protobuf-compiler; fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      # Same jemalloc/musl problem as the binaries job; build in Alpine and
+      # place the result where cargo-deb and cargo-generate-rpm expect it.
+      - name: Build (musl, inside Alpine)
+        run: |
+          docker run --rm -v "$PWD":/w -w /w -e CARGO_HOME=/w/.cargo-home \
+            rust:1.95-alpine sh -c \
+            'apk add --no-cache build-base musl-dev protoc && cargo build --release --locked'
+          sudo chown -R "$(id -u):$(id -g)" target .cargo-home
+          mkdir -p "target/${{ matrix.target }}/release"
+          cp target/release/certstream-server-rust "target/${{ matrix.target }}/release/"
+
+      - name: Build .deb
+        run: cargo deb --no-build --target ${{ matrix.target }} --output "dist/"
+
+      - name: Build .rpm
+        run: |
+          mkdir -p dist
+          cargo generate-rpm --target ${{ matrix.target }} --output "dist/"
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for f in dist/*.deb dist/*.rpm; do
+            [ -e "$f" ] || continue
+            gh release upload "${GITHUB_REF_NAME}" "$f" --clobber
+          done
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.target }}
+          path: dist/*

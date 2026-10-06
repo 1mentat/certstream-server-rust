@@ -1,10 +1,13 @@
-use crate::config::{CustomCtLog, StaticCtLog};
+use crate::config::{CustomCtLog, StaticCtLog, TreeSizeSource};
+use crate::ct::catalog::{self, CatalogFetch, SignedCatalog};
+use crate::ct::normalize::{normalize_log_origin, normalize_operator, normalize_url};
 use futures::future::join_all;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Error, Debug)]
 pub enum LogListError {
@@ -20,28 +23,109 @@ struct LogListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Operator {
     name: String,
+    #[serde(default)]
     logs: Vec<RawCtLog>,
+    /// Apple's log list (and Google's v3 starting in 2026) carry static-ct-api endpoints
+    /// here. Older Google lists omit the field, hence the default. Operators that only
+    /// run tiled logs may also have an empty `logs` array.
+    #[serde(default)]
+    tiled_logs: Vec<RawTiledLog>,
+    /// Recognized-but-unused v3 fields. Captured explicitly so they do not trip
+    /// the unknown-field counter.
+    #[serde(default)]
+    email: Option<serde_json::Value>,
+    /// Genuinely unknown operator-level keys are captured and counted, never a
+    /// parse crash.
+    #[serde(flatten)]
+    _other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RawCtLog {
+    /// Absent on `pending` and `test` entries.
+    #[serde(default)]
     description: String,
     url: String,
     #[serde(default)]
+    log_id: Option<String>,
+    #[serde(default)]
     state: Option<LogState>,
+    /// Recognized v3 fields not consumed by the runtime. Captured so they do
+    /// not trip unknown-field metrics.
+    /// `log_type` is Google's "prod"/"test" marker.
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    mmd: Option<u64>,
+    #[serde(default)]
+    temporal_interval: Option<serde_json::Value>,
+    #[serde(default)]
+    previous_operators: Option<serde_json::Value>,
+    #[serde(default)]
+    log_type: Option<String>,
+    #[serde(flatten)]
+    _other: HashMap<String, serde_json::Value>,
 }
 
+/// Schema for a static-ct-api / Sunlight log entry as it appears in Apple's
+/// `current_log_list.json` and Google's v3 list. The submission URL doubles as
+/// the checkpoint origin (schema-less, trailing-slash-stripped).
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RawTiledLog {
+    /// Absent on `pending` and `test` entries.
+    #[serde(default)]
+    description: String,
+    monitoring_url: String,
+    submission_url: String,
+    #[serde(default)]
+    log_id: Option<String>,
+    #[serde(default)]
+    state: Option<LogState>,
+    /// Recognized v3 fields (see `RawCtLog`). `tls_only` is the tiled-log marker
+    /// for submission over a TLS-authenticated connection.
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    mmd: Option<u64>,
+    #[serde(default)]
+    temporal_interval: Option<serde_json::Value>,
+    #[serde(default)]
+    previous_operators: Option<serde_json::Value>,
+    #[serde(default)]
+    log_type: Option<String>,
+    #[serde(default)]
+    tls_only: Option<bool>,
+    #[serde(flatten)]
+    _other: HashMap<String, serde_json::Value>,
+}
+
+/// Mirror of the v3 log-list `state` object. Prod code only branches on
+/// `rejected`/`retired` today; `pending`/`qualified`/`usable`/`readonly` are
+/// declared so serde recognizes the full lifecycle. Unknown state keys are
+/// captured in `_other` and counted as an unknown enum rather than silently
+/// dropped.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct LogState {
     #[serde(default)]
+    pending: Option<StateInfo>,
+    #[serde(default)]
+    qualified: Option<StateInfo>,
+    #[serde(default)]
     usable: Option<StateInfo>,
+    #[serde(default)]
+    readonly: Option<StateInfo>,
     #[serde(default)]
     retired: Option<StateInfo>,
     #[serde(default)]
     rejected: Option<StateInfo>,
+    #[serde(flatten)]
+    _other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,12 +141,37 @@ pub enum LogType {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CtLog {
     pub description: String,
     pub url: String,
+    /// Canonical operator key: lowercased, punctuation collapsed. Groups a
+    /// log with its operator's other logs for rate limiting, and is the same
+    /// string `ct_log.operator_rate_limits` is keyed by. Not a display name —
+    /// "Let's Encrypt" canonicalises to "lets encrypt".
     pub operator: String,
+    /// The operator's name as the catalog spells it. Empty for a locally
+    /// configured log that declares none, in which case callers fall back to
+    /// `operator`.
+    pub operator_display: String,
     pub log_type: LogType,
+    /// Explicit checkpoint origin override (see `StaticCtLog::log_origin`).
+    pub log_origin: Option<String>,
+    /// Base64-encoded log ID (SHA-256 of the log's public key). Used to dedupe
+    /// logs that appear in multiple log lists (e.g. Google + Apple).
+    pub log_id: Option<String>,
+    /// Base64-encoded SubjectPublicKeyInfo (DER) of the log's public key, as
+    /// carried in the CT log lists. Consumed by static-CT checkpoint signature
+    /// verification (see `verify_checkpoint_signature`). `None` for logs whose
+    /// list entry omits the key or for config-defined logs without one.
+    pub key: Option<String>,
+    /// Optional per-log override; `None` means use the global CT config.
+    pub batch_size: Option<u64>,
+    /// Optional per-log override; `None` means use the global CT config.
+    pub poll_interval_ms: Option<u64>,
+    /// Static-CT only: where the watcher reads the tree head from. Catalog
+    /// discovery always yields `Checkpoint`; only a local `static_logs` entry
+    /// can ask for `GetSth`.
+    pub tree_size_source: TreeSizeSource,
     state: Option<LogState>,
 }
 
@@ -75,6 +184,16 @@ impl CtLog {
             }
             // state: null - include these too (e.g., Solera logs that work but aren't marked usable yet)
             None => true,
+        }
+    }
+
+    /// The operator's name as a person would write it, falling back to the
+    /// canonical key when the source carries no display name.
+    pub fn operator_name(&self) -> &str {
+        if self.operator_display.is_empty() {
+            &self.operator
+        } else {
+            &self.operator_display
         }
     }
 
@@ -94,22 +213,148 @@ impl From<CustomCtLog> for CtLog {
             description: custom.name,
             url: custom.url,
             operator: "Custom".to_string(),
+            operator_display: String::new(),
             log_type: LogType::Rfc6962,
+            log_origin: None,
+            log_id: custom.expected_log_id,
+            key: None,
+            batch_size: custom.batch_size,
+            poll_interval_ms: custom.poll_interval_ms,
+            tree_size_source: TreeSizeSource::default(),
             state: None,
         }
     }
 }
+
+/// Operator name a locally-configured static log carries when it neither
+/// declares one nor inherits one from a discovered log.
+pub const UNATTRIBUTED_STATIC_OPERATOR: &str = "Static CT";
 
 impl From<StaticCtLog> for CtLog {
     fn from(static_log: StaticCtLog) -> Self {
         Self {
             description: static_log.name,
             url: static_log.url,
-            operator: "Static CT".to_string(),
+            operator: static_log
+                .operator
+                .unwrap_or_else(|| UNATTRIBUTED_STATIC_OPERATOR.to_string()),
+            operator_display: String::new(),
             log_type: LogType::StaticCt,
+            log_origin: static_log.log_origin,
+            log_id: static_log.expected_log_id,
+            key: static_log.key,
+            batch_size: static_log.batch_size,
+            poll_interval_ms: static_log.poll_interval_ms,
+            tree_size_source: static_log.tree_size_source,
             state: None,
         }
     }
+}
+
+/// Give each override the operator name of the log it replaces.
+///
+/// Outbound rate limits are keyed by operator, and `From<StaticCtLog>` stamps
+/// every local entry with [`UNATTRIBUTED_STATIC_OPERATOR`]. Left alone, all
+/// the overrides for one operator share a single bucket under a name that
+/// matches no `operator_rate_limits` key, while that operator's other logs
+/// sit in their own. An override that declares its own `operator` keeps it,
+/// and one that replaces nothing keeps the generic name.
+pub fn inherit_operators(discovered: &[CtLog], overrides: &mut [CtLog]) {
+    let by_id: HashMap<&str, (&str, &str)> = discovered
+        .iter()
+        .filter_map(|l| {
+            l.log_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(|id| (id, (l.operator.as_str(), l.operator_display.as_str())))
+        })
+        .collect();
+
+    for override_log in overrides {
+        if override_log.operator != UNATTRIBUTED_STATIC_OPERATOR {
+            continue;
+        }
+        if let Some((operator, display)) = override_log
+            .log_id
+            .as_deref()
+            .and_then(|id| by_id.get(id))
+        {
+            override_log.operator_display = (*display).to_string();
+            override_log.operator = (*operator).to_string();
+        }
+    }
+}
+
+/// Check local log overrides against discovered catalog identity.
+///
+/// A local override that declares an expected CT log ID and matches a discovered
+/// log must agree on the non-replaceable identity fields: transport, normalized
+/// fetch URL, and — when the override explicitly declares one — the checkpoint
+/// `log_origin`. An override that omits `log_origin` (deriving it) is not checked,
+/// so the common `mon.*` monitoring vs `log.*` submission split never false-flags;
+/// but an explicitly declared origin that contradicts the signed catalog's
+/// submission origin for the same log ID is a conflict, since the origin is the
+/// static-CT checkpoint signature domain.
+pub fn local_override_conflicts(discovered: &[CtLog], overrides: &[CtLog]) -> Vec<String> {
+    let mut by_id: HashMap<&str, &CtLog> = HashMap::new();
+    for log in discovered {
+        if let Some(id) = log.log_id.as_deref().filter(|id| !id.is_empty()) {
+            by_id.insert(id, log);
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for override_log in overrides {
+        let Some(id) = override_log.log_id.as_deref().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let Some(discovered_log) = by_id.get(id) else {
+            continue;
+        };
+
+        // A `get_sth` override deliberately reads an RFC 6962 log over the
+        // tile protocol, so the transports are expected to disagree: that is
+        // the whole point of the mode, and the config had to say so
+        // explicitly. Every other transport mismatch is still a conflict,
+        // since silently switching protocols on a discovered log would change
+        // what is being verified.
+        let deliberate_hybrid = override_log.tree_size_source == TreeSizeSource::GetSth
+            && override_log.log_type == LogType::StaticCt
+            && discovered_log.log_type == LogType::Rfc6962;
+        if override_log.log_type != discovered_log.log_type && !deliberate_hybrid {
+            conflicts.push(format!(
+                "override '{}' expected CT log ID {id} has log_type {:?} but discovered log has {:?}",
+                override_log.description, override_log.log_type, discovered_log.log_type
+            ));
+        }
+
+        let override_url = normalize_url(&override_log.url);
+        let discovered_url = normalize_url(&discovered_log.url);
+        if override_url != discovered_url {
+            conflicts.push(format!(
+                "override '{}' expected CT log ID {id} url '{override_url}' disagrees with discovered url '{discovered_url}'",
+                override_log.description
+            ));
+        }
+
+        // Only check the origin when the override explicitly declares one; a
+        // derived (None) origin makes no claim to contradict.
+        if let (Some(override_origin), Some(discovered_origin)) = (
+            override_log.log_origin.as_deref(),
+            discovered_log.log_origin.as_deref(),
+        ) {
+            let override_origin = normalize_log_origin(override_origin);
+            let discovered_origin = normalize_log_origin(discovered_origin);
+            if override_origin != discovered_origin {
+                conflicts.push(format!(
+                    "override '{}' expected CT log ID {id} log_origin '{override_origin}' disagrees with discovered log_origin '{discovered_origin}'",
+                    override_log.description
+                ));
+            }
+        }
+    }
+
+    conflicts
 }
 
 #[cfg(test)]
@@ -118,67 +363,299 @@ fn make_test_log(description: &str, url: &str, state: Option<LogState>) -> CtLog
         description: description.to_string(),
         url: url.to_string(),
         operator: "TestOp".to_string(),
+        operator_display: String::new(),
         log_type: LogType::Rfc6962,
+        log_origin: None,
+        log_id: None,
+        key: None,
+        batch_size: None,
+        poll_interval_ms: None,
+        tree_size_source: TreeSizeSource::Checkpoint,
         state,
     }
 }
 
+/// Probe a log for reachability. Dispatches by `LogType`:
+/// - `Rfc6962` logs respond on `/ct/v1/get-sth`.
+/// - `StaticCt` logs respond on `/checkpoint`.
+///
+/// Static-CT logs do not implement `get-sth`, so attempting it produces false
+/// negatives. When the spec evolves and a log temporarily exposes both, either
+/// endpoint is sufficient — we treat any `200` on the type-appropriate URL as
+/// reachable.
+async fn probe_log(client: &Client, log: &CtLog) -> bool {
+    let url = match log.log_type {
+        LogType::Rfc6962 => format!("{}/ct/v1/get-sth", log.normalized_url()),
+        LogType::StaticCt => format!("{}/checkpoint", log.normalized_url()),
+    };
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) => {
+            debug!(log = %log.description, status = %resp.status(), kind = ?log.log_type, "log not reachable");
+            false
+        }
+        Err(_) => {
+            debug!(log = %log.description, kind = ?log.log_type, "log not reachable");
+            false
+        }
+    }
+}
+
+/// Parse already-fetched catalog JSON bytes into `CtLog` candidates. Unknown
+/// operator/log keys are counted, never a parse crash; malformed catalog JSON
+/// yields zero entries and a counted skip rather than aborting the whole
+/// refresh.
+///
+/// `source_name` is the `catalog_source` metric label. Operator names are
+/// canonicalized via `normalize_operator`; static-ct origins via
+/// `normalize_log_origin`. RFC-6962 entries come from `operators[].logs`,
+/// static-CT entries from `operators[].tiled_logs`.
+fn parse_list(bytes: &[u8], source_name: &str) -> Vec<CtLog> {
+    let response: LogListResponse = match serde_json::from_slice(bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            metrics::counter!(
+                "certstream_catalog_entry_skipped_total",
+                "catalog_source" => source_name.to_string(),
+                "reason" => "list_parse_error"
+            )
+            .increment(1);
+            warn!(catalog_source = source_name, error = %e, "catalog list failed to parse; skipping source this cycle");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for op in response.operators {
+        count_unknown_fields(source_name, &op._other);
+        let operator = normalize_operator(&op.name);
+        let operator_display = op.name.clone();
+        for raw in op.logs {
+            count_unknown_fields(source_name, &raw._other);
+            count_unknown_state_enum(source_name, raw.state.as_ref());
+            let url = normalize_url(&raw.url);
+            out.push(CtLog {
+                description: named(raw.description, &url),
+                url,
+                operator: operator.clone(),
+                operator_display: operator_display.clone(),
+                log_type: LogType::Rfc6962,
+                log_origin: None,
+                log_id: raw.log_id,
+                key: raw.key,
+                batch_size: None,
+                poll_interval_ms: None,
+                // Catalog-discovered logs always carry a signed checkpoint;
+                // only a local override can opt into the get-sth path.
+                tree_size_source: TreeSizeSource::Checkpoint,
+                state: raw.state,
+            });
+        }
+        for raw in op.tiled_logs {
+            count_unknown_fields(source_name, &raw._other);
+            count_unknown_state_enum(source_name, raw.state.as_ref());
+            let url = normalize_url(&raw.monitoring_url);
+            out.push(CtLog {
+                description: named(raw.description, &url),
+                url,
+                operator: operator.clone(),
+                operator_display: operator_display.clone(),
+                log_type: LogType::StaticCt,
+                log_origin: Some(normalize_log_origin(&raw.submission_url)),
+                log_id: raw.log_id,
+                key: raw.key,
+                batch_size: None,
+                poll_interval_ms: None,
+                // Catalog-discovered logs always carry a signed checkpoint;
+                // only a local override can opt into the get-sth path.
+                tree_size_source: TreeSizeSource::Checkpoint,
+                state: raw.state,
+            });
+        }
+    }
+    out
+}
+
+/// A log without a description is named by its URL, so a watcher, a metric
+/// label or a log line never carries an empty name.
+fn named(description: String, url: &str) -> String {
+    if description.is_empty() {
+        url.to_string()
+    } else {
+        description
+    }
+}
+
+/// Count each unknown top-level key once, with the raw name in a WARN log (the
+/// forensic surface) but NEVER as a metric label (unbounded by construction).
+fn count_unknown_fields(source_name: &str, other: &HashMap<String, serde_json::Value>) {
+    for key in other.keys() {
+        metrics::counter!(
+            "certstream_catalog_unknown_field_total",
+            "catalog_source" => source_name.to_string()
+        )
+        .increment(1);
+        warn!(catalog_source = source_name, field = %key, "unknown catalog field (ignored)");
+    }
+}
+
+/// Count unknown `state` object keys (a future lifecycle state) as an unknown
+/// enum. The raw key goes to a WARN log, not a label (`field="state"` is the
+/// only label — a known field name, bounded).
+fn count_unknown_state_enum(source_name: &str, state: Option<&LogState>) {
+    if let Some(s) = state {
+        for key in s._other.keys() {
+            metrics::counter!(
+                "certstream_catalog_unknown_enum_total",
+                "catalog_source" => source_name.to_string(),
+                "field" => "state"
+            )
+            .increment(1);
+            warn!(catalog_source = source_name, state_value = %key, "unknown catalog state enum (treated as inert)");
+        }
+    }
+}
+
+/// What discovery resolved: the logs to run watchers for, and the catalog logs
+/// that did not answer the availability probe. The second set is kept apart
+/// rather than discarded, so a refresh can tell a log that is slow or
+/// throttling from one the catalog dropped.
+pub struct DiscoveredLogs {
+    pub reachable: Vec<CtLog>,
+    pub unreachable: Vec<CtLog>,
+}
+
+/// Discover CT logs from the signed catalog registry and append the operator's
+/// `custom_logs`. Each catalog is fetched and signature-verified; only entries
+/// whose source resolves to runtime-authoritative drive auto-spawn.
+///
+/// Logs appearing in multiple catalogs are deduped by `log_id`; authority is the
+/// OR across sources (any authoritative source that lists a log makes it
+/// spawn-eligible). Authoritative discovered logs are then health-probed in
+/// parallel. Custom logs are explicit operator intent and always included
+/// without probing.
 pub async fn fetch_log_list(
     client: &Client,
-    url: &str,
+    catalogs: &[Box<dyn SignedCatalog>],
+    authority_overrides: &HashMap<String, bool>,
     custom_logs: Vec<CustomCtLog>,
-) -> Result<Vec<CtLog>, LogListError> {
-    let response: LogListResponse = client.get(url).send().await?.json().await?;
+    request_timeout: Duration,
+    user_agent: &str,
+) -> Result<DiscoveredLogs, LogListError> {
+    // Apple has no detached signature, so it is fetched through a dedicated
+    // client that pins the issuer-CA SPKI on top of WebPKI validation. If that
+    // client cannot be built, Apple is skipped this cycle rather than fetched
+    // unpinned. Apple is non-authoritative, so skipping has no spawn impact.
+    let apple_client = match catalog::build_apple_pinned_client(request_timeout, user_agent) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(error = %e, "failed to build TLS-pinned Apple client; skipping the Apple catalog this cycle");
+            None
+        }
+    };
 
-    let candidate_logs: Vec<CtLog> = response
-        .operators
-        .into_iter()
-        .flat_map(|op| {
-            let operator_name = op.name;
-            op.logs.into_iter().map(move |log| CtLog {
-                description: log.description,
-                url: log.url,
-                operator: operator_name.clone(),
-                log_type: LogType::Rfc6962,
-                state: log.state,
-            })
+    // Fetch + verify every catalog concurrently (Apple via the pinned client).
+    let fetches = catalogs.iter().filter_map(|cat| {
+        let fetch_client = if cat.name() == "apple" {
+            apple_client.clone()?
+        } else {
+            client.clone()
+        };
+        Some(async move {
+            (
+                cat,
+                catalog::fetch_and_verify(&fetch_client, cat.as_ref()).await,
+            )
         })
-        .filter(|log| log.is_usable())
-        .collect();
+    });
+    let results = join_all(fetches).await;
 
-    info!(count = candidate_logs.len(), "checking CT log availability");
+    // Merge by log_id. Value: (CtLog, runtime_authoritative). Authority is OR'd
+    // across sources; the first-seen CtLog data wins (identity is stable by id).
+    let mut merged: HashMap<String, (CtLog, bool)> = HashMap::new();
+    let mut had_success = false;
+    for (cat, res) in results {
+        let fetch: CatalogFetch = match res {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(catalog_source = cat.name(), error = %e, "catalog fetch failed; continuing with remaining sources");
+                continue;
+            }
+        };
+        had_success = true;
+        let authoritative =
+            catalog::effective_runtime_authoritative(cat.as_ref(), &fetch, authority_overrides);
+        let parsed = parse_list(&fetch.raw_bytes, cat.name());
+        let parsed_count = parsed.len();
+        for log in parsed {
+            let Some(id) = log.log_id.clone().filter(|s| !s.is_empty()) else {
+                // No usable identity — can't dedup or carry provenance. Count + skip.
+                metrics::counter!(
+                    "certstream_catalog_entry_skipped_total",
+                    "catalog_source" => cat.name().to_string(),
+                    "reason" => "missing_log_id"
+                )
+                .increment(1);
+                continue;
+            };
+            merged
+                .entry(id)
+                .and_modify(|(_, auth)| *auth |= authoritative)
+                .or_insert((log, authoritative));
+        }
+        info!(
+            catalog_source = cat.name(),
+            verified = fetch.verified,
+            verifier_present = fetch.verifier_present,
+            runtime_authoritative = authoritative,
+            entries = parsed_count,
+            "processed catalog source"
+        );
+    }
+    if !had_success {
+        return Err(LogListError::NoLogs);
+    }
+
+    // Spawn candidates: runtime-authoritative and currently usable.
+    let candidate_logs: Vec<CtLog> = merged
+        .into_values()
+        .filter(|(_, authoritative)| *authoritative)
+        .map(|(log, _)| log)
+        .filter(|l| l.is_usable())
+        .collect();
+    info!(
+        count = candidate_logs.len(),
+        "checking CT log availability (authoritative set)"
+    );
 
     let health_checks: Vec<_> = candidate_logs
         .into_iter()
         .map(|log| {
             let client = client.clone();
             async move {
-                let sth_url = format!("{}/ct/v1/get-sth", log.normalized_url());
-                match client
-                    .get(&sth_url)
-                    .timeout(Duration::from_secs(5))
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => Some(log),
-                    Ok(resp) => {
-                        debug!(log = %log.description, status = %resp.status(), "log not reachable");
-                        None
-                    }
-                    Err(_) => {
-                        debug!(log = %log.description, "log not reachable");
-                        None
-                    }
-                }
+                let reachable = probe_log(&client, &log).await;
+                (log, reachable)
             }
         })
         .collect();
 
-    let results = join_all(health_checks).await;
-    let mut logs: Vec<CtLog> = results.into_iter().flatten().collect();
+    let (reachable, unreachable): (Vec<_>, Vec<_>) = join_all(health_checks)
+        .await
+        .into_iter()
+        .partition(|(_, reachable)| *reachable);
+    let mut logs: Vec<CtLog> = reachable.into_iter().map(|(log, _)| log).collect();
+    let unreachable: Vec<CtLog> = unreachable.into_iter().map(|(log, _)| log).collect();
 
-    let filtered_count = logs.len();
-    info!(reachable = filtered_count, "CT log availability check complete");
+    info!(
+        reachable = logs.len(),
+        unreachable = unreachable.len(),
+        "CT log availability check complete"
+    );
 
     for custom_log in custom_logs {
         logs.push(CtLog::from(custom_log));
@@ -188,7 +665,10 @@ pub async fn fetch_log_list(
         return Err(LogListError::NoLogs);
     }
 
-    Ok(logs)
+    Ok(DiscoveredLogs {
+        reachable: logs,
+        unreachable,
+    })
 }
 
 #[cfg(test)]
@@ -201,59 +681,61 @@ mod tests {
         assert!(log.is_usable());
     }
 
+    /// Build a `LogState` with the named lifecycle keys present (others absent).
+    fn mk_state(usable: bool, readonly: bool, retired: bool, rejected: bool) -> LogState {
+        let si = || {
+            Some(StateInfo {
+                _timestamp: "2024-01-01T00:00:00Z".to_string(),
+            })
+        };
+        LogState {
+            pending: None,
+            qualified: None,
+            usable: if usable { si() } else { None },
+            readonly: if readonly { si() } else { None },
+            retired: if retired { si() } else { None },
+            rejected: if rejected { si() } else { None },
+            _other: HashMap::new(),
+        }
+    }
+
     #[test]
     fn test_is_usable_usable_state() {
-        let state = LogState {
-            usable: Some(StateInfo {
-                _timestamp: "2024-01-01T00:00:00Z".to_string(),
-            }),
-            retired: None,
-            rejected: None,
-        };
-        let log = make_test_log("test", "https://ct.example.com", Some(state));
+        let log = make_test_log(
+            "test",
+            "https://ct.example.com",
+            Some(mk_state(true, false, false, false)),
+        );
         assert!(log.is_usable());
     }
 
     #[test]
     fn test_is_usable_retired() {
-        let state = LogState {
-            usable: None,
-            retired: Some(StateInfo {
-                _timestamp: "2024-01-01T00:00:00Z".to_string(),
-            }),
-            rejected: None,
-        };
-        let log = make_test_log("test", "https://ct.example.com", Some(state));
+        let log = make_test_log(
+            "test",
+            "https://ct.example.com",
+            Some(mk_state(false, false, true, false)),
+        );
         assert!(!log.is_usable());
     }
 
     #[test]
     fn test_is_usable_rejected() {
-        let state = LogState {
-            usable: None,
-            retired: None,
-            rejected: Some(StateInfo {
-                _timestamp: "2024-01-01T00:00:00Z".to_string(),
-            }),
-        };
-        let log = make_test_log("test", "https://ct.example.com", Some(state));
+        let log = make_test_log(
+            "test",
+            "https://ct.example.com",
+            Some(mk_state(false, false, false, true)),
+        );
         assert!(!log.is_usable());
     }
 
     #[test]
     fn test_is_usable_both_retired_and_rejected() {
-        let state = LogState {
-            usable: Some(StateInfo {
-                _timestamp: "2023-01-01T00:00:00Z".to_string(),
-            }),
-            retired: Some(StateInfo {
-                _timestamp: "2024-01-01T00:00:00Z".to_string(),
-            }),
-            rejected: Some(StateInfo {
-                _timestamp: "2024-06-01T00:00:00Z".to_string(),
-            }),
-        };
-        let log = make_test_log("test", "https://ct.example.com", Some(state));
+        let log = make_test_log(
+            "test",
+            "https://ct.example.com",
+            Some(mk_state(true, false, true, true)),
+        );
         assert!(!log.is_usable());
     }
 
@@ -292,13 +774,32 @@ mod tests {
         let custom = CustomCtLog {
             name: "My Custom Log".to_string(),
             url: "https://custom.example.com/ct".to_string(),
+            expected_log_id: None,
+            batch_size: None,
+            poll_interval_ms: None,
         };
         let ct_log = CtLog::from(custom);
         assert_eq!(ct_log.description, "My Custom Log");
         assert_eq!(ct_log.url, "https://custom.example.com/ct");
         assert_eq!(ct_log.operator, "Custom");
         assert_eq!(ct_log.log_type, LogType::Rfc6962);
+        assert!(ct_log.log_id.is_none());
         assert!(ct_log.state.is_none());
+    }
+
+    #[test]
+    fn test_from_custom_ct_log_preserves_overrides() {
+        let custom = CustomCtLog {
+            name: "My Custom Log".to_string(),
+            url: "https://custom.example.com/ct".to_string(),
+            expected_log_id: Some("custom-log-id".to_string()),
+            batch_size: Some(128),
+            poll_interval_ms: Some(2500),
+        };
+        let ct_log = CtLog::from(custom);
+        assert_eq!(ct_log.log_id.as_deref(), Some("custom-log-id"));
+        assert_eq!(ct_log.batch_size, Some(128));
+        assert_eq!(ct_log.poll_interval_ms, Some(2500));
     }
 
     #[test]
@@ -306,16 +807,44 @@ mod tests {
         let static_log = StaticCtLog {
             name: "LE Willow 2025h2".to_string(),
             url: "https://mon.willow.ct.letsencrypt.org/2025h2d/".to_string(),
+            log_origin: Some("log.willow.ct.letsencrypt.org/2025h2d".to_string()),
+            expected_log_id: None,
+            key: None,
+            batch_size: None,
+            poll_interval_ms: None,
+            tree_size_source: TreeSizeSource::default(),
+            operator: None,
         };
         let ct_log = CtLog::from(static_log);
         assert_eq!(ct_log.description, "LE Willow 2025h2");
-        assert_eq!(
-            ct_log.url,
-            "https://mon.willow.ct.letsencrypt.org/2025h2d/"
-        );
+        assert_eq!(ct_log.url, "https://mon.willow.ct.letsencrypt.org/2025h2d/");
         assert_eq!(ct_log.operator, "Static CT");
         assert_eq!(ct_log.log_type, LogType::StaticCt);
+        assert_eq!(
+            ct_log.log_origin.as_deref(),
+            Some("log.willow.ct.letsencrypt.org/2025h2d")
+        );
+        assert!(ct_log.log_id.is_none());
         assert!(ct_log.state.is_none());
+    }
+
+    #[test]
+    fn test_from_static_ct_log_preserves_overrides() {
+        let static_log = StaticCtLog {
+            name: "LE Willow 2025h2".to_string(),
+            url: "https://mon.willow.ct.letsencrypt.org/2025h2d/".to_string(),
+            log_origin: Some("log.willow.ct.letsencrypt.org/2025h2d".to_string()),
+            expected_log_id: Some("static-log-id".to_string()),
+            key: None,
+            batch_size: Some(64),
+            poll_interval_ms: Some(3000),
+            tree_size_source: TreeSizeSource::default(),
+            operator: None,
+        };
+        let ct_log = CtLog::from(static_log);
+        assert_eq!(ct_log.log_id.as_deref(), Some("static-log-id"));
+        assert_eq!(ct_log.batch_size, Some(64));
+        assert_eq!(ct_log.poll_interval_ms, Some(3000));
     }
 
     #[test]
@@ -323,5 +852,362 @@ mod tests {
         assert_eq!(LogType::Rfc6962, LogType::Rfc6962);
         assert_eq!(LogType::StaticCt, LogType::StaticCt);
         assert_ne!(LogType::Rfc6962, LogType::StaticCt);
+    }
+
+    #[test]
+    fn local_override_conflicts_detects_identity_mismatch() {
+        let mut discovered = make_test_log("disc", "https://mon.example.com/log", None);
+        discovered.log_type = LogType::StaticCt;
+        discovered.log_id = Some("logid-x".to_string());
+
+        let mut ok = make_test_log("ok", "https://mon.example.com/log/", None);
+        ok.log_type = LogType::StaticCt;
+        ok.log_id = Some("logid-x".to_string());
+        assert!(
+            local_override_conflicts(std::slice::from_ref(&discovered), &[ok]).is_empty(),
+            "a matching override must not conflict"
+        );
+
+        let mut bad_url = make_test_log("bad-url", "https://other.example.com/log", None);
+        bad_url.log_type = LogType::StaticCt;
+        bad_url.log_id = Some("logid-x".to_string());
+        assert!(
+            !local_override_conflicts(std::slice::from_ref(&discovered), &[bad_url]).is_empty()
+        );
+
+        let mut bad_type = make_test_log("bad-type", "https://mon.example.com/log", None);
+        bad_type.log_type = LogType::Rfc6962;
+        bad_type.log_id = Some("logid-x".to_string());
+        assert!(
+            !local_override_conflicts(std::slice::from_ref(&discovered), &[bad_type]).is_empty()
+        );
+
+        let mut additive = make_test_log("additive", "https://new.example.com/log", None);
+        additive.log_id = Some("logid-y".to_string());
+        assert!(local_override_conflicts(&[discovered], &[additive]).is_empty());
+    }
+
+    #[test]
+    fn an_operator_name_falls_back_to_the_canonical_key() {
+        let mut log = make_test_log("d", "https://ct.example.com/log", None);
+        assert_eq!(
+            log.operator_name(),
+            "TestOp",
+            "a source with no display name falls back to the key"
+        );
+
+        log.operator = "lets encrypt".to_string();
+        log.operator_display = "Let's Encrypt".to_string();
+        assert_eq!(log.operator_name(), "Let's Encrypt");
+    }
+
+    #[test]
+    fn inherit_operators_takes_the_replaced_logs_operator() {
+        let mut discovered = make_test_log("disc", "https://ct.example.com/log", None);
+        discovered.log_id = Some("logid-x".to_string());
+        discovered.operator = "trustasia".to_string();
+
+        let mut replacing = make_test_log("replacing", "https://ct.example.com/log", None);
+        replacing.log_id = Some("logid-x".to_string());
+        replacing.operator = UNATTRIBUTED_STATIC_OPERATOR.to_string();
+
+        let mut declared = make_test_log("declared", "https://other.example.com/log", None);
+        declared.log_id = Some("logid-x".to_string());
+        declared.operator = "explicit".to_string();
+
+        let mut orphan = make_test_log("orphan", "https://new.example.com/log", None);
+        orphan.log_id = Some("logid-unknown".to_string());
+        orphan.operator = UNATTRIBUTED_STATIC_OPERATOR.to_string();
+
+        let mut overrides = vec![replacing, declared, orphan];
+        inherit_operators(std::slice::from_ref(&discovered), &mut overrides);
+
+        assert_eq!(
+            overrides[0].operator, "trustasia",
+            "an override replacing a discovered log shares its rate-limit bucket"
+        );
+        assert_eq!(
+            overrides[1].operator, "explicit",
+            "a declared operator is never overwritten"
+        );
+        assert_eq!(
+            overrides[2].operator, UNATTRIBUTED_STATIC_OPERATOR,
+            "an override that replaces nothing has no operator to inherit"
+        );
+    }
+
+    #[test]
+    fn local_override_conflicts_allows_deliberate_get_sth_hybrid() {
+        // TrustAsia's log2026a/b and hetu2027 are RFC 6962 in the catalog but
+        // serve tile data, so a `get_sth` override intentionally reads them
+        // over the tile protocol. That transport mismatch is the feature.
+        let mut discovered = make_test_log("disc", "https://ct.example.com/log", None);
+        discovered.log_type = LogType::Rfc6962;
+        discovered.log_id = Some("logid-x".to_string());
+
+        let mut hybrid = make_test_log("hybrid", "https://ct.example.com/log", None);
+        hybrid.log_type = LogType::StaticCt;
+        hybrid.log_id = Some("logid-x".to_string());
+        hybrid.tree_size_source = TreeSizeSource::GetSth;
+        assert!(
+            local_override_conflicts(std::slice::from_ref(&discovered), &[hybrid]).is_empty(),
+            "a declared get_sth override may switch an RFC 6962 log to the tile transport"
+        );
+
+        // Without the declaration it is still the old silent-protocol-switch
+        // conflict.
+        let mut undeclared = make_test_log("undeclared", "https://ct.example.com/log", None);
+        undeclared.log_type = LogType::StaticCt;
+        undeclared.log_id = Some("logid-x".to_string());
+        assert!(
+            !local_override_conflicts(std::slice::from_ref(&discovered), &[undeclared]).is_empty(),
+            "switching transport without tree_size_source: get_sth must still conflict"
+        );
+
+        // The exemption is one-directional: it does not license reading a
+        // tiled log over RFC 6962.
+        let mut reversed = make_test_log("reversed", "https://ct.example.com/log", None);
+        reversed.log_type = LogType::Rfc6962;
+        reversed.log_id = Some("logid-x".to_string());
+        reversed.tree_size_source = TreeSizeSource::GetSth;
+        let mut tiled = make_test_log("tiled-disc", "https://ct.example.com/log", None);
+        tiled.log_type = LogType::StaticCt;
+        tiled.log_id = Some("logid-x".to_string());
+        assert!(
+            !local_override_conflicts(std::slice::from_ref(&tiled), &[reversed]).is_empty(),
+            "get_sth must not excuse an RFC 6962 override of a tiled log"
+        );
+    }
+
+    #[test]
+    fn local_override_conflicts_checks_declared_log_origin() {
+        let mut discovered = make_test_log("disc", "https://mon.example.com/log", None);
+        discovered.log_type = LogType::StaticCt;
+        discovered.log_id = Some("logid-x".to_string());
+        discovered.log_origin = Some("log.example.com/log".to_string());
+
+        // Override declares a contradicting origin for the same log ID → conflict.
+        let mut bad_origin = make_test_log("bad-origin", "https://mon.example.com/log", None);
+        bad_origin.log_type = LogType::StaticCt;
+        bad_origin.log_id = Some("logid-x".to_string());
+        bad_origin.log_origin = Some("https://evil.example.com/log/".to_string());
+        assert!(
+            !local_override_conflicts(std::slice::from_ref(&discovered), &[bad_origin]).is_empty(),
+            "an explicitly declared origin contradicting the catalog must conflict"
+        );
+
+        // Override declares the same origin (differently spelled) → no conflict.
+        let mut ok_origin = make_test_log("ok-origin", "https://mon.example.com/log", None);
+        ok_origin.log_type = LogType::StaticCt;
+        ok_origin.log_id = Some("logid-x".to_string());
+        ok_origin.log_origin = Some("https://log.example.com/log/".to_string());
+        assert!(
+            local_override_conflicts(std::slice::from_ref(&discovered), &[ok_origin]).is_empty(),
+            "a matching origin (modulo normalization) must not conflict"
+        );
+
+        // Override omits the origin (derives it) → not checked, no conflict.
+        let mut derived = make_test_log("derived", "https://mon.example.com/log", None);
+        derived.log_type = LogType::StaticCt;
+        derived.log_id = Some("logid-x".to_string());
+        derived.log_origin = None;
+        assert!(
+            local_override_conflicts(std::slice::from_ref(&discovered), &[derived]).is_empty(),
+            "an override without a declared origin must not conflict"
+        );
+    }
+
+    /// Google's `all_logs_list.json` includes `log_type: "test"` logs that have
+    /// no `description`. One such entry used to fail the whole list.
+    #[test]
+    fn test_parse_list_keeps_logs_without_a_description() {
+        let json = br#"{
+            "operators": [{
+                "name": "Sectigo",
+                "logs": [
+                    {
+                        "description": "Sectigo 'Elephant2026h2'",
+                        "url": "https://elephant2026h2.ct.sectigo.com/",
+                        "log_id": "aaa=",
+                        "state": {"usable": {"timestamp": "2026-01-01T00:00:00Z"}}
+                    },
+                    {
+                        "url": "https://dumbo.ctlabs.sectigo.com/",
+                        "log_id": "bbb=",
+                        "mmd": 86400,
+                        "log_type": "test"
+                    }
+                ]
+            }]
+        }"#;
+        let logs = parse_list(json, "google_v3_all");
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[1].url, "https://dumbo.ctlabs.sectigo.com");
+        assert_eq!(logs[1].description, "https://dumbo.ctlabs.sectigo.com");
+    }
+
+    #[test]
+    fn test_parse_list_keeps_pending_tiled_logs_without_a_description() {
+        let json = br#"{
+            "operators": [{
+                "name": "HARICA",
+                "logs": [],
+                "tiled_logs": [{
+                    "log_id": "ccc=",
+                    "monitoring_url": "https://selene.mon.ct.harica.eu/selene2027h1/",
+                    "submission_url": "https://selene.ct.harica.eu/selene2027h1/",
+                    "state": {"pending": {"timestamp": "2026-09-01T00:00:00Z"}}
+                }]
+            }]
+        }"#;
+        let logs = parse_list(json, "google_v3_all");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].description, logs[0].url);
+    }
+
+    /// Apple's log list adds `assetVersionV2` and `tiled_logs` and may include
+    /// operators with empty (or missing) `logs` arrays. The parser must accept
+    /// all of these.
+    #[test]
+    fn test_parse_apple_style_log_list() {
+        let json = r#"{
+            "$schema": "https://example.com/schema.json",
+            "assetVersion": 32,
+            "assetVersionV2": 1013,
+            "operators": [
+                {
+                    "name": "Cloudflare",
+                    "email": ["ct-logs@cloudflare.com"],
+                    "logs": [],
+                    "tiled_logs": [
+                        {
+                            "description": "Cloudflare 'Raio2025h2b' log",
+                            "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAESwiXfU4...",
+                            "log_id": "Tw05u8NV28wWJ5ZuVAUVfMr3Lj90j0f+ewSeWlkVXL0=",
+                            "mmd": 60,
+                            "monitoring_url": "https://raio2025h2b.ct.cloudflare.com/",
+                            "submission_url": "https://ct.cloudflare.com/logs/raio2025h2b/",
+                            "state": {"usable": {"timestamp": "2025-07-01T00:00:00Z"}},
+                            "tls_only": true
+                        }
+                    ]
+                },
+                {
+                    "name": "Old Operator",
+                    "logs": [
+                        {
+                            "description": "Old RFC6962 log",
+                            "url": "https://old.example.com/ct",
+                            "log_id": "abcdef==",
+                            "state": {"usable": {"timestamp": "2024-01-01T00:00:00Z"}}
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: LogListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.operators.len(), 2);
+        assert_eq!(parsed.operators[0].name, "Cloudflare");
+        assert!(parsed.operators[0].logs.is_empty());
+        assert_eq!(parsed.operators[0].tiled_logs.len(), 1);
+        let tiled = &parsed.operators[0].tiled_logs[0];
+        assert_eq!(
+            tiled.monitoring_url,
+            "https://raio2025h2b.ct.cloudflare.com/"
+        );
+        assert_eq!(
+            tiled.submission_url,
+            "https://ct.cloudflare.com/logs/raio2025h2b/"
+        );
+        assert_eq!(
+            tiled.log_id.as_deref(),
+            Some("Tw05u8NV28wWJ5ZuVAUVfMr3Lj90j0f+ewSeWlkVXL0=")
+        );
+
+        assert_eq!(parsed.operators[1].name, "Old Operator");
+        assert_eq!(parsed.operators[1].logs.len(), 1);
+        assert!(parsed.operators[1].tiled_logs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_legacy_google_v3_no_tiled_logs() {
+        // Older Google v3 responses (and minimal test fixtures) have no
+        // `tiled_logs` field at all — the default must populate an empty Vec.
+        let json = r#"{
+            "operators": [
+                {"name": "Google", "logs": [
+                    {"description": "Argon2026", "url": "https://ct.googleapis.com/logs/argon2026/"}
+                ]}
+            ]
+        }"#;
+        let parsed: LogListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.operators[0].logs.len(), 1);
+        assert!(parsed.operators[0].tiled_logs.is_empty());
+    }
+
+    /// parse_list: normalizes operator + origin, tolerates unknown operator/log
+    /// fields and an unknown `state` enum key without crashing, and emits both
+    /// an RFC-6962 and a static-CT entry.
+    #[test]
+    fn parse_list_normalizes_and_tolerates_unknown() {
+        let json = br#"{
+            "future_top_level_key": 1,
+            "operators": [
+                {
+                    "name": "DigiCert, Inc.",
+                    "some_unknown_operator_field": true,
+                    "logs": [
+                        {
+                            "description": "DigiCert RFC6962 log",
+                            "url": "ct.digicert.com/log/",
+                            "log_id": "rfc-id-1",
+                            "state": {"usable": {"timestamp": "2024-01-01T00:00:00Z"}},
+                            "unknown_log_field": "x"
+                        }
+                    ],
+                    "tiled_logs": [
+                        {
+                            "description": "DigiCert tiled log",
+                            "monitoring_url": "https://mon.example.com/tiled/",
+                            "submission_url": "https://ct.example.com/tiled/",
+                            "log_id": "tiled-id-1",
+                            "state": {"some_future_state": {"timestamp": "2024-01-01T00:00:00Z"}}
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let logs = parse_list(json, "test_source");
+        assert_eq!(logs.len(), 2, "one RFC6962 + one static-CT entry");
+
+        let rfc = logs
+            .iter()
+            .find(|l| l.log_type == LogType::Rfc6962)
+            .unwrap();
+        assert_eq!(rfc.operator, "digicert inc", "operator canonicalized");
+        assert_eq!(
+            rfc.url, "https://ct.digicert.com/log",
+            "url normalized (scheme + no trailing slash)"
+        );
+        assert_eq!(rfc.log_id.as_deref(), Some("rfc-id-1"));
+
+        let tiled = logs
+            .iter()
+            .find(|l| l.log_type == LogType::StaticCt)
+            .unwrap();
+        assert_eq!(tiled.operator, "digicert inc");
+        assert_eq!(tiled.url, "https://mon.example.com/tiled");
+        assert_eq!(
+            tiled.log_origin.as_deref(),
+            Some("ct.example.com/tiled"),
+            "origin normalized"
+        );
+        // The unknown `state` enum key did not crash the parse.
+    }
+
+    /// Malformed (non-JSON) bytes yield zero entries, not a panic/abort.
+    #[test]
+    fn parse_list_malformed_yields_empty() {
+        assert!(parse_list(b"not json at all", "test_source").is_empty());
     }
 }
