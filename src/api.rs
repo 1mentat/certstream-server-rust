@@ -5,21 +5,24 @@ use axum::{
     Json,
 };
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::ct::watcher::HealthStatus;
-use crate::models::Subject;
+use parking_lot::RwLock;
 
+use crate::ct::watcher::HealthStatus;
+use crate::models::{LeafCert, Subject};
+
+/// Uppercases and strips separators over bytes rather than chars: hashes are
+/// ASCII hex, and `char::to_uppercase` yields an iterator per character.
 #[inline]
 fn normalize_hash(hash: &str) -> String {
-    hash.chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .flat_map(|c| c.to_uppercase())
+    hash.bytes()
+        .filter(|b| b.is_ascii_hexdigit())
+        .map(|b| b.to_ascii_uppercase() as char)
         .collect()
 }
 
@@ -42,7 +45,14 @@ pub struct ConnectionStats {
 pub struct ThroughputStats {
     pub messages_sent: u64,
     pub certificates_processed: u64,
+    /// Bytes actually written to subscribers. Sums the one format each
+    /// subscriber asked for, so it tracks outbound bandwidth.
     pub bytes_sent: u64,
+    /// Bytes produced by serialization, counted once per certificate across
+    /// every enabled stream format. Exceeds `bytes_sent` whenever a format is
+    /// enabled but nobody is subscribed to it, which is the signal to disable
+    /// that format.
+    pub bytes_serialized: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,21 +101,13 @@ pub struct CertDetail {
     pub cert_link: String,
 }
 
+/// Shares the `Arc<LeafCert>` and `Arc<Source>` the broadcast message already
+/// holds, so caching a certificate for `/api/cert` costs two refcount bumps
+/// rather than a copy of its fields.
 pub struct CachedCert {
-    pub fingerprint: String,
-    pub sha1: String,
-    pub sha256: String,
-    pub serial_number: String,
-    pub subject: Subject,
-    pub issuer: Subject,
-    pub not_before: i64,
-    pub not_after: i64,
-    pub is_ca: bool,
-    pub all_domains: Vec<String>,
-    pub signature_algorithm: String,
+    pub leaf: Arc<LeafCert>,
     pub seen: f64,
-    pub source_name: String,
-    pub source_url: String,
+    pub source: Arc<crate::models::Source>,
     pub cert_index: u64,
 }
 
@@ -127,23 +129,38 @@ impl CertificateCache {
     pub fn push(&self, cert: CachedCert) {
         let cert = Arc::new(cert);
 
-        let sha256_key = normalize_hash(&cert.sha256);
-        let sha1_key = normalize_hash(&cert.sha1);
-        let fp_key = normalize_hash(&cert.fingerprint);
+        // Indexed before it enters the queue, so a lookup never misses a
+        // certificate that is already queued.
+        self.hash_index.insert(normalize_hash(&cert.leaf.sha256), Arc::clone(&cert));
+        self.hash_index.insert(normalize_hash(&cert.leaf.sha1), Arc::clone(&cert));
+        self.hash_index.insert(normalize_hash(&cert.leaf.fingerprint), Arc::clone(&cert));
 
-        self.hash_index.insert(sha256_key, Arc::clone(&cert));
-        self.hash_index.insert(sha1_key, Arc::clone(&cert));
-        self.hash_index.insert(fp_key, Arc::clone(&cert));
+        // Lock only the VecDeque for queue management, not for hash_index operations.
+        let evicted = {
+            let mut entries = self.entries.write();
+            let evicted = if entries.len() >= self.capacity {
+                entries.pop_front()
+            } else {
+                None
+            };
+            entries.push_back(Arc::clone(&cert));
+            evicted
+        };
 
-        let mut entries = self.entries.write();
-        if entries.len() >= self.capacity {
-            if let Some(old) = entries.pop_front() {
-                self.hash_index.remove(&normalize_hash(&old.sha256));
-                self.hash_index.remove(&normalize_hash(&old.sha1));
-                self.hash_index.remove(&normalize_hash(&old.fingerprint));
+        // Removed after the VecDeque lock is released, and only if the index
+        // still points at the evicted Arc. The same certificate can be
+        // re-broadcast and re-indexed while an older copy is still queued;
+        // removing unconditionally would drop the newer copy's index entry and
+        // make /api/cert/{hash} return 404 for a certificate still held.
+        if let Some(old) = evicted {
+            for key in [
+                normalize_hash(&old.leaf.sha256),
+                normalize_hash(&old.leaf.sha1),
+                normalize_hash(&old.leaf.fingerprint),
+            ] {
+                self.hash_index.remove_if(&key, |_, current| Arc::ptr_eq(current, &old));
             }
         }
-        entries.push_back(cert);
     }
 
     #[inline]
@@ -156,13 +173,20 @@ impl CertificateCache {
         self.entries.read().len()
     }
 
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 }
 
 pub struct LogTracker {
-    logs: RwLock<Vec<TrackedLog>>,
+    /// Keyed by the normalised log URL. DashMap sharding replaces the single
+    /// RwLock<Vec<…>>, giving O(1) updates with no global write-lock contention.
+    logs: DashMap<String, TrackedLog>,
 }
 
 pub struct TrackedLog {
@@ -176,16 +200,21 @@ pub struct TrackedLog {
     pub last_success: Option<i64>,
 }
 
+impl Default for LogTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogTracker {
     pub fn new() -> Self {
         Self {
-            logs: RwLock::new(Vec::new()),
+            logs: DashMap::new(),
         }
     }
 
     pub fn register(&self, name: String, url: String, operator: String) {
-        let mut logs = self.logs.write();
-        logs.push(TrackedLog {
+        self.logs.insert(url.clone(), TrackedLog {
             name,
             url,
             operator,
@@ -197,42 +226,70 @@ impl LogTracker {
         });
     }
 
+    /// Drop a log the server has stopped watching, so `/api/logs` and the
+    /// health rollup stop counting a watcher that no longer exists.
+    ///
+    /// The Prometheus per-log gauges keep their last value until the process
+    /// restarts — the exporter has no per-series delete — so a retired log's
+    /// `certstream_ct_log_lag_entries` freezes rather than disappearing.
+    pub fn deregister(&self, url: &str) {
+        self.logs.remove(url);
+    }
+
     pub fn update(&self, url: &str, status: HealthStatus, current_index: u64, tree_size: u64, total_errors: u64) {
-        let mut logs = self.logs.write();
-        if let Some(log) = logs.iter_mut().find(|l| l.url == url) {
-            log.status = status;
-            log.current_index = current_index;
-            log.tree_size = tree_size;
-            log.total_errors = total_errors;
-            log.last_success = Some(chrono::Utc::now().timestamp());
+        if let Some(mut entry) = self.logs.get_mut(url) {
+            entry.status = status;
+            entry.current_index = current_index;
+            entry.tree_size = tree_size;
+            entry.total_errors = total_errors;
+            entry.last_success = Some(chrono::Utc::now().timestamp());
+
+            // How far behind the log's head we are. `status` only answers
+            // "are requests succeeding", so a log can sit healthy while
+            // falling further behind every poll: on a two-hour run 19 of 45
+            // logs were healthy and more than 5K entries behind, one of them
+            // by 1.3M. Called once per poll per log, so the label clone is
+            // ~45/s in the worst case.
+            let lag = tree_size.saturating_sub(current_index);
+            metrics::gauge!("certstream_ct_log_lag_entries", "log" => entry.name.clone())
+                .set(lag as f64);
         }
     }
 
     pub fn get_all(&self) -> Vec<LogStatus> {
-        let logs = self.logs.read();
-        logs.iter()
-            .map(|l| LogStatus {
-                name: l.name.clone(),
-                url: l.url.clone(),
-                operator: l.operator.clone(),
-                status: match l.status {
-                    HealthStatus::Healthy => "healthy".to_string(),
-                    HealthStatus::Degraded => "degraded".to_string(),
-                    HealthStatus::Unhealthy => "unhealthy".to_string(),
-                },
-                current_index: l.current_index,
-                tree_size: l.tree_size,
-                total_errors: l.total_errors,
-                last_success: l.last_success,
+        self.logs
+            .iter()
+            .map(|entry| {
+                let l = entry.value();
+                LogStatus {
+                    name: l.name.clone(),
+                    url: l.url.clone(),
+                    operator: l.operator.clone(),
+                    status: match l.status {
+                        HealthStatus::Healthy => "healthy".to_string(),
+                        HealthStatus::Degraded => "degraded".to_string(),
+                        HealthStatus::Unhealthy => "unhealthy".to_string(),
+                    },
+                    current_index: l.current_index,
+                    tree_size: l.tree_size,
+                    total_errors: l.total_errors,
+                    last_success: l.last_success,
+                }
             })
             .collect()
     }
 
     pub fn count_by_status(&self) -> (usize, usize, usize) {
-        let logs = self.logs.read();
-        let healthy = logs.iter().filter(|l| l.status == HealthStatus::Healthy).count();
-        let degraded = logs.iter().filter(|l| l.status == HealthStatus::Degraded).count();
-        let unhealthy = logs.iter().filter(|l| l.status == HealthStatus::Unhealthy).count();
+        let mut healthy = 0usize;
+        let mut degraded = 0usize;
+        let mut unhealthy = 0usize;
+        for entry in self.logs.iter() {
+            match entry.status {
+                HealthStatus::Healthy => healthy += 1,
+                HealthStatus::Degraded => degraded += 1,
+                HealthStatus::Unhealthy => unhealthy += 1,
+            }
+        }
         (healthy, degraded, unhealthy)
     }
 }
@@ -241,9 +298,17 @@ pub struct ServerStats {
     pub start_time: Instant,
     pub messages_sent: AtomicU64,
     pub certificates_processed: AtomicU64,
+    /// Written by the WebSocket and SSE senders, which batch their local
+    /// counts before touching this so a fan-out to many subscribers does not
+    /// turn one broadcast into one atomic per subscriber.
     pub bytes_sent: AtomicU64,
-    pub ws_connections: AtomicU64,
-    pub sse_connections: AtomicU64,
+    pub bytes_serialized: AtomicU64,
+}
+
+impl Default for ServerStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServerStats {
@@ -253,8 +318,7 @@ impl ServerStats {
             messages_sent: AtomicU64::new(0),
             certificates_processed: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
-            ws_connections: AtomicU64::new(0),
-            sse_connections: AtomicU64::new(0),
+            bytes_serialized: AtomicU64::new(0),
         }
     }
 
@@ -267,21 +331,23 @@ pub struct ApiState {
     pub stats: Arc<ServerStats>,
     pub cache: Arc<CertificateCache>,
     pub log_tracker: Arc<LogTracker>,
+    pub ws_state: Arc<crate::websocket::AppState>,
 }
 
 pub async fn handle_stats(State(state): State<Arc<ApiState>>) -> Json<StatsResponse> {
     Json(StatsResponse {
         uptime_seconds: state.stats.uptime_seconds(),
         connections: ConnectionStats {
-            total: state.stats.ws_connections.load(Ordering::Relaxed)
-                + state.stats.sse_connections.load(Ordering::Relaxed),
-            websocket: state.stats.ws_connections.load(Ordering::Relaxed),
-            sse: state.stats.sse_connections.load(Ordering::Relaxed),
+            total: state.ws_state.connections.total()
+                + crate::sse::sse_connection_count(),
+            websocket: state.ws_state.connections.total(),
+            sse: crate::sse::sse_connection_count(),
         },
         throughput: ThroughputStats {
             messages_sent: state.stats.messages_sent.load(Ordering::Relaxed),
             certificates_processed: state.stats.certificates_processed.load(Ordering::Relaxed),
             bytes_sent: state.stats.bytes_sent.load(Ordering::Relaxed),
+            bytes_serialized: state.stats.bytes_serialized.load(Ordering::Relaxed),
         },
         memory: MemoryStats {
             cache_entries: state.cache.len(),
@@ -310,22 +376,22 @@ pub async fn handle_cert(
         Some(cert) => {
             let cert_link = format!(
                 "{}/ct/v1/get-entries?start={}&end={}",
-                cert.source_url, cert.cert_index, cert.cert_index
+                cert.source.url, cert.cert_index, cert.cert_index
             );
             Json(CertDetail {
-                fingerprint: cert.fingerprint.clone(),
-                sha1: cert.sha1.clone(),
-                sha256: cert.sha256.clone(),
-                serial_number: cert.serial_number.clone(),
-                subject: cert.subject.clone(),
-                issuer: cert.issuer.clone(),
-                not_before: cert.not_before,
-                not_after: cert.not_after,
-                is_ca: cert.is_ca,
-                all_domains: cert.all_domains.clone(),
-                signature_algorithm: cert.signature_algorithm.clone(),
+                fingerprint: cert.leaf.fingerprint.to_string(),
+                sha1: cert.leaf.sha1.clone(),
+                sha256: cert.leaf.sha256.clone(),
+                serial_number: cert.leaf.serial_number.clone(),
+                subject: cert.leaf.subject.clone(),
+                issuer: cert.leaf.issuer.clone(),
+                not_before: cert.leaf.not_before,
+                not_after: cert.leaf.not_after,
+                is_ca: cert.leaf.is_ca,
+                all_domains: cert.leaf.all_domains.to_vec(),
+                signature_algorithm: cert.leaf.signature_algorithm.to_string(),
                 seen: cert.seen,
-                source: cert.source_name.clone(),
+                source: cert.source.name.to_string(),
                 cert_index: cert.cert_index,
                 cert_link,
             })
@@ -339,29 +405,41 @@ pub async fn handle_cert(
 mod tests {
     use super::*;
     use crate::ct::watcher::HealthStatus;
+    use crate::models::{Extensions, LeafCert};
+    use std::borrow::Cow;
 
     fn make_cert(sha256: &str, sha1: &str, fingerprint: &str) -> CachedCert {
         CachedCert {
-            fingerprint: fingerprint.to_string(),
-            sha1: sha1.to_string(),
-            sha256: sha256.to_string(),
-            serial_number: "00".to_string(),
-            subject: Subject {
-                cn: Some("example.com".to_string()),
-                ..Subject::default()
-            },
-            issuer: Subject {
-                cn: Some("Test CA".to_string()),
-                ..Subject::default()
-            },
-            not_before: 0,
-            not_after: 1_000_000,
-            is_ca: false,
-            all_domains: vec!["example.com".to_string()],
-            signature_algorithm: "SHA256withRSA".to_string(),
+            leaf: Arc::new(LeafCert {
+                fingerprint: Arc::from(fingerprint),
+                sha1: sha1.to_string(),
+                sha256: sha256.to_string(),
+                sha256_raw: [0u8; 32],
+                serial_number: "00".to_string(),
+                subject: Subject {
+                    cn: Some("example.com".to_string()),
+                    ..Subject::default()
+                },
+                issuer: Subject {
+                    cn: Some("Test CA".to_string()),
+                    ..Subject::default()
+                },
+                not_before: 0,
+                not_after: 1_000_000,
+                is_ca: false,
+                all_domains: smallvec::smallvec!["example.com".to_string()],
+                signature_algorithm: Cow::Borrowed("SHA256withRSA"),
+                as_der: None,
+                extensions: Extensions::default(),
+            }),
             seen: 1.0,
-            source_name: "test-log".to_string(),
-            source_url: "https://ct.test/log".to_string(),
+            source: Arc::new(crate::models::Source {
+                log_id: None,
+                operator: Arc::from("Test"),
+                log_type: "rfc6962",
+                name: Arc::from("test-log"),
+                url: Arc::from("https://ct.test/log"),
+            }),
             cert_index: 42,
         }
     }
@@ -375,7 +453,7 @@ mod tests {
         // Lookup with lowercase — should still find via normalized uppercase
         let found = cache.get_by_hash("aabbccdd");
         assert!(found.is_some(), "lowercase lookup should succeed");
-        assert_eq!(found.unwrap().sha256, "aabbccdd");
+        assert_eq!(found.unwrap().leaf.sha256, "aabbccdd");
     }
 
     #[test]
@@ -429,7 +507,7 @@ mod tests {
 
         let found = cache.get_by_hash("ABCD1234");
         assert!(found.is_some());
-        assert_eq!(found.unwrap().sha256, "ABCD1234");
+        assert_eq!(found.unwrap().leaf.sha256, "ABCD1234");
     }
 
     #[test]
@@ -439,7 +517,7 @@ mod tests {
 
         let found = cache.get_by_hash("FFFF0000");
         assert!(found.is_some());
-        assert_eq!(found.unwrap().sha1, "FFFF0000");
+        assert_eq!(found.unwrap().leaf.sha1, "FFFF0000");
     }
 
     #[test]
@@ -449,7 +527,7 @@ mod tests {
 
         let found = cache.get_by_hash("12345678");
         assert!(found.is_some());
-        assert_eq!(found.unwrap().fingerprint, "12345678");
+        assert_eq!(&*found.unwrap().leaf.fingerprint, "12345678");
     }
 
     #[test]
@@ -553,8 +631,9 @@ mod tests {
         tracker.update("https://u", HealthStatus::Unhealthy, 0, 0, 0);
 
         let all = tracker.get_all();
-        let statuses: Vec<&str> = all.iter().map(|l| l.status.as_str()).collect();
-        assert_eq!(statuses, vec!["healthy", "degraded", "unhealthy"]);
+        let mut statuses: Vec<&str> = all.iter().map(|l| l.status.as_str()).collect();
+        statuses.sort(); // DashMap iteration order is not guaranteed
+        assert_eq!(statuses, vec!["degraded", "healthy", "unhealthy"]);
     }
 
     #[test]
@@ -582,14 +661,11 @@ mod tests {
         assert_eq!(stats.messages_sent.load(Ordering::Relaxed), 0);
         assert_eq!(stats.certificates_processed.load(Ordering::Relaxed), 0);
         assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.ws_connections.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.sse_connections.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn server_stats_uptime_seconds_returns_reasonable_value() {
         let stats = ServerStats::new();
-        // Immediately after construction uptime should be very small (< 2s)
         let uptime = stats.uptime_seconds();
         assert!(uptime < 2, "uptime should be less than 2 seconds right after creation, got {uptime}");
     }

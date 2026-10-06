@@ -1,8 +1,10 @@
-use bytes::Bytes;
+use axum::extract::ws::Utf8Bytes;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::Arc;
+
+use crate::config::StreamConfig;
 
 pub type DomainList = SmallVec<[String; 4]>;
 
@@ -12,16 +14,55 @@ pub struct CertificateMessage {
     pub data: CertificateData,
 }
 
+/// What a given check actually established about an entry.
+///
+/// Reported rather than assumed: a consumer investigating an incident needs
+/// to know which checks ran, not which checks the server is capable of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationState {
+    /// The check ran and passed.
+    Verified,
+    /// The check did not run, or could not run on this input.
+    #[default]
+    Unverified,
+    /// The check ran and failed. The entry is still delivered; the
+    /// `checkpoint_signature_mode` setting decides whether it is ingested.
+    Failed,
+    /// The check does not apply to this source — an RFC 6962 log serves no
+    /// checkpoint, so there is no checkpoint signature to verify.
+    NotApplicable,
+}
+
+/// Which checks were performed on the entry, and what they found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Verification {
+    /// Signature on the signed tree head this entry was read under.
+    pub checkpoint_signature: VerificationState,
+    /// Proof that the entry is in that signed tree.
+    pub inclusion: VerificationState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateData {
     pub update_type: Cow<'static, str>,
-    pub leaf_cert: LeafCert,
+    pub leaf_cert: Arc<LeafCert>,
+    /// Chain certs are `Arc`-shared: static-CT watchers reuse one parsed
+    /// issuer across every leaf that chains to it (serde's `rc` feature
+    /// serializes through the Arc transparently).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub chain: Option<Vec<ChainCert>>,
+    pub chain: Option<Vec<Arc<ChainCert>>>,
     pub cert_index: u64,
     pub cert_link: String,
     pub seen: f64,
+    /// Submission timestamp: the moment the CT log issued the SCT for this entry
+    /// (RFC 6962 §3.1), in seconds since Unix epoch with millisecond precision.
+    pub submission_timestamp: f64,
     pub source: Arc<Source>,
+    /// Skipped in the v1 payloads: `data` there is the CertStream shape and
+    /// stays byte-for-byte what it was. The v2 payload reads this explicitly.
+    #[serde(skip)]
+    pub verification: Verification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,10 +151,14 @@ pub struct LeafCert {
     pub serial_number: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub fingerprint: String,
+    /// The same value as `sha1`, sharing its allocation.
+    pub fingerprint: Arc<str>,
     pub sha1: String,
     pub sha256: String,
-    pub signature_algorithm: String,
+    /// Raw SHA-256 bytes, used directly as the dedup key. Not serialized.
+    #[serde(skip)]
+    pub sha256_raw: [u8; 32],
+    pub signature_algorithm: Cow<'static, str>,
     pub is_ca: bool,
     pub all_domains: DomainList,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -128,65 +173,221 @@ pub struct ChainCert {
     pub serial_number: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub fingerprint: String,
+    pub fingerprint: Arc<str>,
     pub sha1: String,
     pub sha256: String,
-    pub signature_algorithm: String,
+    pub signature_algorithm: Cow<'static, str>,
     pub is_ca: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub as_der: Option<String>,
     pub extensions: Extensions,
 }
 
+impl From<LeafCert> for ChainCert {
+    /// A chain cert is a leaf-cert parse minus the leaf-only fields
+    /// (`all_domains`, `sha256_raw`). Shared by the RFC 6962 chain parser and
+    /// the static-CT issuer cache so the field mapping lives in one place.
+    fn from(leaf: LeafCert) -> Self {
+        ChainCert {
+            subject: leaf.subject,
+            issuer: leaf.issuer,
+            serial_number: leaf.serial_number,
+            not_before: leaf.not_before,
+            not_after: leaf.not_after,
+            fingerprint: leaf.fingerprint,
+            sha1: leaf.sha1,
+            sha256: leaf.sha256,
+            signature_algorithm: leaf.signature_algorithm,
+            is_ca: leaf.is_ca,
+            as_der: leaf.as_der,
+            extensions: leaf.extensions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub name: Arc<str>,
     pub url: Arc<str>,
+    /// Skipped in the v1 payloads for the same reason as
+    /// [`CertificateData::verification`]: CertStream's `source` object is
+    /// `{name, url}` and adding keys to it would break consumers that
+    /// round-trip the message.
+    #[serde(skip)]
+    pub log_id: Option<Arc<str>>,
+    #[serde(skip)]
+    pub operator: Arc<str>,
+    /// `"rfc6962"` or `"static_ct"`.
+    #[serde(skip)]
+    pub log_type: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DomainsOnlyMessage {
+/// Borrow-based like `LiteMessage` — serializing the domains_only stream
+/// must not clone every domain String per certificate.
+#[derive(Debug, Clone, Serialize)]
+pub struct DomainsOnlyMessage<'a> {
     pub message_type: Cow<'static, str>,
-    pub data: DomainList,
+    pub data: &'a DomainList,
 }
 
+/// Payloads carry the UTF-8 invariant (`Utf8Bytes` wraps shared `Bytes`), so
+/// WS/SSE fan-out is a pure refcount bump per client — the O(n) UTF-8 scan
+/// happens once here at serialize time, not once per subscriber per message.
 #[derive(Debug, Clone)]
 pub struct PreSerializedMessage {
-    pub full: Bytes,
-    pub lite: Bytes,
-    pub domains_only: Bytes,
+    pub full: Utf8Bytes,
+    pub lite: Utf8Bytes,
+    pub domains_only: Utf8Bytes,
+    pub v2: Utf8Bytes,
+    // Each payload above is empty when its stream is disabled or the message
+    // has nothing to say on it; senders skip empty payloads.
+    /// The parsed leaf, retained only while a server-side filter exists, so
+    /// filter matching reads structured fields instead of substring-searching
+    /// serialized JSON. An `Arc` bump rather than a copy, and the certificate
+    /// cache already holds the same allocation.
+    pub leaf: Option<Arc<LeafCert>>,
+}
+
+/// Serialize any `Serialize` value to JSON bytes.
+///
+/// Backend precedence (each gated by Cargo feature):
+///   1. `sonic` → cloudwego/sonic-rs (fastest; subtly different edge-case
+///      semantics — see the `sonic` feature comment in Cargo.toml for the
+///      full list, but tl;dr: NaN/Infinity emitted as non-standard tokens,
+///      some Unicode escaping differences. Default OFF.)
+///   2. `simd` → simd-json (default ON).
+///   3. neither → serde_json (always-available fallback; required when both
+///      `simd` and `sonic` are disabled).
+///
+/// All three produce identical JSON bytes for the payloads this crate emits
+/// (cert metadata: integers, monotonic timestamps as f64, ASCII/UTF-8 strings).
+/// The differences only surface for edge-case values that certstream-server
+/// never constructs.
+#[inline]
+fn serialize_json<T: Serialize>(value: &T, _capacity_hint: usize) -> Option<Vec<u8>> {
+    #[cfg(feature = "sonic")]
+    {
+        sonic_rs::to_vec(value).ok()
+    }
+    #[cfg(all(feature = "simd", not(feature = "sonic")))]
+    {
+        simd_json::to_vec(value).ok()
+    }
+    #[cfg(not(any(feature = "simd", feature = "sonic")))]
+    {
+        let mut buf = Vec::with_capacity(_capacity_hint);
+        serde_json::to_writer(&mut buf, value).ok()?;
+        Some(buf)
+    }
+}
+
+/// Serialize to a `Utf8Bytes`, validating UTF-8 exactly once. Serde output is
+/// always valid UTF-8, so the validation cannot fail in practice; `None` on
+/// the impossible path keeps the caller's existing skip semantics.
+#[inline]
+pub(crate) fn serialize_utf8<T: Serialize>(value: &T, capacity_hint: usize) -> Option<Utf8Bytes> {
+    let s = String::from_utf8(serialize_json(value, capacity_hint)?).ok()?;
+    Some(Utf8Bytes::from(s))
 }
 
 impl PreSerializedMessage {
-    pub fn from_certificate(msg: &CertificateMessage) -> Option<Self> {
-        let mut full = Vec::with_capacity(4096);
-        let mut lite_buf = Vec::with_capacity(2048);
-        let mut domains_buf = Vec::with_capacity(512);
+    pub fn from_certificate(
+        msg: &CertificateMessage,
+        streams: &StreamConfig,
+        retain_leaf: bool,
+    ) -> Option<Self> {
+        let full = if streams.full {
+            serialize_utf8(msg, 4096)?
+        } else {
+            Utf8Bytes::from_static("")
+        };
 
-        #[cfg(feature = "simd")]
-        {
-            full = simd_json::to_vec(msg).ok()?;
-            let lite_msg = msg.to_lite();
-            lite_buf = simd_json::to_vec(&lite_msg).ok()?;
-            let domains_msg = msg.to_domains_only();
-            domains_buf = simd_json::to_vec(&domains_msg).ok()?;
-        }
+        let lite = if streams.lite {
+            serialize_utf8(&msg.to_lite(), 2048)?
+        } else {
+            Utf8Bytes::from_static("")
+        };
 
-        #[cfg(not(feature = "simd"))]
-        {
-            serde_json::to_writer(&mut full, msg).ok()?;
-            let lite_msg = msg.to_lite();
-            serde_json::to_writer(&mut lite_buf, &lite_msg).ok()?;
-            let domains_msg = msg.to_domains_only();
-            serde_json::to_writer(&mut domains_buf, &domains_msg).ok()?;
-        }
+        // An IP address certificate carries no DNS names. Left empty, the
+        // fan-out paths skip it rather than send `"data": []`.
+        let domains_only = if streams.domains_only && !msg.data.leaf_cert.all_domains.is_empty() {
+            serialize_utf8(&msg.to_domains_only(), 512)?
+        } else {
+            Utf8Bytes::from_static("")
+        };
+
+        let v2 = if streams.v2 {
+            serialize_utf8(&msg.to_v2(), 2048)?
+        } else {
+            Utf8Bytes::from_static("")
+        };
 
         Some(Self {
-            full: Bytes::from(full),
-            lite: Bytes::from(lite_buf),
-            domains_only: Bytes::from(domains_buf),
+            full,
+            lite,
+            domains_only,
+            v2,
+            leaf: retain_leaf.then(|| Arc::clone(&msg.data.leaf_cert)),
         })
     }
+}
+
+/// Version 2 of the wire format.
+///
+/// v1 (`full` / `lite` / `domains_only`) is the CertStream shape and stays
+/// exactly as it is. v2 exists to answer a question v1 cannot: *where did
+/// this record come from, and what do you actually know about it*. The
+/// `(log_id, index)` pair identifies the record at its source; the
+/// certificate's SHA-256 identifies the certificate. Those are different
+/// things — one certificate appears in several logs at different indices —
+/// and separating them is what makes a finding reproducible.
+#[derive(Debug, Clone, Serialize)]
+struct V2Message<'a> {
+    message_type: &'a str,
+    version: u8,
+    data: V2Data<'a>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct V2Data<'a> {
+    source: V2Source<'a>,
+    entry: V2Entry<'a>,
+    verification: &'a Verification,
+    cert: LiteLeafCert<'a>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct V2Source<'a> {
+    name: &'a str,
+    url: &'a str,
+    /// Base64 SHA-256 of the log's public key. `null` for a log whose list
+    /// entry carries no key — those cannot be identified beyond their URL.
+    log_id: Option<&'a str>,
+    /// The operator's name as the catalog spells it. The canonical key that
+    /// `ct_log.operator_rate_limits` and the metric labels use is this
+    /// lowercased with punctuation collapsed.
+    operator: &'a str,
+    log_type: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct V2Entry<'a> {
+    /// Position in the log's tree. With `source.log_id`, this is the address
+    /// of the record at its source.
+    index: u64,
+    #[serde(rename = "type")]
+    entry_type: &'a str,
+    /// When this server read the entry.
+    observed_at: String,
+    /// When the log issued the SCT for it.
+    submitted_at: String,
+    link: &'a str,
+}
+
+fn rfc3339(epoch_secs: f64) -> String {
+    chrono::DateTime::from_timestamp_millis((epoch_secs * 1000.0) as i64)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +403,7 @@ struct LiteData<'a> {
     cert_index: u64,
     cert_link: &'a str,
     seen: f64,
+    submission_timestamp: f64,
     source: &'a Arc<Source>,
 }
 
@@ -222,10 +424,63 @@ struct LiteLeafCert<'a> {
 }
 
 impl CertificateMessage {
-    pub fn to_domains_only(&self) -> DomainsOnlyMessage {
+    pub fn to_domains_only(&self) -> DomainsOnlyMessage<'_> {
         DomainsOnlyMessage {
             message_type: Cow::Borrowed("dns_entries"),
-            data: self.data.leaf_cert.all_domains.clone(),
+            data: &self.data.leaf_cert.all_domains,
+        }
+    }
+
+    /// The v2 payload as a JSON string. Used by the backfill export, which
+    /// writes one record per line rather than broadcasting.
+    pub fn to_v2_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.to_v2())
+    }
+
+    fn to_v2(&self) -> V2Message<'_> {
+        V2Message {
+            message_type: "certificate_update",
+            version: 2,
+            data: V2Data {
+                source: V2Source {
+                    name: &self.data.source.name,
+                    url: &self.data.source.url,
+                    log_id: self.data.source.log_id.as_deref(),
+                    operator: &self.data.source.operator,
+                    log_type: self.data.source.log_type,
+                },
+                entry: V2Entry {
+                    index: self.data.cert_index,
+                    // v1 spells these "X509LogEntry" / "PrecertLogEntry".
+                    entry_type: if self.data.update_type.contains("Precert") {
+                        "precert"
+                    } else {
+                        "x509"
+                    },
+                    observed_at: rfc3339(self.data.seen),
+                    submitted_at: rfc3339(self.data.submission_timestamp),
+                    link: &self.data.cert_link,
+                },
+                verification: &self.data.verification,
+                cert: self.lite_leaf(),
+            },
+        }
+    }
+
+    fn lite_leaf(&self) -> LiteLeafCert<'_> {
+        LiteLeafCert {
+            subject: &self.data.leaf_cert.subject,
+            issuer: &self.data.leaf_cert.issuer,
+            serial_number: &self.data.leaf_cert.serial_number,
+            not_before: self.data.leaf_cert.not_before,
+            not_after: self.data.leaf_cert.not_after,
+            fingerprint: &self.data.leaf_cert.fingerprint,
+            sha1: &self.data.leaf_cert.sha1,
+            sha256: &self.data.leaf_cert.sha256,
+            signature_algorithm: self.data.leaf_cert.signature_algorithm.as_ref(),
+            is_ca: self.data.leaf_cert.is_ca,
+            all_domains: &self.data.leaf_cert.all_domains,
+            extensions: &self.data.leaf_cert.extensions,
         }
     }
 
@@ -234,37 +489,143 @@ impl CertificateMessage {
             message_type: &self.message_type,
             data: LiteData {
                 update_type: &self.data.update_type,
-                leaf_cert: LiteLeafCert {
-                    subject: &self.data.leaf_cert.subject,
-                    issuer: &self.data.leaf_cert.issuer,
-                    serial_number: &self.data.leaf_cert.serial_number,
-                    not_before: self.data.leaf_cert.not_before,
-                    not_after: self.data.leaf_cert.not_after,
-                    fingerprint: &self.data.leaf_cert.fingerprint,
-                    sha1: &self.data.leaf_cert.sha1,
-                    sha256: &self.data.leaf_cert.sha256,
-                    signature_algorithm: &self.data.leaf_cert.signature_algorithm,
-                    is_ca: self.data.leaf_cert.is_ca,
-                    all_domains: &self.data.leaf_cert.all_domains,
-                    extensions: &self.data.leaf_cert.extensions,
-                },
+                leaf_cert: self.lite_leaf(),
                 cert_index: self.data.cert_index,
                 cert_link: &self.data.cert_link,
                 seen: self.data.seen,
+                submission_timestamp: self.data.submission_timestamp,
                 source: &self.data.source,
             },
         }
     }
 
     #[inline]
-    pub fn pre_serialize(self) -> Option<Arc<PreSerializedMessage>> {
-        PreSerializedMessage::from_certificate(&self).map(Arc::new)
+    pub fn pre_serialize(
+        self,
+        streams: &StreamConfig,
+        retain_leaf: bool,
+    ) -> Option<Arc<PreSerializedMessage>> {
+        PreSerializedMessage::from_certificate(&self, streams, retain_leaf).map(Arc::new)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v2_of(msg: &CertificateMessage) -> serde_json::Value {
+        serde_json::to_value(msg.to_v2()).unwrap()
+    }
+
+    /// The whole reason v2 is a separate format: v1 is the CertStream shape,
+    /// and the fields v2 adds must not leak into it.
+    #[test]
+    fn v1_payloads_are_unchanged_by_the_v2_fields() {
+        let mut msg = make_test_message();
+        Arc::get_mut(&mut msg.data.source).unwrap().log_id = Some(Arc::from("some-log-id"));
+        Arc::get_mut(&mut msg.data.source).unwrap().operator = Arc::from("Example Operator");
+        msg.data.verification = Verification {
+            checkpoint_signature: VerificationState::Verified,
+            inclusion: VerificationState::Unverified,
+        };
+
+        let full = serde_json::to_string(&msg).unwrap();
+        let lite = serde_json::to_string(&msg.to_lite()).unwrap();
+
+        for payload in [&full, &lite] {
+            for leaked in ["log_id", "operator", "log_type", "verification", "observed_at"] {
+                assert!(
+                    !payload.contains(leaked),
+                    "v1 payload leaked `{leaked}`:\n{payload}"
+                );
+            }
+        }
+        // And the source object is still exactly {name, url}.
+        let parsed: serde_json::Value = serde_json::from_str(&full).unwrap();
+        let source = parsed["data"]["source"].as_object().unwrap();
+        assert_eq!(source.len(), 2, "v1 source must stay {{name, url}}: {source:?}");
+    }
+
+    /// `(log_id, index)` addresses the record at its source; the SHA-256
+    /// addresses the certificate. Both have to be present and distinct.
+    #[test]
+    fn v2_addresses_the_record_and_the_certificate_separately() {
+        let mut msg = make_test_message();
+        Arc::get_mut(&mut msg.data.source).unwrap().log_id = Some(Arc::from("some-log-id"));
+        Arc::get_mut(&mut msg.data.source).unwrap().operator = Arc::from("Example Operator");
+        Arc::get_mut(&mut msg.data.source).unwrap().log_type = "static_ct";
+
+        let v2 = v2_of(&msg);
+        assert_eq!(v2["version"], 2);
+        assert_eq!(v2["data"]["source"]["log_id"], "some-log-id");
+        assert_eq!(v2["data"]["source"]["operator"], "Example Operator");
+        assert_eq!(v2["data"]["source"]["log_type"], "static_ct");
+        assert_eq!(v2["data"]["entry"]["index"], 12345);
+        assert_eq!(v2["data"]["cert"]["sha256"], "EE:FF");
+    }
+
+    #[test]
+    fn v2_reports_the_entry_type_and_both_timestamps() {
+        let mut msg = make_test_message();
+        msg.data.seen = 1_700_000_000.5;
+        msg.data.submission_timestamp = 1_699_999_000.25;
+
+        let v2 = v2_of(&msg);
+        assert_eq!(v2["data"]["entry"]["type"], "x509");
+        assert_eq!(v2["data"]["entry"]["observed_at"], "2023-11-14T22:13:20.500Z");
+        assert_eq!(v2["data"]["entry"]["submitted_at"], "2023-11-14T21:56:40.250Z");
+
+        msg.data.update_type = Cow::Borrowed("PrecertLogEntry");
+        assert_eq!(v2_of(&msg)["data"]["entry"]["type"], "precert");
+    }
+
+    /// A consumer must be able to tell "checked and passed" from "did not
+    /// check" from "does not apply here".
+    #[test]
+    fn v2_states_what_was_actually_verified() {
+        let mut msg = make_test_message();
+
+        msg.data.verification = Verification {
+            checkpoint_signature: VerificationState::Verified,
+            inclusion: VerificationState::Unverified,
+        };
+        let v2 = v2_of(&msg);
+        assert_eq!(v2["data"]["verification"]["checkpoint_signature"], "verified");
+        assert_eq!(v2["data"]["verification"]["inclusion"], "unverified");
+
+        msg.data.verification.checkpoint_signature = VerificationState::NotApplicable;
+        assert_eq!(
+            v2_of(&msg)["data"]["verification"]["checkpoint_signature"],
+            "not_applicable"
+        );
+
+        msg.data.verification.checkpoint_signature = VerificationState::Failed;
+        assert_eq!(
+            v2_of(&msg)["data"]["verification"]["checkpoint_signature"],
+            "failed"
+        );
+    }
+
+    #[test]
+    fn v2_is_only_serialized_when_the_stream_is_enabled() {
+        let msg = make_test_message();
+
+        let off = PreSerializedMessage::from_certificate(
+            &msg,
+            &StreamConfig { v2: false, ..StreamConfig::default() },
+            false,
+        )
+        .unwrap();
+        assert!(off.v2.is_empty(), "disabled v2 must cost nothing");
+
+        let on = PreSerializedMessage::from_certificate(
+            &msg,
+            &StreamConfig { v2: true, ..StreamConfig::default() },
+            false,
+        )
+        .unwrap();
+        assert!(on.v2.contains(r#""version":2"#));
+    }
     use smallvec::smallvec;
     use std::borrow::Cow;
     use std::sync::Arc;
@@ -273,8 +634,9 @@ mod tests {
         CertificateMessage {
             message_type: Cow::Borrowed("certificate_update"),
             data: CertificateData {
+                verification: Default::default(),
                 update_type: Cow::Borrowed("X509LogEntry"),
-                leaf_cert: LeafCert {
+                leaf_cert: Arc::new(LeafCert {
                     subject: Subject {
                         cn: Some("example.com".into()),
                         ..Default::default()
@@ -289,17 +651,22 @@ mod tests {
                     fingerprint: "AA:BB".into(),
                     sha1: "CC:DD".into(),
                     sha256: "EE:FF".into(),
-                    signature_algorithm: "sha256, rsa".into(),
+                    sha256_raw: [0u8; 32],
+                    signature_algorithm: Cow::Borrowed("sha256, rsa"),
                     is_ca: false,
                     all_domains: smallvec!["example.com".into(), "www.example.com".into()],
                     as_der: None,
                     extensions: Extensions::default(),
-                },
+                }),
                 chain: None,
                 cert_index: 12345,
                 cert_link: "https://ct.example.com/entry/12345".into(),
                 seen: 1700000000.0,
+                submission_timestamp: 1700000000.0,
                 source: Arc::new(Source {
+                    log_id: None,
+                    operator: Arc::from("Test"),
+                    log_type: "rfc6962",
                     name: Arc::from("Test Log"),
                     url: Arc::from("https://ct.example.com/"),
                 }),
@@ -362,32 +729,44 @@ mod tests {
     #[test]
     fn test_pre_serialize_returns_some() {
         let msg = make_test_message();
-        let result = msg.pre_serialize();
+        let result = msg.pre_serialize(&StreamConfig::default(), false);
         assert!(result.is_some());
     }
 
     #[test]
     fn test_pre_serialize_full_contains_certificate_update() {
         let msg = make_test_message();
-        let pre = msg.pre_serialize().unwrap();
-        let full_str = std::str::from_utf8(&pre.full).unwrap();
+        let pre = msg.pre_serialize(&StreamConfig::default(), false).unwrap();
+        let full_str = pre.full.as_str();
         assert!(full_str.contains("certificate_update"));
     }
 
     #[test]
     fn test_pre_serialize_lite_does_not_contain_chain() {
         let msg = make_test_message();
-        let pre = msg.pre_serialize().unwrap();
-        let lite_str = std::str::from_utf8(&pre.lite).unwrap();
+        let pre = msg.pre_serialize(&StreamConfig::default(), false).unwrap();
+        let lite_str = pre.lite.as_str();
         assert!(!lite_str.contains("\"chain\""));
     }
 
     #[test]
     fn test_pre_serialize_domains_contains_dns_entries() {
         let msg = make_test_message();
-        let pre = msg.pre_serialize().unwrap();
-        let domains_str = std::str::from_utf8(&pre.domains_only).unwrap();
+        let pre = msg.pre_serialize(&StreamConfig::default(), false).unwrap();
+        let domains_str = pre.domains_only.as_str();
         assert!(domains_str.contains("dns_entries"));
+    }
+
+    #[test]
+    fn test_pre_serialize_leaves_domains_empty_without_dns_names() {
+        let mut msg = make_test_message();
+        let mut leaf = (*msg.data.leaf_cert).clone();
+        leaf.all_domains.clear();
+        msg.data.leaf_cert = Arc::new(leaf);
+
+        let pre = msg.pre_serialize(&StreamConfig::default(), false).unwrap();
+        assert!(pre.domains_only.is_empty());
+        assert!(pre.lite.as_str().contains("certificate_update"));
     }
 
     #[test]

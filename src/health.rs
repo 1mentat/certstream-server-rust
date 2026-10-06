@@ -111,18 +111,19 @@ pub async fn example_json() -> Json<CertificateMessage> {
     let example = CertificateMessage {
         message_type: Cow::Borrowed("certificate_update"),
         data: CertificateData {
+            verification: Default::default(),
             update_type: Cow::Borrowed("X509LogEntry"),
-            leaf_cert: LeafCert {
+            leaf_cert: Arc::new(LeafCert {
                 subject: subject.clone(),
                 issuer: issuer.clone(),
                 serial_number: "0123456789ABCDEF".to_string(),
                 not_before: 1704067200,
                 not_after: 1735689600,
-                fingerprint: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01"
-                    .to_string(),
+                fingerprint: Arc::from("AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01"),
                 sha1: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01".to_string(),
                 sha256: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89".to_string(),
-                signature_algorithm: "sha256, rsa".to_string(),
+                sha256_raw: [0u8; 32],
+                signature_algorithm: Cow::Borrowed("sha256, rsa"),
                 is_ca: false,
                 all_domains: smallvec![
                     "example.com".to_string(),
@@ -131,26 +132,29 @@ pub async fn example_json() -> Json<CertificateMessage> {
                 ],
                 as_der: Some("BASE64_ENCODED_DER_DATA".to_string()),
                 extensions,
-            },
-            chain: Some(vec![ChainCert {
+            }),
+            chain: Some(vec![Arc::new(ChainCert {
                 subject: issuer,
                 issuer: chain_issuer,
                 serial_number: "00112233445566".to_string(),
                 not_before: 1672531200,
                 not_after: 1767225600,
-                fingerprint: "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44"
-                    .to_string(),
+                fingerprint: Arc::from("11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44"),
                 sha1: "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44".to_string(),
                 sha256: "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00".to_string(),
-                signature_algorithm: "sha256, rsa".to_string(),
+                signature_algorithm: Cow::Borrowed("sha256, rsa"),
                 is_ca: true,
                 as_der: Some("BASE64_ENCODED_CA_DER".to_string()),
                 extensions: chain_extensions,
-            }]),
+            })]),
             cert_index: 123456789,
             cert_link: "https://ct.googleapis.com/logs/us1/argon2025h2/ct/v1/get-entries?start=123456789&end=123456789".to_string(),
             seen: 1704067200.123,
+            submission_timestamp: 1704000000.0,
             source: Arc::new(Source {
+                log_id: Some(Arc::from("example-log-id")),
+                operator: Arc::from("Example Operator"),
+                log_type: "static_ct",
                 name: Arc::from("Google 'Argon2024' log"),
                 url: Arc::from("https://ct.googleapis.com/logs/argon2024"),
             }),

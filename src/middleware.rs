@@ -39,7 +39,21 @@ impl ConnectionLimiter {
             .unwrap_or_else(|| self.fallback_config.clone())
     }
 
-    pub fn try_acquire(&self, ip: IpAddr) -> bool {
+    /// Take a slot and get back a handle that returns it on drop.
+    ///
+    /// The WebSocket handlers must acquire *before* `ws.on_upgrade`, but axum
+    /// drops the upgrade callback without ever calling it when the handshake
+    /// fails, so a slot released at the end of the connection task leaks on
+    /// every failed upgrade. Moving this guard into the callback makes the
+    /// release follow the callback's lifetime instead of its execution.
+    pub fn acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionGuard> {
+        self.try_acquire(ip).then(|| ConnectionGuard {
+            limiter: Arc::clone(self),
+            ip,
+        })
+    }
+
+    fn try_acquire(&self, ip: IpAddr) -> bool {
         let config = self.get_config();
 
         if !config.enabled {
@@ -47,7 +61,9 @@ impl ConnectionLimiter {
         }
 
         loop {
-            let current_total = self.total_connections.load(Ordering::SeqCst);
+            // Acquire: the CAS below is only sound if this load cannot be
+            // reordered past it.
+            let current_total = self.total_connections.load(Ordering::Acquire);
             if current_total >= config.max_connections {
                 metrics::counter!("certstream_connection_limit_rejected").increment(1);
                 return false;
@@ -55,7 +71,7 @@ impl ConnectionLimiter {
 
             if self
                 .total_connections
-                .compare_exchange(current_total, current_total + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(current_total, current_total + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -73,7 +89,11 @@ impl ConnectionLimiter {
                 }
             }
             if should_release {
-                self.total_connections.fetch_sub(1, Ordering::SeqCst);
+                self.total_connections.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |v| Some(v.saturating_sub(1)),
+                ).ok();
                 metrics::counter!("certstream_per_ip_limit_rejected").increment(1);
                 return false;
             }
@@ -87,14 +107,21 @@ impl ConnectionLimiter {
         true
     }
 
-    pub fn release(&self, ip: IpAddr) {
+    fn release(&self, ip: IpAddr) {
         let config = self.get_config();
 
         if !config.enabled {
             return;
         }
 
-        self.total_connections.fetch_sub(1, Ordering::SeqCst);
+        // Saturating, because a hot reload can flip `enabled` from false to
+        // true between acquire and release — the acquire never incremented,
+        // and an unchecked decrement would underflow the counter.
+        self.total_connections.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |v| Some(v.saturating_sub(1)),
+        ).ok();
 
         if let Some(mut entry) = self.per_ip_connections.get_mut(&ip) {
             *entry = entry.saturating_sub(1);
@@ -108,6 +135,42 @@ impl ConnectionLimiter {
     pub fn current_connections(&self) -> u32 {
         self.total_connections.load(Ordering::Relaxed)
     }
+
+    /// Sweep zero-count entries from `per_ip_connections`. `release()` already
+    /// removes entries inline when their count hits zero, but error paths can
+    /// leave zombies (entry decremented to zero by saturating_sub without the
+    /// follow-up remove). This is a belt-and-braces sweep — cheap, idempotent,
+    /// safe to run when the limiter is disabled.
+    pub fn cleanup_stale(&self) {
+        self.per_ip_connections.retain(|_, count| *count > 0);
+    }
+}
+
+/// A slot held in [`ConnectionLimiter`], returned when this value drops.
+///
+/// Covers the paths a hand-written `release()` call misses: a failed
+/// WebSocket upgrade (axum drops the callback uninvoked), a cancelled
+/// connection task, and an early return between acquiring and streaming.
+pub struct ConnectionGuard {
+    limiter: Arc<ConnectionLimiter>,
+    ip: IpAddr,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.limiter.release(self.ip);
+    }
+}
+
+/// Constant-time check that `target` matches some element of `list`.
+/// Length mismatch short-circuits per entry (the length itself is not secret),
+/// but byte comparison runs in fixed time so an attacker can't distinguish
+/// near-matches via response timing.
+fn ct_contains(list: &[String], target: &[u8]) -> bool {
+    list.iter().any(|stored| {
+        let sb = stored.as_bytes();
+        sb.len() == target.len() && sb.ct_eq(target).into()
+    })
 }
 
 #[derive(Clone)]
@@ -124,40 +187,49 @@ impl AuthMiddleware {
         }
     }
 
-    fn get_config(&self) -> AuthConfig {
-        self.hot_reload
-            .as_ref()
-            .map(|hr| hr.get().auth.clone())
-            .unwrap_or_else(|| self.fallback_config.clone())
+    /// Runs `f` against the live config without cloning it: the hot-reload
+    /// snapshot is an `ArcSwap` load, so a request that checks the enabled
+    /// flag, the header name and the token list reads one consistent snapshot
+    /// and copies none of it.
+    fn with_config<R>(&self, f: impl FnOnce(&AuthConfig) -> R) -> R {
+        match &self.hot_reload {
+            Some(hr) => f(&hr.get().auth),
+            None => f(&self.fallback_config),
+        }
     }
 
-    pub fn validate(&self, token: Option<&str>) -> bool {
-        let config = self.get_config();
-
+    fn validate_against(config: &AuthConfig, token: Option<&str>) -> bool {
         if !config.enabled {
             return true;
         }
-
-        match token {
-            Some(t) => {
-                let token_value = t.strip_prefix("Bearer ").unwrap_or(t);
-                let token_bytes = token_value.as_bytes();
-                config.tokens.iter().any(|stored| {
-                    let stored_bytes = stored.as_bytes();
-                    stored_bytes.len() == token_bytes.len()
-                        && stored_bytes.ct_eq(token_bytes).into()
-                })
-            }
-            None => false,
-        }
+        let Some(t) = token else { return false };
+        let token_value = t.strip_prefix("Bearer ").unwrap_or(t);
+        ct_contains(&config.tokens, token_value.as_bytes())
     }
 
+    /// Test-only inspectors — production traffic goes through `authorize`.
+    #[cfg(test)]
+    pub fn validate(&self, token: Option<&str>) -> bool {
+        self.with_config(|config| Self::validate_against(config, token))
+    }
+
+    #[cfg(test)]
     pub fn is_enabled(&self) -> bool {
-        self.get_config().enabled
+        self.with_config(|config| config.enabled)
     }
 
-    pub fn header_name(&self) -> String {
-        self.get_config().header_name
+    /// Full request check with a single config snapshot: enabled flag, header
+    /// lookup, and token validation all read the same consistent config.
+    pub fn authorize(&self, headers: &axum::http::HeaderMap) -> bool {
+        self.with_config(|config| {
+            if !config.enabled {
+                return true;
+            }
+            let token = headers
+                .get(config.header_name.as_str())
+                .and_then(|v| v.to_str().ok());
+            Self::validate_against(config, token)
+        })
     }
 }
 
@@ -166,17 +238,7 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !auth.is_enabled() {
-        return next.run(request).await;
-    }
-
-    let header_name = auth.header_name();
-    let token = request
-        .headers()
-        .get(&header_name)
-        .and_then(|v| v.to_str().ok());
-
-    if auth.validate(token) {
+    if auth.authorize(request.headers()) {
         next.run(request).await
     } else {
         metrics::counter!("certstream_auth_rejected").increment(1);
@@ -190,12 +252,11 @@ pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let token = request
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
-
-    match limiter.check(addr.ip(), token) {
+    // Single-tier rate limit keyed by source IP. Auth status doesn't
+    // influence this: a malicious authenticated client still hits the
+    // same per-IP ceiling as anyone else. Tier-based throttling was
+    // removed in 1.5.0 — it added complexity without a clear use case.
+    match limiter.check(addr.ip()) {
         RateLimitResult::Allowed => next.run(request).await,
         RateLimitResult::Rejected { retry_after_ms } => {
             let mut response = (
@@ -203,10 +264,10 @@ pub async fn rate_limit_middleware(
                 format!("Rate limit exceeded. Retry after {}ms", retry_after_ms),
             )
                 .into_response();
-            response.headers_mut().insert(
-                "Retry-After",
-                ((retry_after_ms / 1000).max(1)).to_string().parse().unwrap(),
-            );
+            let secs = (retry_after_ms / 1000).max(1).to_string();
+            if let Ok(hv) = secs.parse() {
+                response.headers_mut().insert("Retry-After", hv);
+            }
             response
         }
     }
@@ -235,8 +296,6 @@ mod tests {
             enabled,
             tokens: tokens.into_iter().map(String::from).collect(),
             header_name: "Authorization".to_string(),
-            standard_tokens: Vec::new(),
-            premium_tokens: Vec::new(),
         }
     }
 

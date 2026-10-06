@@ -203,6 +203,15 @@ async fn handle_query_certs(
                 // Open table at cursor version using from_valid_uri for defense-in-depth
                 let table_builder = match DeltaTableBuilder::from_valid_uri(&state.config.table_path) {
                     Ok(builder) => builder,
+                    // A local table path that does not exist yet is "no data", not a bad URI.
+                    Err(DeltaTableError::InvalidTableLocation(_)) => {
+                        metrics::counter!("certstream_query_requests", "status" => "503").increment(1);
+                        metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(ErrorResponse { error: "Query service unavailable".to_string() }),
+                        ).into_response();
+                    }
                     Err(e) => {
                         warn!(error = %e, "Failed to parse table URI");
                         metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
@@ -249,6 +258,15 @@ async fn handle_query_certs(
         // No cursor — open latest version using from_valid_uri for defense-in-depth
         let table_builder = match DeltaTableBuilder::from_valid_uri(&state.config.table_path) {
             Ok(builder) => builder,
+            // A local table path that does not exist yet is "no data", not a bad URI.
+            Err(DeltaTableError::InvalidTableLocation(_)) => {
+                metrics::counter!("certstream_query_requests", "status" => "503").increment(1);
+                metrics::histogram!("certstream_query_duration_seconds").record(start.elapsed().as_secs_f64());
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse { error: "Query service unavailable".to_string() }),
+                ).into_response();
+            }
             Err(e) => {
                 warn!(error = %e, "Failed to parse table URI");
                 metrics::counter!("certstream_query_requests", "status" => "500").increment(1);
@@ -2031,7 +2049,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_nonexistent_table_returns_503() {
         // Verify that a nonexistent Delta table returns HTTP 503 (Service Unavailable) through the handler
-        let table_path = "/tmp/delta_query_test_handler_nonexistent/nonexistent";
+        let table_path = "file:///tmp/delta_query_test_handler_nonexistent/nonexistent";
 
         // Config pointing to a table that will never exist
         let mut config = crate::config::QueryApiConfig::default();

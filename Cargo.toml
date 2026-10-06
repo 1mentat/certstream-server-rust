@@ -1,71 +1,166 @@
 [package]
 name = "certstream-server-rust"
-version = "1.2.0"
+version = "1.6.1"
 edition = "2024"
-repository = "https://github.com/burakozcn01/certstream-server-rust"
+repository = "https://github.com/1mentat/certstream-server-rust"
 license = "MIT"
+readme = "README.md"
 description = "High-performance Certificate Transparency log streaming server"
+keywords = ["certificate", "transparency", "certstream", "websocket", "tls"]
+categories = ["command-line-utilities", "network-programming"]
+# The published crate is the server, not the site or the dashboards.
+exclude = ["docs/", "grafana/", "soak/", "packaging/", "*.png", "certstream_state.json"]
 
 [features]
-default = []
+default = ["simd"]
 simd = ["simd-json"]
 integration = []
+# `sonic` swaps the JSON serializer for cloudwego/sonic-rs. Benchmarks have
+# it ~1.5-2× faster than simd-json on typical payloads. Default OFF because
+# the behaviour around a handful of edge cases differs subtly from
+# serde_json / simd-json:
+#
+#   * NaN / Infinity floats: serde_json and simd-json reject by default;
+#     sonic-rs accepts and emits the non-standard tokens "NaN"/"inf".
+#     certstream-server payloads never produce NaN floats (all f64 fields
+#     are derived from monotonic millisecond timestamps), but if a future
+#     field could contain NaN, that's the failure mode to watch for.
+#
+#   * Number precision: round-trip for normal f64 values is byte-identical
+#     to serde_json. Denormals and very-large integers above 2^53 may
+#     stringify slightly differently — irrelevant for our payload.
+#
+#   * Unicode escaping: serde_json escapes some non-ASCII control bytes
+#     that sonic-rs leaves raw. Both are valid JSON per RFC 8259, but
+#     downstream consumers doing byte-level diffing may notice.
+#
+# Sonic-rs uses runtime CPU-feature dispatch (SSE4.2 / AVX2 on x86,
+# NEON on arm64) so the binary stays portable.
+#
+# Opt in with `--features sonic`. If both `simd` and `sonic` are enabled,
+# sonic-rs takes precedence (newer + generally faster).
+sonic = ["dep:sonic-rs"]
 
 [dependencies]
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "io-std", "macros", "fs", "signal"] }
 axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
-reqwest = { version = "0.12", features = ["json"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+reqwest = { version = "0.13", features = ["json", "gzip", "brotli", "deflate", "rustls"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-simd-json = { version = "0.14", optional = true }
+simd-json = { version = "0.17", optional = true }
+sonic-rs = { version = "0.5", optional = true }
 serde_yaml = "0.9"
-x509-parser = "0.16"
+x509-parser = "0.18"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 thiserror = "2"
-sha1 = "0.10"
-sha2 = "0.10"
-bytes = "1.10"
+sha1 = "0.11"
+sha2 = "0.11"
+bytes = "1.11"
 parking_lot = "0.12"
 smallvec = { version = "1.15", features = ["serde"] }
-regex = "1.11"
-memchr = "2.7"
+regex = "1.12"
+memchr = "2.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 backon = "1"
 dashmap = "6"
-notify = { version = "7", features = ["macos_kqueue"] }
+ahash = "0.8"
+notify = { version = "8", features = ["macos_kqueue"] }
 subtle = "2.6"
-arc-swap = "1.7"
+arc-swap = "1.9"
 tokio-util = { version = "0.7.18", features = ["full"] }
-futures = "0.3.31"
-flate2 = "1.0"
 deltalake = { version = "0.25", features = ["datafusion", "s3"] }
 prost = "0.13"
 prost-types = "0.13"
 databricks-zerobus-ingest-sdk = "0.1"
 parquet = "54"
 
-[dev-dependencies]
-rcgen = "0.13"
-uuid = { version = "1", features = ["v4"] }
+futures = "0.3.32"
+flate2 = "1.1"
+quick_cache = "0.6"
+rsa = { version = "0.9.10", features = ["sha2", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+rustls-native-certs = "0.8"
+static_ct_api = "0.2"
+# Merkle inclusion / consistency verification against a log's hash tiles.
+# Already in the tree via static_ct_api; named here because we use it directly.
+tlog_tiles = "0.2"
+signed_note = "0.2"
+p256 = { version = "0.13", features = ["pkcs8", "ecdsa"] }
+async-nats = "0.50"
+
+# jemalloc as global allocator: the ingest workload churns multi-MB transient
+# buffers across ~100 tasks; system allocators retain the freed pages in
+# arenas and RSS parks at the high-water mark. Not available on MSVC.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+# Reads the allocator's own counters (allocated / resident / retained) so
+# /metrics can separate live heap from pages jemalloc has yet to return.
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
 
 [build-dependencies]
 prost-build = "0.13"
 
+[dev-dependencies]
+rcgen = "0.14"
+uuid = { version = "1", features = ["v4"] }
+# The filter tests build a LeafCert by hand; `all_domains` is a SmallVec.
+smallvec = "1.15"
+
+# cargo-deb: `cargo deb` produces a package that installs the binary, the
+# systemd unit and the example config. The unit uses DynamicUser, so there is
+# no account to create in a maintainer script.
+[package.metadata.deb]
+maintainer = "1mentat <1mentat@users.noreply.github.com>"
+copyright = "2026, 1mentat"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Monitors every Chrome- and Apple-trusted Certificate Transparency log and \
+streams newly issued TLS certificates over WebSocket and SSE. Speaks both \
+RFC 6962 and the static-ct-api tile protocol from a single binary."""
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/certstream-server-rust", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/certstream-server-rust/README.md", "644"],
+    ["config.example.yaml", "usr/share/doc/certstream-server-rust/config.example.yaml", "644"],
+    ["packaging/certstream-server-rust.default", "etc/default/certstream-server-rust", "644"],
+]
+conf-files = ["/etc/default/certstream-server-rust"]
+maintainer-scripts = "packaging/"
+systemd-units = { unit-name = "certstream-server-rust", unit-scripts = "packaging/", enable = false, start = false }
+
+# cargo-generate-rpm: run after `cargo build --release`.
+[package.metadata.generate-rpm]
+summary = "Certificate Transparency log streaming server"
+license = "MIT"
+assets = [
+    { source = "target/release/certstream-server-rust", dest = "/usr/bin/certstream-server-rust", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/certstream-server-rust/README.md", mode = "644", doc = true },
+    { source = "config.example.yaml", dest = "/usr/share/doc/certstream-server-rust/config.example.yaml", mode = "644", doc = true },
+    { source = "packaging/certstream-server-rust.service", dest = "/usr/lib/systemd/system/certstream-server-rust.service", mode = "644" },
+    { source = "packaging/certstream-server-rust.default", dest = "/etc/default/certstream-server-rust", mode = "644", config = true },
+]
+
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = 3
+# Explicit: panic=unwind retained because main.rs:498 uses
+# futures::FutureExt::catch_unwind to recover from worker panics in the CT
+# poll loop. Switching to panic=abort would silently break that recovery
+# path. Revisit when the catch_unwind site is refactored.
+panic = "unwind"
 
 [profile.release.build-override]
 opt-level = 3
+

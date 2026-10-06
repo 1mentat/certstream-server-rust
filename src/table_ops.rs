@@ -537,7 +537,7 @@ pub async fn run_reparse_audit(
                 mismatches_in_row.push(FieldDiff {
                     field_name: "signature_algorithm".to_string(),
                     stored: stored_sig_algo.to_string(),
-                    reparsed: leaf.signature_algorithm.clone(),
+                    reparsed: leaf.signature_algorithm.to_string(),
                 });
             }
 
@@ -1108,13 +1108,13 @@ mod tests {
             source_url,
             cert_link: "https://example.com/cert/1".to_string(),
             serial_number: leaf.serial_number.clone(),
-            fingerprint: leaf.fingerprint.clone(),
+            fingerprint: leaf.fingerprint.to_string(),
             sha256: leaf.sha256.clone(),
             sha1: leaf.sha1.clone(),
             not_before: leaf.not_before,
             not_after: leaf.not_after,
             is_ca: leaf.is_ca,
-            signature_algorithm: leaf.signature_algorithm.clone(),
+            signature_algorithm: leaf.signature_algorithm.to_string(),
             subject_aggregated: leaf.subject.aggregated.as_deref().unwrap_or("").to_string(),
             issuer_aggregated: leaf.issuer.aggregated.as_deref().unwrap_or("").to_string(),
             all_domains: leaf.all_domains.to_vec(),

@@ -4,31 +4,51 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Certstream Server Rust - Real-Time Certificate Transparency Log Streaming</title>
-    <meta name="description" content="Certstream server written in Rust for real-time SSL/TLS certificate streaming. Aggregates certificates from 60+ CT logs via WebSocket and SSE. Drop-in replacement for certstream-server and certstream-server-go. 12MB memory, 50K+ concurrent clients.">
+    <meta name="description" content="A Certificate Transparency streaming server written in Rust. Reads SSL/TLS certificates from Chrome- and Apple-trusted CT logs and streams them over WebSocket and SSE. Compatible with certstream-server and certstream-server-go clients. RFC 6962 and static-ct-api in a single binary.">
     <meta name="keywords" content="certstream, certstream server, certstream rust, certstream-server-rust, certificate transparency, CT logs, SSL certificates, TLS certificates, real-time streaming, websocket, sse, rust server">
-    <meta name="author" content="burakozcn01">
+    <meta name="author" content="reloading01">
     <meta name="robots" content="index, follow">
     <link rel="canonical" href="https://certstream.dev/">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://certstream.dev/">
-    <meta property="og:title" content="Certstream Server Rust - Real-Time Certificate Transparency Streaming">
-    <meta property="og:description" content="Certstream server in Rust for real-time certificate streaming. Aggregates SSL/TLS certs from 60+ CT logs. WebSocket and SSE support. 12x less memory than Go.">
+    <meta property="og:title" content="certstream-server-rust: Certificate Transparency streaming">
+    <meta property="og:description" content="A certstream server in Rust. Reads SSL/TLS certificates from Chrome- and Apple-trusted CT logs and streams them over WebSocket and SSE.">
     <meta property="og:site_name" content="certstream-server-rust">
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="Certstream Server Rust - Real-Time Certificate Streaming">
-    <meta name="twitter:description" content="Stream SSL/TLS certificates from 60+ CT logs in real-time. WebSocket and SSE. 12MB memory, 50K+ concurrent clients. Drop-in replacement for certstream-server-go.">
-    <meta name="theme-color" content="#b7410e">
+    <meta name="twitter:title" content="certstream-server-rust: Certificate Transparency streaming">
+    <meta name="twitter:description" content="Stream SSL/TLS certificates from Chrome- and Apple-trusted CT logs over WebSocket and SSE. RFC 6962 and static-ct-api, in a single binary.">
+    <meta name="theme-color" content="#ffffff">
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <script>
+      // Applied before first paint so the page never flashes the wrong theme.
+      (function () {
+        var saved = null;
+        try { saved = localStorage.getItem('theme'); } catch (e) {}
+        if (saved === 'dark' || saved === 'light') {
+          document.documentElement.setAttribute('data-theme', saved);
+        }
+        window.toggleTheme = function () {
+          var root = document.documentElement;
+          var current = root.getAttribute('data-theme');
+          if (!current) {
+            current = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          var next = current === 'dark' ? 'light' : 'dark';
+          root.setAttribute('data-theme', next);
+          try { localStorage.setItem('theme', next); } catch (e) {}
+        };
+      })();
+    </script>
     <link rel="stylesheet" href="styles.css">
     <script type="application/ld+json">
     {
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
         "name": "certstream-server-rust",
-        "description": "High-performance Certificate Transparency log streaming server written in Rust",
+        "description": "Certificate Transparency log streaming server written in Rust, with WebSocket and SSE endpoints",
         "url": "https://certstream.dev/",
         "applicationCategory": "SecurityApplication",
         "operatingSystem": "Linux, macOS, Windows",
@@ -37,19 +57,12 @@
             "price": "0",
             "priceCurrency": "USD"
         },
-        "aggregateRating": {
-            "@type": "AggregateRating",
-            "ratingValue": "5",
-            "ratingCount": "12",
-            "bestRating": "5",
-            "worstRating": "1"
-        },
         "author": {
             "@type": "Person",
-            "name": "burakozcn01",
-            "url": "https://github.com/burakozcn01"
+            "name": "reloading01",
+            "url": "https://github.com/reloading01"
         },
-        "codeRepository": "https://github.com/burakozcn01/certstream-server-rust",
+        "codeRepository": "https://github.com/reloading01/certstream-server-rust",
         "programmingLanguage": "Rust",
         "license": "https://opensource.org/licenses/MIT"
     }
@@ -69,18 +82,34 @@
             },
             {
                 "@type": "Question",
-                "name": "How is certstream-server-rust different from certstream-server-go?",
+                "name": "What protocols does certstream-server-rust support?",
                 "acceptedAnswer": {
                     "@type": "Answer",
-                    "text": "certstream-server-rust uses 12x less memory (22MB vs 254MB under load), delivers 9x faster latency (3.4ms vs 31ms), and provides 2.5x higher throughput. It also supports SSE in addition to WebSocket."
+                    "text": "certstream-server-rust supports WebSocket and Server-Sent Events (SSE), and ingests from both RFC 6962 and static-CT-API (checkpoint + tile) logs. This allows integration with browsers, command-line tools, and data pipelines."
                 }
             },
             {
                 "@type": "Question",
-                "name": "What protocols does certstream-server-rust support?",
+                "name": "Is there a free certstream API available?",
                 "acceptedAnswer": {
                     "@type": "Answer",
-                    "text": "certstream-server-rust supports WebSocket and Server-Sent Events (SSE). This allows integration with browsers, command-line tools, and data pipelines."
+                    "text": "You can self-host certstream-server-rust for free using Docker. Run `docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest` and connect via WebSocket at ws://localhost:8080/ or SSE at http://localhost:8080/sse."
+                }
+            },
+            {
+                "@type": "Question",
+                "name": "How do I connect to the certstream API?",
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": "Self-host with Docker, then connect to ws://localhost:8080/ via WebSocket, or use `curl -N http://localhost:8080/sse` for Server-Sent Events. Python users can use the certstream library: certstream.listen_for_events(callback, url='ws://localhost:8080/'). See the Quick Start guide for details."
+                }
+            },
+            {
+                "@type": "Question",
+                "name": "What can I use the certstream API for?",
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": "Common use cases: phishing domain detection, brand monitoring, security research, threat intelligence, certificate inventory, and discovering newly registered domains. The certstream API streams every newly issued SSL/TLS certificate in real-time from Certificate Transparency logs."
                 }
             }
         ]
@@ -90,7 +119,7 @@
 <body>
     <header>
         <div class="wrap">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <nav>
                 <ul class="nav-links">
                     <li><a href="/" class="active">Home</a></li>
@@ -100,7 +129,11 @@
                 </ul>
             </nav>
             <button class="mobile-menu-btn" onclick="document.getElementById('mobile-nav').classList.add('active')"><span></span><span></span><span></span></button>
-            <a href="https://github.com/burakozcn01/certstream-server-rust" class="gh-link" target="_blank" rel="noopener">
+            <button class="theme-toggle" onclick="toggleTheme()" aria-label="Switch between light and dark theme" title="Switch theme">
+                <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>
+                <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+            </button>
+            <a href="https://github.com/reloading01/certstream-server-rust" class="gh-link" target="_blank" rel="noopener">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
                 GitHub
             </a>
@@ -108,7 +141,7 @@
     </header>
     <div class="mobile-nav" id="mobile-nav">
         <div class="mobile-nav-header">
-            <a href="/" class="logo">certstream-server-rust</a>
+            <a href="/" class="logo" aria-label="certstream-server-rust"><img class="logo-light" src="/logo-black.png" alt="certstream-server-rust"><img class="logo-dark" src="/logo-white.png" alt="" aria-hidden="true"></a>
             <button class="mobile-nav-close" onclick="document.getElementById('mobile-nav').classList.remove('active')">&times;</button>
         </div>
         <ul class="mobile-nav-links">
@@ -116,141 +149,198 @@
             <li><a href="docs.html">API Docs</a></li>
             <li><a href="quickstart.html">Quick Start</a></li>
             <li><a href="architecture.html">Architecture</a></li>
-            <li><a href="https://github.com/burakozcn01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
+            <li><a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a></li>
         </ul>
     </div>
 
     <main>
         <section class="hero">
-            <div class="wrap">
-                <h1><span class="hl">Certstream</span> server in Rust for real-time CT log streaming</h1>
-                <p class="hero-desc">
-                    Drop-in replacement for certstream-server and certstream-server-go. Stream certificates via WebSocket and SSE.
-                    Monitor 60+ Certificate Transparency logs with 50K+ concurrent clients.
-                </p>
-                <div class="hero-stats">
-                    <div class="hero-stat">
-                        <strong>27 MB</strong>
-                        <span>Memory (idle)</span>
+            <div class="wrap hero-grid">
+                <div class="hero-copy">
+                    <h1>Certificate Transparency streaming in Rust</h1>
+                    <p class="hero-desc">
+                        Watches the Chrome- and Apple-trusted Certificate Transparency logs and streams every new SSL/TLS certificate to you over WebSocket or Server-Sent Events. RFC 6962 and static-ct-api logs both work, in one binary.
+                    </p>
+                    <div class="hero-actions">
+                        <a href="/quickstart.html" class="btn btn-primary">Quick Start</a>
+                        <a href="https://github.com/reloading01/certstream-server-rust" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
                     </div>
-                    <div class="hero-stat">
-                        <strong>8.4ms</strong>
-                        <span>Avg latency</span>
-                    </div>
-                    <div class="hero-stat">
-                        <strong>48.6K/s</strong>
-                        <span>Throughput</span>
-                    </div>
-                    <div class="hero-stat">
-                        <strong>23%</strong>
-                        <span>CPU (500 clients)</span>
-                    </div>
+                    <p class="hero-stats" id="hero-stats" hidden></p>
                 </div>
-                <div class="hero-actions">
-                    <a href="https://github.com/burakozcn01/certstream-server-rust#quick-start" class="btn btn-primary" target="_blank" rel="noopener">Get Started</a>
-                    <a href="https://github.com/burakozcn01/certstream-server-rust" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
-                </div>
-                <div class="install-box">
-                    <code>docker run -d -p 8080:8080 reloading01/certstream-server-rust:latest</code>
-                    <button onclick="navigator.clipboard.writeText('docker run -d -p 8080:8080 reloading01/certstream-server-rust:latest');this.textContent='Copied!'">Copy</button>
+                <div class="hero-demo">
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Run</span>
+                            <button class="copy-btn" onclick="navigator.clipboard.writeText('docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest');this.textContent='Copied'">Copy</button>
+                        </div>
+                        <pre class="wrap"><span class="cm">$</span> docker run -d -p 8080:8080 \
+    ghcr.io/reloading01/certstream-server-rust:latest</pre>
+                    </div>
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Stream</span>
+                            <span class="tag">/domains-only</span>
+                        </div>
+                        <pre class="wrap"><span class="cm">$</span> wscat -c ws://localhost:8080/domains-only
+{"<span class="str">message_type</span>":"<span class="str">certificate_update</span>",
+ "<span class="str">data</span>":["<span class="str">example.com</span>","<span class="str">www.example.com</span>"]}</pre>
+                    </div>
                 </div>
             </div>
         </section>
 
-        <section id="features">
+        <section id="features" class="split">
             <div class="wrap">
                 <div class="section-header">
-                    <h2>What you get</h2>
-                    <p>Built for security teams, researchers, and developers who need reliable CT monitoring</p>
+                    <h2>Features</h2>
                 </div>
                 <div class="features-list">
                     <div class="feature-item">
-                        <h3>Multi-protocol streaming</h3>
-                        <p>WebSocket and SSE (Server-Sent Events). Pick the protocol that fits your stack. WebSocket for real-time clients, SSE for browsers and pipelines.</p>
+                        <h3>WebSocket and SSE</h3>
+                        <p>Use WebSocket or Server-Sent Events, whichever your client prefers. Both carry the same certificates.</p>
+                    </div>
+                    <div class="feature-item">
+                        <h3>RFC 6962 and static-ct-api</h3>
+                        <p>Classic <code>get-entries</code> logs and the newer checkpoint-and-tile static-ct-api logs are watched side by side in one process.</p>
+                    </div>
+                    <div class="feature-item">
+                        <h3>Cross-log deduplication</h3>
+                        <p>One certificate usually ends up in several CT logs. The server hashes each one with SHA-256 and sends it once per deduplication window, so your client does not see repeats.</p>
                     </div>
                     <div class="feature-item">
                         <h3>State persistence</h3>
-                        <p>Resume from last position after restart. No certificate loss during maintenance or updates. Configurable state file.</p>
+                        <p>Log positions are saved to disk. After a restart or an upgrade each log continues where it stopped instead of starting over.</p>
                     </div>
                     <div class="feature-item">
-                        <h3>Connection limiting</h3>
-                        <p>Per-IP and total connection limits. Production-ready protection against abuse.</p>
+                        <h3>Connection limits</h3>
+                        <p>Optional caps on total connections and on connections per IP address.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Token authentication</h3>
-                        <p>Bearer token based auth for API access control. Multiple tokens supported. Configurable header name.</p>
+                        <p>Turn on bearer tokens for clients. Tokens are compared in constant time. You can set several of them and change the header name.</p>
                     </div>
                     <div class="feature-item">
-                        <h3>Hot reload config</h3>
-                        <p>Config changes apply without restart. File watcher detects updates. Zero-downtime configuration.</p>
+                        <h3>Configuration reload</h3>
+                        <p>The config file is watched. Settings that support it take effect without a restart.</p>
                     </div>
                     <div class="feature-item">
-                        <h3>CT log health</h3>
-                        <p>Automatic retry with exponential backoff. Circuit breaker for unhealthy logs. Configurable health thresholds.</p>
+                        <h3>Log health</h3>
+                        <p>Every CT log has its own watcher. Repeated failures move it from healthy to degraded to unhealthy, with retries, exponential backoff and a circuit breaker per log.</p>
                     </div>
                     <div class="feature-item">
-                        <h3>Prometheus metrics</h3>
-                        <p>Built-in /metrics endpoint. Connection counts per protocol, message throughput, CT log health.</p>
+                        <h3>Metrics and REST API</h3>
+                        <p>Prometheus metrics at <code>/metrics</code>. An optional REST API returns server statistics, CT log status and certificate lookups.</p>
                     </div>
                 </div>
             </div>
         </section>
 
-        <section id="performance">
+        <section id="migrating" class="split">
             <div class="wrap">
                 <div class="section-header">
-                    <h2>Performance</h2>
-                    <p>Load tested with 500 concurrent WebSocket clients, 60 seconds (2 CPU cores, 2GB RAM per container)</p>
+                    <h2>Compatibility</h2>
+                    <p>The message format is the one Calidog's certstream-server and certstream-server-go use, so a client only needs a different WebSocket address.</p>
                 </div>
-                <div class="comparison-grid" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
-                    <div class="comparison-cell header"></div>
-                    <div class="comparison-cell header">Rust</div>
-                    <div class="comparison-cell header">Go</div>
-                    <div class="comparison-cell header">Elixir</div>
-                    <div class="comparison-cell label">Memory (idle)</div>
-                    <div class="comparison-cell"><span class="value best">27 MB</span></div>
-                    <div class="comparison-cell"><span class="value">49 MB</span></div>
-                    <div class="comparison-cell"><span class="value">230 MB</span></div>
-                    <div class="comparison-cell label">Memory (under load)</div>
-                    <div class="comparison-cell"><span class="value best">198 MB</span></div>
-                    <div class="comparison-cell"><span class="value">309 MB</span></div>
-                    <div class="comparison-cell"><span class="value">649 MB</span></div>
-                    <div class="comparison-cell label">CPU (under load)</div>
-                    <div class="comparison-cell"><span class="value best">23%</span></div>
-                    <div class="comparison-cell"><span class="value">34%</span></div>
-                    <div class="comparison-cell"><span class="value">206%</span></div>
-                    <div class="comparison-cell label">Throughput</div>
-                    <div class="comparison-cell"><span class="value best">48.6K/s</span></div>
-                    <div class="comparison-cell"><span class="value">27K/s</span></div>
-                    <div class="comparison-cell"><span class="value">19K/s</span></div>
-                    <div class="comparison-cell label">Avg Latency</div>
-                    <div class="comparison-cell"><span class="value best">8.4ms</span></div>
-                    <div class="comparison-cell"><span class="value">9.2ms</span></div>
-                    <div class="comparison-cell"><span class="value">26.8ms</span></div>
-                    <div class="comparison-cell label">P99 Latency</div>
-                    <div class="comparison-cell"><span class="value best">172ms</span></div>
-                    <div class="comparison-cell"><span class="value">187ms</span></div>
-                    <div class="comparison-cell"><span class="value">297ms</span></div>
+                <div class="code-examples">
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Python</span>
+                            <span class="tag">certstream library</span>
+                        </div>
+                        <pre class="wrap"><span class="kw">import</span> certstream
+
+certstream.listen_for_events(callback,
+    url=<span class="str">'wss://your-host:8080/'</span>)</pre>
+                    </div>
+                    <div class="code-example">
+                        <div class="code-example-header">
+                            <span class="lang">Anything else</span>
+                            <span class="tag">plain WebSocket</span>
+                        </div>
+                        <pre class="wrap"><span class="cm"># same certificate_update messages,</span>
+<span class="cm"># same all_domains, same leaf_cert</span>
+wscat -c <span class="str">wss://your-host:8080/</span></pre>
+                    </div>
                 </div>
-                <p style="margin-top: 24px; color: #666; font-size: 0.85rem; text-align: center;">
-                    Rust vs Elixir: 8.5x less memory, 2.5x higher throughput. Rust vs Go: 1.6x less memory, 1.8x higher throughput.
+                <p style="margin-top: 24px; color: var(--ink-2); font-size: 0.92rem; max-width: 72ch;">
+                    Message types, field names and the <code>leaf_cert</code> shape are unchanged, so a parser written for either of them keeps working. On top of that, this server reads static-ct-api logs and drops duplicates seen across logs. If you only want domain names, <code>/domains-only</code> sends about 100 to 500 bytes per message instead of 2 to 5 KB.
                 </p>
             </div>
         </section>
 
+        <section id="performance" class="split">
+            <div class="wrap">
+                <div class="section-header">
+                    <h2>Performance</h2>
+                    <p>Two hours against all 45 Chrome- and Apple-trusted logs, default configuration, one subscriber on the domains-only stream, metrics sampled every 30 seconds.</p>
+                </div>
+                <div class="stat-grid">
+                    <div class="stat-cell">
+                        <div class="num">420<span class="unit">/s</span></div>
+                        <div class="lbl">Certificates ingested, median. 796/s at p95</div>
+                    </div>
+                    <div class="stat-cell">
+                        <div class="num">722<span class="unit">/s</span></div>
+                        <div class="lbl">Domain names, 62 million a day</div>
+                    </div>
+                    <div class="stat-cell">
+                        <div class="num">80<span class="unit">MB</span></div>
+                        <div class="lbl">Resident memory, steady state. 50 MB allocated</div>
+                    </div>
+                    <div class="stat-cell">
+                        <div class="num">0.2<span class="unit">core</span></div>
+                        <div class="lbl">CPU, median</div>
+                    </div>
+                </div>
+                <p style="margin-top: 24px; color: var(--ink-2); font-size: 0.92rem; max-width: 72ch;">
+                    At the median that works out to roughly 36 million certificate updates a day. Each certificate is serialized once and shared with every subscriber through an <code>Arc&lt;PreSerializedMessage&gt;</code>, and with no clients connected the serialization is skipped. Memory is covered in the
+                    <a href="docs.html#performance">API docs</a>.
+                </p>
+            </div>
+        </section>
+
+
+        <section id="support" class="split">
+            <div class="wrap">
+                <div class="section-header">
+                    <h2>Support</h2>
+                </div>
+                <div class="center-block">
+                    <p>
+                        I develop certstream-server-rust in my spare time and release it under the MIT license. If it is useful to you, a star, a bug report or a word to someone who needs it helps.
+                    </p>
+                    <p>
+                        GitHub Sponsors is there if you want to support the work.
+                    </p>
+                    <div style="margin-top: 24px;">
+                        <a href="https://github.com/sponsors/reloading01" class="btn btn-primary" target="_blank" rel="noopener">Sponsor on GitHub</a>
+                    </div>
+                </div>
+            </div>
+        </section>
     </main>
 
     <footer>
         <div class="wrap">
             <div class="links">
-                <a href="https://github.com/burakozcn01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a>
-                <a href="https://hub.docker.com/r/reloading01/certstream-server-rust" target="_blank" rel="noopener">Docker Hub</a>
+                <a href="https://github.com/reloading01/certstream-server-rust" target="_blank" rel="noopener">GitHub</a>
+                <a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener">Container Registry</a>
                 <a href="docs.html">Documentation</a>
-                <a href="https://github.com/burakozcn01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
-                <a href="https://github.com/burakozcn01/certstream-server-rust/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+                <a href="https://github.com/reloading01/certstream-server-rust/issues" target="_blank" rel="noopener">Issues</a>
+                <a href="https://github.com/sponsors/reloading01" target="_blank" rel="noopener">Sponsor</a>
+                <a href="https://github.com/reloading01/certstream-server-rust/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
             </div>
-            <p>certstream-server-rust</p>
+            <span class="colophon">certstream-server-rust</span>
         </div>
     </footer>
+    <script>
+      fetch('/stats.json').then(function (r) { return r.json(); }).then(function (s) {
+        var n = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+        var el = document.getElementById('hero-stats');
+        el.innerHTML = '<a href="https://github.com/reloading01/certstream-server-rust/stargazers" target="_blank" rel="noopener"><strong>' + n.format(s.stars) + '</strong> stars</a>' +
+          '<a href="https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust" target="_blank" rel="noopener"><strong>' + n.format(s.container_pulls) + '</strong> image pulls</a>';
+        el.hidden = false;
+      }).catch(function () {});
+    </script>
 </body>
 </html>

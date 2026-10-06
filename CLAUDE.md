@@ -1,7 +1,7 @@
 # certstream-server-rust
 
-Last verified: 2026-03-09
-Last context update: 2026-03-09
+Last verified: 2026-10-05
+Last context update: 2026-10-05
 
 ## Tech Stack
 - Language: Rust (edition 2024)
@@ -18,6 +18,7 @@ Last context update: 2026-03-09
 - `cargo test` - Run all tests
 - `cargo run` - Start server (reads config.yaml or env vars)
 - `cargo run -- --validate-config` - Validate configuration without starting
+- `cargo run -- --range-backfill --log <ID> --start N --end M [--out FILE]` - Upstream JSONL replay of one log's index range (no Delta/state-file involvement)
 - `cargo run -- --backfill` - Run delta backfill mode (catch-up gaps)
 - `cargo run -- --backfill --from 0` - Run historical backfill from index 0
 - `cargo run -- --backfill --logs "google"` - Backfill only logs matching filter
@@ -34,6 +35,8 @@ Last context update: 2026-03-09
 - `src/config.rs` - All configuration structs, YAML + env var loading, validation
 - `src/ct/` - Certificate Transparency log fetching and watching
 - `src/ct/fetch.rs` - Shared fetch functions for RFC 6962 and Static CT logs
+- `src/range_backfill.rs` - Upstream's `--range-backfill`: replay one log's index range to JSONL
+- `src/lib.rs` - Library facade (upstream); exposes parser/model/config surface for tests and fuzz targets. Fork-only modules (delta_sink, query, table_ops, zerobus_sink, backfill) are bin-only
 - `src/backfill.rs` - Backfill mode: gap detection, fetcher tasks, writer task (delta or zerobus), staging merge
 - `src/models/` - Data models (CertificateMessage, PreSerializedMessage)
 - `src/websocket/` - WebSocket stream handlers
@@ -69,6 +72,9 @@ The binary has five execution modes selected in main.rs:
 
 ## Key Conventions
 - Config structs use serde Deserialize with defaults; env vars override YAML
+- **Upstream sync**: fork merged with upstream (`burakozcn01/certstream-server-rust`) through v1.6.1; upstream history was rewritten, so merges need an explicit base (v1.2.0 commit `86c6536`). Name clashes resolved by renaming upstream's JSONL `--backfill` to `--range-backfill` (module `range_backfill`)
+- **Sinks need the full stream**: delta_sink and zerobus_sink are built from the `full` payload; `streams.full` must be true when either is enabled (validated in `Config::validate()`)
+- **Build requires `protoc`** (build.rs compiles `proto/cert_record.proto`); Dockerfile and CI install it
 - Env var pattern: `CERTSTREAM_<SECTION>_<FIELD>` (e.g., `CERTSTREAM_DELTA_SINK_ENABLED`)
 - All optional features use an `enabled: bool` field (default false)
 - Graceful shutdown via CancellationToken propagated to all tasks
@@ -224,7 +230,8 @@ The binary has five execution modes selected in main.rs:
 - **Error type**: `FetchError { HttpError, InvalidResponse, RateLimited(u16), NotAvailable(u16) }`
 - **RFC 6962**: `get_tree_size(client, base_url, timeout)` and `fetch_entries(client, base_url, start, end, source, timeout)`
 - **Static CT**: `get_checkpoint_tree_size(client, base_url, timeout)` and `fetch_tile_entries(client, base_url, tile_index, partial_width, offset_in_tile, source, timeout, issuer_cache)`
-- **Shared by**: watcher, static_ct poller, and backfill fetchers
+- **Shared by**: backfill fetchers only. Upstream's watcher and static_ct poller have their own fetch paths (hybrid tiles, Merkle verification, NATS) and no longer use `ct::fetch`; `get_tree_size` and `get_checkpoint_tree_size` are currently unused
+- **Static CT checkpoint**: `get_checkpoint_tree_size(client, base_url, expected_origin, timeout)` takes the expected checkpoint origin (upstream `parse_checkpoint` requires it)
 - **Parse failures**: skipped with debug log and metrics counter increment, not treated as errors
 
 ## Delta Table Replication
